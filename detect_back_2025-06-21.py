@@ -202,9 +202,9 @@ def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
         contours, _ = cv2.findContours(vis_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         cv2.drawContours(contour_vis, contours, -1, (0, 255, 0), 2)
 
-        cv2.imshow("Inlier Mask", vis_mask)
-        cv2.imshow("Relative Height Map", color_map)
-        cv2.imshow("Plane Region Contour", contour_vis)
+        # cv2.imshow("Inlier Mask", vis_mask)
+        # cv2.imshow("Relative Height Map", color_map)
+        # cv2.imshow("Plane Region Contour", contour_vis)
 
     # FIXME plane_model, inlier_mask, height_map, conter_vis = fit_plane_and_extract_height_map( ValueError: not enough values to unpack(expected 4, got 3)
     return plane_model, inlier_mask, height_map, contour_vis
@@ -568,11 +568,8 @@ def main():
 
             elif registration_mode == 2:  # 彩色点云显示
 
-                # ROI_X1, ROI_Y1 = 800, 700  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
-                # 这里使用的是深度图分辨率的 ROI
-                ROI_X1, ROI_Y1 = 745, 591  # 左上角坐标
-                ROI_X2, ROI_Y2 = 1009, 813  # 右下角坐标
+                ROI_X1, ROI_Y1 = 800, 700  # 左上角坐标
+                ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
 
                 # 点云转换
                 cl.DeviceStreamMapDepthImageToPoint3D(frame, depth_calib_data, scale_unit, pointcloud_data_arr)
@@ -627,7 +624,7 @@ def main():
                     overlay = cv2.addWeighted(depth, 0.6, mask_color, 0.4, 0)
                     # draw
                     cv2.rectangle(overlay, (ROI_X1, ROI_Y1), (ROI_X2, ROI_Y2), (255, 0, 0), 2)
-                    cv2.imshow("result", overlay)
+                    # cv2.imshow("result", overlay)
 
             k = cv2.waitKey(10)
             if k == ord('q'):
