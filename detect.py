@@ -304,8 +304,13 @@ def extract_skeleton_from_contour_image(image: np.ndarray, invert_binary=True):
                     break
             return skel
 
-        # 提取骨架
-        thinned = skeletonize_(ring_mask)  # (480,560)
+        # 使用 scikit-image 的 skeletonize 函数，效果更好
+        from skimage.morphology import skeletonize
+        skeleton = skeletonize(ring_mask > 0)
+        thinned = (skeleton * 255).astype(np.uint8)
+        # thinned = skeletonize(ring_mask)
+        # # 提取骨架
+        # thinned = skeletonize_(ring_mask)  # (480,560)
 
         # 将骨架绘制为蓝色（BGR格式）
         vis_img[thinned != 0] = (255, 0, 0)  # 蓝色通道
@@ -339,6 +344,30 @@ def extract_skeleton_from_contour_image(image: np.ndarray, invert_binary=True):
     return dilation
 
 
+def overlay_skeleton_on_color(dilation, color_image, ROI_X1, ROI_Y1, ROI_X2, ROI_Y2):
+    # 计算ROI区域的宽高
+    roi_w = ROI_X2 - ROI_X1
+    roi_h = ROI_Y2 - ROI_Y1
+    if roi_w <= 0 or roi_h <= 0:
+        print("ROI区域无效")
+        return
+
+    # 如果骨架图不匹配ROI大小，则使用插值方式缩放
+    if dilation.shape[:2] != (roi_h, roi_w):
+        resized_skeleton = cv2.resize(dilation, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST)
+    else:
+        resized_skeleton = dilation
+
+    # 创建与彩色图相同大小的临时掩码，并在ROI内填充骨架
+    overlay_mask = np.zeros_like(color_image)
+    # 骨架像素设为可辨识的颜色（如绿色）
+    overlay_mask[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2][resized_skeleton == 255] = (0, 255, 0)
+
+    # 叠加到原彩色图上
+    result = cv2.addWeighted(color_image, 1.0, overlay_mask, 0.7, 0)
+
+    # 显示结果
+    cv2.imshow("Overlay Skeleton on Color", result)
 
 def main():
     cl = PercipioSDK()
@@ -549,7 +578,7 @@ def main():
 
                 # 骨架提取
                 skeletonize_vis = extract_skeleton_from_contour_image(conter_vis)
-                # cv2.imshow("skeletonize_vis", skeletonize_vis)
+                cv2.imshow("skeletonize_vis", skeletonize_vis)
 
             elif registration_mode == 1:  # 彩色图映射到深度图坐标系。
                 cl.DeviceStreamImageDecode(img_color, img_parsed_color)
@@ -571,8 +600,12 @@ def main():
                 # ROI_X1, ROI_Y1 = 800, 700  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
                 # 这里使用的是深度图分辨率的 ROI
+                # 正方形的
                 ROI_X1, ROI_Y1 = 745, 591  # 左上角坐标
                 ROI_X2, ROI_Y2 = 1009, 813  # 右下角坐标
+                # 长条的
+                # ROI_X1, ROI_Y1 = 647, 603  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 739, 809  # 右下角坐标
 
                 # 点云转换
                 cl.DeviceStreamMapDepthImageToPoint3D(frame, depth_calib_data, scale_unit, pointcloud_data_arr)
@@ -600,7 +633,8 @@ def main():
                 plane_model, inlier_mask, height_map, conter_vis = fit_plane_and_extract_height_map(
                     roi_cloud,
                     # roi_p3d_aligned,
-                    distance_threshold=3.8,
+                    distance_threshold=4.8, #正方形物体所用
+                    # distance_threshold=1.5,  #长条物体
                     visualize=True
                 )
                 dilation_vis = extract_skeleton_from_contour_image(conter_vis)
@@ -613,10 +647,11 @@ def main():
                         else:
                             dilation_vis = cv2.cvtColor(dilation_vis, cv2.COLOR_BGR2GRAY)
 
-                    # resize to depth size
+                    # 创建与完整深度图同样大小的掩码
                     full_mask = np.zeros((depth.shape[0], depth.shape[1]), dtype=dilation_vis.dtype)
+                    # 将ROI区域的骨架填充到正确位置
                     full_mask[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2] = dilation_vis
-                    # cv2.imshow("full_mask", full_mask)
+                    cv2.imshow("full_mask", full_mask)
 
                     # create red mask
                     mask_color = np.zeros_like(depth)
@@ -628,6 +663,22 @@ def main():
                     # draw
                     cv2.rectangle(overlay, (ROI_X1, ROI_Y1), (ROI_X2, ROI_Y2), (255, 0, 0), 2)
                     cv2.imshow("result", overlay)
+
+                    original_color = image_data()
+                    cl.DeviceStreamImageDecode(img_color,original_color)
+                    color_arr = original_color.as_nparray()
+                    cv2.imshow("original_color_arr", color_arr)
+
+                    # # 在彩色图上叠加骨架线
+                    overlay_skeleton_on_color(
+                        dilation_vis, color_arr, ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
+                    )
+                    # overlay_skeleton_with_scaling(
+                    #     cl, depth_calib, img_depth, scale_unit,
+                    #     color_calib, img_color, full_mask
+                    # )
+
+
 
             k = cv2.waitKey(10)
             if k == ord('q'):
