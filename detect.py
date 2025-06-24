@@ -49,7 +49,7 @@ def extract_nearest_surface_mask(roi_p3d_aligned, depth_margin):
     print("\t最小深度值:{}mm".format(z_min_val))
 
     # 2. 创建 mask，提取 z_min 附近的一层
-    lower = z_min_val
+    lower = z_min_val + 0.5  # 0.5mm 偏移，避免精度问题
     upper = z_min_val + depth_margin
     surface_mask = ((z_img >= lower) & (z_img <= upper)).astype(np.uint8) * 255  # 二值掩码
 
@@ -344,30 +344,91 @@ def extract_skeleton_from_contour_image(image: np.ndarray, invert_binary=True):
     return dilation
 
 
-def overlay_skeleton_on_color(dilation, color_image, ROI_X1, ROI_Y1, ROI_X2, ROI_Y2):
-    # 计算ROI区域的宽高
-    roi_w = ROI_X2 - ROI_X1
-    roi_h = ROI_Y2 - ROI_Y1
-    if roi_w <= 0 or roi_h <= 0:
-        print("ROI区域无效")
+def overlay_skeleton_with_scaling(cl: pcammls.PercipioSDK,
+                                  depth_calib,
+                                  img_depth: pcammls.image_data,
+                                  scale_unit: float,
+                                  color_calib,
+                                  img_color: pcammls.image_data,
+                                  skeleton_img: np.ndarray):
+    """
+    使用SDK的坐标映射功能，将深度坐标系下的骨架图精确地叠加到彩色图上。
+    (修正版：解决掩码与彩色图维度不匹配的索引错误)
+
+    Args:
+        cl: PercipioSDK 实例.
+        depth_calib: 深度相机的标定数据.
+        img_depth: 原始的深度图像数据 (将被临时修改).
+        scale_unit: 深度值缩放单位.
+        color_calib: 彩色相机的标定数据.
+        img_color: 原始的彩色图像数据.
+        skeleton_img: 在深度图坐标系下生成的骨架二值图 (uint8).
+    """
+    if skeleton_img is None:
+        print("输入的骨架图为空，无法叠加。")
         return
 
-    # 如果骨架图不匹配ROI大小，则使用插值方式缩放
-    if dilation.shape[:2] != (roi_h, roi_w):
-        resized_skeleton = cv2.resize(dilation, (roi_w, roi_h), interpolation=cv2.INTER_NEAREST)
-    else:
-        resized_skeleton = dilation
+    # 1. 备份原始深度数据
+    original_depth_np = img_depth.as_nparray().copy()
 
-    # 创建与彩色图相同大小的临时掩码，并在ROI内填充骨架
-    overlay_mask = np.zeros_like(color_image)
-    # 骨架像素设为可辨识的颜色（如绿色）
-    overlay_mask[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2][resized_skeleton == 255] = (0, 255, 0)
+    # 2. 创建包含真实深度值的“伪深度图”
+    fake_depth_np = np.zeros_like(original_depth_np)
+    skeleton_mask = (skeleton_img == 255)
+    fake_depth_np[skeleton_mask] = original_depth_np[skeleton_mask]
 
-    # 叠加到原彩色图上
-    result = cv2.addWeighted(color_image, 1.0, overlay_mask, 0.7, 0)
+    # 3. 将伪深度图数据临时写入 img_depth 的缓冲区
+    img_depth.as_nparray()[:] = fake_depth_np
 
-    # 显示结果
-    cv2.imshow("Overlay Skeleton on Color", result)
+    # 4. 调用SDK函数进行坐标映射
+    mapped_skeleton_image = pcammls.image_data()
+    cl.DeviceStreamMapDepthImageToColorCoordinate(
+        depth_calib, img_depth, scale_unit, color_calib,
+        img_color.width, img_color.height, mapped_skeleton_image
+    )
+
+    # 5. 立即恢复原始深度数据
+    img_depth.as_nparray()[:] = original_depth_np
+
+    # 6. 从映射结果中生成最终的、对齐的二值掩码
+    mapped_skeleton_np = mapped_skeleton_image.as_nparray()
+    if mapped_skeleton_np is None:
+        print("坐标映射失败，无法生成叠加图。")
+        return
+
+    final_aligned_mask = (mapped_skeleton_np > 0).astype(np.uint8) * 255
+
+    # 7. 解码彩色图并进行叠加
+    decoded_color = pcammls.image_data()
+    cl.DeviceStreamImageDecode(img_color, decoded_color)
+    color_arr = decoded_color.as_nparray()
+
+    overlay_color = np.zeros_like(color_arr)
+
+    # --- 修正 IndexError 的核心代码 ---
+    # 创建布尔掩码
+    boolean_mask = (final_aligned_mask == 255)
+    # 检查掩码是否为 (H, W, 1) 的3D形状，如果是，则压缩为 (H, W) 的2D形状
+    if boolean_mask.ndim == 3 and boolean_mask.shape[2] == 1:
+        boolean_mask = np.squeeze(boolean_mask, axis=2)
+
+    # 现在使用2D掩码为3D图像的像素赋值
+    overlay_color[boolean_mask] = (0, 255, 0)  # BGR: Green
+
+    result = cv2.addWeighted(color_arr, 1.0, overlay_color, 0.8, 0)
+
+    # 为了对比，显示映射后的原始深度图渲染效果
+    img_registration_render = pcammls.image_data()
+    mapped_depth_for_render = pcammls.image_data()
+    cl.DeviceStreamMapDepthImageToColorCoordinate(
+        depth_calib, img_depth, scale_unit, color_calib,
+        img_color.width, img_color.height, mapped_depth_for_render
+    )
+    cl.DeviceStreamDepthRender(mapped_depth_for_render, img_registration_render)
+    cv2.imshow("MappedDepthRender", img_registration_render.as_nparray())
+
+    # 显示最终的叠加结果
+    cv2.imshow("ColorSkeletonOverlay (Aligned)", result)
+
 
 def main():
     cl = PercipioSDK()
@@ -620,24 +681,27 @@ def main():
                 # cv2.imshow('depth', depth)  # (1536, 2048, 3)
                 # Depth at (1000, 1000): R=35, G=255, B=219
 
-                # roi depth
-                roi_raw_depth = depth[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
-                # print('roi depth image shape :{}'.format(roi_raw_depth.shape))
-                cv2.imshow("roi_raw_depth", roi_raw_depth)
-
                 # roi cloud
                 roi_cloud = p3d_nparray[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
                 cv2.imshow("roi_p3d_nparray", roi_cloud)
 
-                # process
                 plane_model, inlier_mask, height_map, conter_vis = fit_plane_and_extract_height_map(
                     roi_cloud,
-                    # roi_p3d_aligned,
-                    distance_threshold=4.8, #正方形物体所用
-                    # distance_threshold=1.5,  #长条物体
-                    visualize=True
+                    distance_threshold=4.8,  # 这个值可能仍然适用
+                    visualize=True,
                 )
                 dilation_vis = extract_skeleton_from_contour_image(conter_vis)
+                # dilation_vis = None
+                # # 检查 inlier_mask 是否有效
+                # if inlier_mask is not None and np.any(inlier_mask):
+                #     # 将布尔掩码转换为 uint8 图像 (0 和 255)
+                #     binary_ring_mask = inlier_mask.astype(np.uint8) * 255
+                #     cv2.imshow("Binary Mask for Skeletonization", binary_ring_mask)
+                #
+                #     # 调用新的、简化的骨架提取函数
+                #     dilation_vis = extract_skeleton_from_binary_mask(binary_ring_mask)
+                # else:
+                #     print("未能生成平面内点掩码，跳过骨架提取。")
 
                 if dilation_vis is not None:
                     if dilation_vis.ndim == 3 and dilation_vis.shape[2] == 3:
@@ -668,15 +732,12 @@ def main():
                     cl.DeviceStreamImageDecode(img_color,original_color)
                     color_arr = original_color.as_nparray()
                     cv2.imshow("original_color_arr", color_arr)
-
-                    # # 在彩色图上叠加骨架线
-                    overlay_skeleton_on_color(
-                        dilation_vis, color_arr, ROI_X1, ROI_Y1, ROI_X2, ROI_Y2
+                    # 在彩色图上叠加骨架线
+                    overlay_skeleton_with_scaling(
+                        cl, depth_calib, img_depth, scale_unit,
+                        color_calib, img_color, full_mask
                     )
-                    # overlay_skeleton_with_scaling(
-                    #     cl, depth_calib, img_depth, scale_unit,
-                    #     color_calib, img_color, full_mask
-                    # )
+
 
 
 
