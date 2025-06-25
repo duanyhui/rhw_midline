@@ -143,6 +143,7 @@ def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
         plane_model: 平面参数 [a, b, c, d]
         inlier_mask: (H, W) 的 bool 掩码，True 表示属于平面
         height_map: (H, W) 的 float 高度图，仅平面区域有效
+        contour_vis: 可视化轮廓图像 (H, W, 3)
     """
     H, W, _ = roi_p3d.shape
     valid_mask = np.all(~np.isnan(roi_p3d), axis=2) & (roi_p3d[:, :, 2] > 0)
@@ -150,7 +151,7 @@ def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
 
     if len(points) < ransac_n:
         print("点云中有效点不足以拟合平面")
-        return None, None, None
+        return None, None, None,None
 
     # Open3D 点云构建与拟合
     pcd = open3d.geometry.PointCloud()
@@ -430,6 +431,67 @@ def overlay_skeleton_with_scaling(cl: pcammls.PercipioSDK,
     cv2.imshow("ColorSkeletonOverlay (Aligned)", result)
 
 
+def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool = True):
+    """
+    直接从表面掩码（如 Z 值提取的掩码）中提取内外轮廓并计算中轴线（骨架）。
+    此函数绕过了 RANSAC 拟合，直接处理给定的二值掩码。
+
+    参数:
+        surface_mask: (H, W) 的二值掩码 (uint8), 255 代表目标区域。
+        visualize: 是否显示中间过程和结果的可视化窗口。
+
+    返回:
+        dilated_skeleton: (H, W, 3) 的 BGR 图像，包含膨胀后的骨架线。
+                         如果无法生成，则返回 None。
+    修改时间:  2025-06-25 17:19
+
+    """
+    if surface_mask is None or np.count_nonzero(surface_mask) == 0:
+        print("输入的 surface_mask 为空或不包含有效区域。")
+        return None
+
+    # 1. 从掩码中提取内外轮廓（通常是面积最大的两个）
+    # 使用一个较小的 simplify_epsilon 来平滑轮廓，同时保留形状
+    contours = extract_outer_inner_contours(surface_mask, simplify_epsilon=2)
+
+    if len(contours) < 2:
+        print("未能找到足够的内外轮廓来生成环状区域。")
+        return None
+
+    outer_cnt = contours[0]
+    inner_cnt = contours[1]
+
+    # 2. 创建环状区域掩码 (Ring Mask)
+    ring_mask = np.zeros_like(surface_mask, dtype=np.uint8)
+    cv2.drawContours(ring_mask, [outer_cnt], -1, 255, cv2.FILLED)  # 填充外轮廓
+    cv2.drawContours(ring_mask, [inner_cnt], -1, 0, cv2.FILLED)   # 在内轮廓区域挖一个洞
+
+    # 3. 提取骨架
+    # 使用 scikit-image 的 skeletonize 函数，效果较好
+    from skimage.morphology import skeletonize
+    skeleton = skeletonize(ring_mask > 0)
+    skeleton_img = (skeleton * 255).astype(np.uint8)
+
+    # 4. 膨胀骨架使其更粗，便于观察和后续处理
+    kernel = np.ones((3, 3), np.uint8)
+    dilated_skeleton = cv2.dilate(skeleton_img, kernel, iterations=1)
+
+    # 5. 可视化（如果需要）
+    if visualize:
+        # 创建一个彩色图像用于可视化
+        vis_img = cv2.cvtColor(surface_mask, cv2.COLOR_GRAY2BGR)
+        # 绘制内外轮廓
+        cv2.drawContours(vis_img, [outer_cnt], -1, (0, 0, 255), 2)  # 外轮廓红色
+        cv2.drawContours(vis_img, [inner_cnt], -1, (0, 255, 0), 2)  # 内轮廓绿色
+        # 将骨架叠加为蓝色
+        vis_img[dilated_skeleton != 0] = (255, 0, 0)
+
+        cv2.imshow("Ring Mask", ring_mask)
+        cv2.imshow("Skeleton from Surface Mask", vis_img)
+
+    # 返回一个三通道的图像，方便后续的颜色叠加等操作
+    return cv2.cvtColor(dilated_skeleton, cv2.COLOR_GRAY2BGR)
+
 def main():
     cl = PercipioSDK()
 
@@ -662,11 +724,16 @@ def main():
                 # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
                 # 这里使用的是深度图分辨率的 ROI
                 # 正方形的
-                ROI_X1, ROI_Y1 = 745, 591  # 左上角坐标
-                ROI_X2, ROI_Y2 = 1009, 813  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 745, 591  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 1009, 813  # 右下角坐标
                 # 长条的
-                # ROI_X1, ROI_Y1 = 647, 603  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 739, 809  # 右下角坐标
+                ROI_X1, ROI_Y1 = 668, 607  # 左上角坐标
+                ROI_X2, ROI_Y2 = 749, 813  # 右下角坐标
+
+                # ROI_X1, ROI_Y1 = 876, 665  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 928, 810  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 865, 482  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 941, 669  # 右下角坐标
 
                 # 点云转换
                 cl.DeviceStreamMapDepthImageToPoint3D(frame, depth_calib_data, scale_unit, pointcloud_data_arr)
@@ -678,19 +745,38 @@ def main():
                 # 深度图显示
                 cl.DeviceStreamDepthRender(frame, img_registration_depth)
                 depth = img_registration_depth.as_nparray()
-                # cv2.imshow('depth', depth)  # (1536, 2048, 3)
-                # Depth at (1000, 1000): R=35, G=255, B=219
 
-                # roi cloud
+                # 提取点云 ROI
                 roi_cloud = p3d_nparray[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
                 cv2.imshow("roi_p3d_nparray", roi_cloud)
 
-                plane_model, inlier_mask, height_map, conter_vis = fit_plane_and_extract_height_map(
-                    roi_cloud,
-                    distance_threshold=4.8,  # 这个值可能仍然适用
-                    visualize=True,
-                )
-                dilation_vis = extract_skeleton_from_contour_image(conter_vis)
+                surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=4.5)
+                if surface_mask is None:
+                    print("无法提取表面掩码，跳过此帧。")
+                    continue
+                cv2.imshow("Initial Surface Mask", surface_mask)
+
+                # 直接从 surface_mask 计算中轴线，不再使用 RANSAC
+                dilation_vis = extract_skeleton_from_surface_mask(surface_mask, visualize=True)
+
+                # # 使用RANSAC拟合平面并提取高度图，鲁棒性高，但准确度可能不如直接提取最近一层点云区域。
+                # # plane_model, inlier_mask, height_map, conter_vis = fit_plane_and_extract_height_map(
+                # #     roi_cloud,
+                # #     distance_threshold=4.8,
+                # #     visualize=True,
+                # # )
+                # # dilation_vis = extract_skeleton_from_contour_image(conter_vis)
+                #
+                # # 提取最近一层点云区域，并根据该区域计算中轴线的方法（准确度高但鲁棒性差）
+                # surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=3.8)
+                # print("z_min:", z_min)
+                # if surface_mask is not None:
+                #     cv2.imshow("Nearest Surface Mask", surface_mask)
+                #     dilation_vis = extract_skeleton_from_contour_image(surface_mask, invert_binary=False)
+                # else:
+                #     dilation_vis = None
+
+
                 # dilation_vis = None
                 # # 检查 inlier_mask 是否有效
                 # if inlier_mask is not None and np.any(inlier_mask):
@@ -717,12 +803,9 @@ def main():
                     full_mask[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2] = dilation_vis
                     cv2.imshow("full_mask", full_mask)
 
-                    # create red mask
+                    # 在深度图上叠加骨架
                     mask_color = np.zeros_like(depth)
-                    mask_color[full_mask == 255] = (102, 255, 255)  # G
-                    # print("green pixel count:", np.sum(np.all(mask_color == (0, 255, 0), axis=2))) # 3233
-                    # cv2.imshow("mask_color", mask_color)
-                    # addWeight
+                    mask_color[full_mask == 255] = (102, 255, 255)  # 浅绿色
                     overlay = cv2.addWeighted(depth, 0.6, mask_color, 0.4, 0)
                     # draw
                     cv2.rectangle(overlay, (ROI_X1, ROI_Y1), (ROI_X2, ROI_Y2), (255, 0, 0), 2)
