@@ -5,6 +5,7 @@ import cv2
 import open3d
 from skimage.morphology import skeletonize
 from scipy.ndimage import label
+from scipy.spatial import cKDTree
 
 
 class PythonPercipioDeviceEvent(pcammls.DeviceEvent):
@@ -224,7 +225,6 @@ def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
     inlier_points = np.asarray(pcd.points)[inliers] * 1000  # 转回 mm
 
     # 构建快速 KDTree 来映射回像素位置
-    from scipy.spatial import cKDTree
     tree = cKDTree(points)
     _, indices = tree.query(inlier_points, k=1)
 
@@ -512,7 +512,7 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
     # 1. 从掩码中提取内外轮廓（通常是面积最大的两个）
     # 使用一个较小的 simplify_epsilon 来平滑轮廓，同时保留形状
     # contours = extract_outer_inner_contours_002(surface_mask, simplify_epsilon=0.00001)
-    contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=12,initial_epsilon_factor=0.001)
+    contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=6,initial_epsilon_factor=0.001)
 
     if len(contours) < 2:
         print("未能找到足够的内外轮廓来生成环状区域。")
@@ -521,7 +521,7 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
     outer_cnt = contours[0]
     inner_cnt = contours[1]
 
-    # 2. 创建环状区域掩码 (Ring Mask)
+    # 2. 创建环状区域掩膜 (Ring Mask)
     ring_mask = np.zeros_like(surface_mask, dtype=np.uint8)
     cv2.drawContours(ring_mask, [outer_cnt], -1, 255, cv2.FILLED)  # 填充外轮廓
     cv2.drawContours(ring_mask, [inner_cnt], -1, 0, cv2.FILLED)   # 在内轮廓区域挖一个洞
@@ -598,6 +598,49 @@ def extract_skeleton_points_and_visualize(skeleton_image, origin_offset=(0, 0), 
 
     return global_points
 
+
+def compare_centerlines(actual_points, theoretical_points, image_shape):
+    """
+    比较实际中轴线和理论中轴线，并生成可视化结果。
+
+    :param actual_points: (N, 2) numpy数组，实际中轴线坐标。
+    :param theoretical_points: (M, 2) numpy数组，理论中轴线坐标。
+    :param image_shape: (height, width) 的元组，用于创建可视化图像。
+    :return:
+        - vis_image: (H, W, 3) BGR图像，可视化比较结果。
+        - match_score: 0到1之间的浮点数，表示匹配程度。
+    """
+    if actual_points.size == 0 or theoretical_points.size == 0:
+        return np.zeros((image_shape[0], image_shape[1], 3), dtype=np.uint8), 0.0
+
+    vis_image = np.zeros((image_shape[0], image_shape[1], 3), dtype=np.uint8)
+
+    # 绘制理论中轴线 (绿色)
+    for i in range(len(theoretical_points) - 1):
+        p1 = tuple(theoretical_points[i].astype(int))
+        p2 = tuple(theoretical_points[i+1].astype(int))
+        cv2.line(vis_image, p1, p2, (0, 255, 0), 2)
+
+    # 绘制实际中轴线 (红色)
+    for point in actual_points:
+        cv2.circle(vis_image, tuple(point.astype(int)), radius=2, color=(0, 0, 255), thickness=-1)
+
+    # 计算匹配程度
+    tree = cKDTree(theoretical_points)
+    distances, _ = tree.query(actual_points, k=1)
+
+    # 将距离超过一定阈值（例如5个像素）的点视为不匹配
+    threshold = 5.0
+    matched_points = np.sum(distances < threshold)
+    match_score = matched_points / len(actual_points) if len(actual_points) > 0 else 0.0
+
+    # 在图像上显示匹配分数
+    cv2.putText(vis_image, f"Match Score: {match_score:.2f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+
+    return vis_image, match_score
+
+
 def main():
     cl = PercipioSDK()
 
@@ -616,6 +659,13 @@ def main():
         return
 
     sn = dev_list[selected_idx].id
+
+    # 加载理论中轴线
+    try:
+        theoretical_centerline = np.load('theoretical_centerline.npy')
+    except FileNotFoundError:
+        print("警告: 未找到 'theoretical_centerline.npy'。请先运行 draw_centerline.py 创建理论中轴线。")
+        theoretical_centerline = None
 
     handle = cl.Open(sn)
     if not cl.isValidHandle(handle):
@@ -835,6 +885,8 @@ def main():
                 # 长条的
                 # ROI_X1, ROI_Y1 = 668, 607  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 749, 813  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 685, 698  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 741, 800  # 右下角坐标
 
                 # ROI_X1, ROI_Y1 = 876, 665  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 928, 810  # 右下角坐标
@@ -856,7 +908,7 @@ def main():
                 roi_cloud = p3d_nparray[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
                 cv2.imshow("roi_p3d_nparray", roi_cloud)
 
-                surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=4.5)
+                surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=3.5)
                 if surface_mask is None:
                     print("无法提取表面掩码，跳过此帧。")
                     continue
@@ -909,6 +961,17 @@ def main():
                     if len(skeleton_points) > 5:
                         print("前5个点的全局坐标 (x, y):")
                         print(skeleton_points[:5])
+
+                    # --- 新增：比较中轴线 ---
+                    if theoretical_centerline is not None:
+                        comparison_vis, match_score = compare_centerlines(
+                            skeleton_points,
+                            theoretical_centerline,
+                            (depth.shape[0], depth.shape[1])
+                        )
+                        cv2.imshow("Centerline Comparison", comparison_vis)
+                        print(f"中轴线匹配度: {match_score:.2f}")
+                    # --- 结束新增 ---
 
                     if dilation_vis.ndim == 3 and dilation_vis.shape[2] == 3:
                         if np.array_equal(dilation_vis[:, :, 0], dilation_vis[:, :, 1]) and \
