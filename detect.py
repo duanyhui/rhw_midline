@@ -552,6 +552,52 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
     # 返回一个三通道的图像，方便后续的颜色叠加等操作
     return cv2.cvtColor(dilated_skeleton, cv2.COLOR_GRAY2BGR)
 
+def extract_skeleton_points_and_visualize(skeleton_image, origin_offset=(0, 0), visualize=True):
+    """
+    从骨架图中提取所有离散点的坐标，并可选择性地进行可视化。
+    该函数处理坐标系转换，将ROI内的局部坐标映射为全局坐标。
+
+    :param skeleton_image: 输入的骨架二值图 (H, W) 或 (H, W, 3)。通常是 extract_skeleton_* 函数的输出。
+    :param origin_offset: (x, y) 格式的偏移量，即ROI在原图中的左上角坐标。
+    :param visualize: 是否创建一个新窗口来绘制并显示这些离散点。
+    :return: 一个 (N, 2) 的 NumPy 数组，包含所有骨架点的 (x, y) 全局坐标。如果无有效点则返回空数组。
+    """
+    # 1. 确保输入是 2D 灰度图
+    if skeleton_image is None or skeleton_image.size == 0:
+        print("输入的骨架图为空，无法提取点。")
+        return np.array([])
+
+    if skeleton_image.ndim == 3:
+        gray_skeleton = cv2.cvtColor(skeleton_image, cv2.COLOR_BGR2GRAY)
+    else:
+        gray_skeleton = skeleton_image
+
+    # 2. 提取所有非零像素的坐标 (y, x)
+    rows, cols = np.where(gray_skeleton > 0)
+
+    if len(rows) == 0:
+        print("骨架图中未找到有效点。")
+        return np.array([])
+
+    # 3. 将坐标转换为 (x, y) 格式并应用全局偏移量
+    # np.vstack((cols, rows)).T 将 (y,x) 坐标对转换为 (N, 2) 的 [x, y] 格式数组
+    local_points = np.vstack((cols, rows)).T
+    global_points = local_points + np.array(origin_offset)
+
+    # 4. 在新窗口中可视化离散点
+    if visualize:
+        # 创建一个与输入骨架图同样大小的黑色画布
+        vis_canvas = np.zeros((skeleton_image.shape[0], skeleton_image.shape[1], 3), dtype=np.uint8)
+
+        # 在画布上绘制每个离散点（使用局部坐标）
+        for point in local_points:
+            # point 是 [x, y] 格式
+            cv2.circle(vis_canvas, tuple(point), radius=1, color=(0, 255, 255), thickness=-1)  # 绘制黄色的点
+
+        cv2.imshow("Discrete Skeleton Points (in ROI)", vis_canvas)
+
+    return global_points
+
 def main():
     cl = PercipioSDK()
 
@@ -850,6 +896,20 @@ def main():
                 #     print("未能生成平面内点掩码，跳过骨架提取。")
 
                 if dilation_vis is not None:
+
+                    # 提取中轴线的离散点，并传入ROI的偏移量(ROI_X1, ROI_Y1)来获取全局坐标
+                    skeleton_points = extract_skeleton_points_and_visualize(
+                        dilation_vis,
+                        origin_offset=(ROI_X1, ROI_Y1),
+                        visualize=True
+                    )
+
+                    # 打印返回的数据，供后续比较和分析
+                    print(f"提取到 {len(skeleton_points)} 个中轴线离散点。")
+                    if len(skeleton_points) > 5:
+                        print("前5个点的全局坐标 (x, y):")
+                        print(skeleton_points[:5])
+
                     if dilation_vis.ndim == 3 and dilation_vis.shape[2] == 3:
                         if np.array_equal(dilation_vis[:, :, 0], dilation_vis[:, :, 1]) and \
                                 np.array_equal(dilation_vis[:, :, 0], dilation_vis[:, :, 2]):
