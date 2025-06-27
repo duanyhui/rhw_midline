@@ -50,7 +50,7 @@ def extract_nearest_surface_mask(roi_p3d_aligned, depth_margin):
     print("\t最小深度值:{}mm".format(z_min_val))
 
     # 2. 创建 mask，提取 z_min 附近的一层
-    lower = z_min_val + 0.5  # 0.5mm 偏移，避免精度问题
+    lower = z_min_val
     upper = z_min_val + depth_margin
     surface_mask = ((z_img >= lower) & (z_img <= upper)).astype(np.uint8) * 255  # 二值掩码
 
@@ -512,7 +512,7 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
     # 1. 从掩码中提取内外轮廓（通常是面积最大的两个）
     # 使用一个较小的 simplify_epsilon 来平滑轮廓，同时保留形状
     # contours = extract_outer_inner_contours_002(surface_mask, simplify_epsilon=0.00001)
-    contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=6,initial_epsilon_factor=0.001)
+    contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=16,initial_epsilon_factor=0.001)
 
     if len(contours) < 2:
         print("未能找到足够的内外轮廓来生成环状区域。")
@@ -550,6 +550,71 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
         cv2.imshow("Skeleton from Surface Mask", vis_img)
 
     # 返回一个三通道的图像，方便后续的颜色叠加等操作
+    return cv2.cvtColor(dilated_skeleton, cv2.COLOR_GRAY2BGR)
+
+
+def extract_skeleton_universal(surface_mask: np.ndarray, visualize: bool = True):
+    """
+    通用的骨架提取函数，能同时处理实心和空心（有镂空）的物体。
+
+    该函数通过检测轮廓数量来自动判断物体类型，并相应地创建用于骨架化的目标掩码。
+    - 如果只有一个轮廓，则处理为实心物体。
+    - 如果有多个轮廓，则取最大的两个创建环形区域进行处理。
+
+    :param surface_mask: (H, W) 的二值掩码 (uint8), 255 代表目标区域。
+    :param visualize: 是否显示中间过程和结果的可视化窗口。
+    :return: (H, W, 3) 的 BGR 图像，包含膨胀后的骨架线。如果无法生成，则返回 None。
+    """
+    if surface_mask is None or np.count_nonzero(surface_mask) == 0:
+        print("输入的 surface_mask 为空或不包含有效区域。")
+        return None
+
+    # 1. 提取轮廓并进行自适应拟合
+    contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=16, initial_epsilon_factor=0.001)
+
+    if not contours:
+        print("未能找到任何轮廓。")
+        return None
+
+    # 2. ★★★ 核心改动：根据轮廓数量决定处理方式 ★★★
+    target_mask = np.zeros_like(surface_mask, dtype=np.uint8)
+    outer_cnt = contours[0]
+    inner_cnt = None
+
+    if len(contours) >= 2:
+        # 情况一：空心物体（至少有两个轮廓）
+        print("检测到空心物体，生成环形掩码。")
+        inner_cnt = contours[1]
+        # 创建环形区域
+        cv2.drawContours(target_mask, [outer_cnt], -1, 255, cv2.FILLED)
+        cv2.drawContours(target_mask, [inner_cnt], -1, 0, cv2.FILLED)
+    else:
+        # 情况二：实心物体（只有一个轮廓）
+        print("检测到实心物体，生成填充掩码。")
+        # 创建实心区域
+        cv2.drawContours(target_mask, [outer_cnt], -1, 255, cv2.FILLED)
+
+    # 3. 提取骨架
+    skeleton = skeletonize(target_mask > 0)
+    skeleton_img = (skeleton * 255).astype(np.uint8)
+
+    # 4. 膨胀骨架使其更粗
+    kernel = np.ones((3, 3), np.uint8)
+    dilated_skeleton = cv2.dilate(skeleton_img, kernel, iterations=1)
+
+    # 5. 可视化
+    if visualize:
+        vis_img = cv2.cvtColor(surface_mask, cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(vis_img, [outer_cnt], -1, (0, 0, 255), 2)  # 外轮廓红色
+        if inner_cnt is not None:
+            cv2.drawContours(vis_img, [inner_cnt], -1, (0, 255, 0), 2)  # 内轮廓绿色
+
+        # 将骨架叠加为蓝色
+        vis_img[dilated_skeleton != 0] = (255, 0, 0)
+
+        cv2.imshow("Target Mask for Skeletonization", target_mask)
+        cv2.imshow("Universal Skeleton Extraction", vis_img)
+
     return cv2.cvtColor(dilated_skeleton, cv2.COLOR_GRAY2BGR)
 
 def extract_skeleton_points_and_visualize(skeleton_image, origin_offset=(0, 0), visualize=True):
@@ -635,7 +700,7 @@ def compare_centerlines(actual_points, theoretical_points, image_shape):
     match_score = matched_points / len(actual_points) if len(actual_points) > 0 else 0.0
 
     # 在图像上显示匹配分数
-    cv2.putText(vis_image, f"Match Score: {match_score:.2f}", (10, 30),
+    cv2.putText(vis_image, f"Match Score: {match_score*100:.2f}%", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
 
     return vis_image, match_score
@@ -880,13 +945,13 @@ def main():
                 # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
                 # 这里使用的是深度图分辨率的 ROI
                 # 正方形的
-                ROI_X1, ROI_Y1 = 745, 591  # 左上角坐标
-                ROI_X2, ROI_Y2 = 1009, 813  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 745, 591  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 1009, 813  # 右下角坐标
                 # 长条的
                 # ROI_X1, ROI_Y1 = 668, 607  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 749, 813  # 右下角坐标
-                # ROI_X1, ROI_Y1 = 685, 698  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 741, 800  # 右下角坐标
+                ROI_X1, ROI_Y1 = 680, 689  # 左上角坐标
+                ROI_X2, ROI_Y2 = 732, 803  # 右下角坐标
 
                 # ROI_X1, ROI_Y1 = 876, 665  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 928, 810  # 右下角坐标
@@ -908,7 +973,7 @@ def main():
                 roi_cloud = p3d_nparray[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
                 cv2.imshow("roi_p3d_nparray", roi_cloud)
 
-                surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=3.5)
+                surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=2.5)
                 if surface_mask is None:
                     print("无法提取表面掩码，跳过此帧。")
                     continue
@@ -916,6 +981,8 @@ def main():
 
                 # 直接从 surface_mask 计算中轴线，不再使用 RANSAC
                 dilation_vis = extract_skeleton_from_surface_mask(surface_mask, visualize=True)
+                # # 使用通用骨架提取方法，能处理实心和空心物体
+                dilation_vis = extract_skeleton_universal(surface_mask, visualize=True)
 
                 # # 使用RANSAC拟合平面并提取高度图，鲁棒性高，但准确度可能不如直接提取最近一层点云区域。
                 # # plane_model, inlier_mask, height_map, conter_vis = fit_plane_and_extract_height_map(

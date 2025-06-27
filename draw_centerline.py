@@ -4,20 +4,39 @@ import pcammls
 from pcammls import *
 import os
 
-# 全局变量用于存储绘制的点
+# 全局变量
 line_points = []
+drawing_mode = 'point'  # 'point' 或 'freehand'
+drawing = False         # 在自由绘制模式下，当鼠标按住时为 True
 
 def mouse_callback(event, x, y, flags, param):
-    """鼠标回调函数，用于通过点击添加/删除点来绘制中轴线"""
-    global line_points
+    """鼠标回调函数，处理逐点模式和自由绘制模式"""
+    global line_points, drawing_mode, drawing
 
-    if event == cv2.EVENT_LBUTTONDOWN:
-        line_points.append((x, y))
-        print(f"添加新点: ({x}, {y})。")
-    elif event == cv2.EVENT_RBUTTONDOWN:
-        if line_points:
-            line_points.pop()
-            print("移除了最后一个点。")
+    if drawing_mode == 'point':
+        if event == cv2.EVENT_LBUTTONDOWN:
+            line_points.append((x, y))
+            print(f"逐点模式: 添加新点 ({x}, {y})。")
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            if line_points:
+                line_points.pop()
+                print("逐点模式: 移除了最后一个点。")
+
+    elif drawing_mode == 'freehand':
+        if event == cv2.EVENT_LBUTTONDOWN:
+            drawing = True
+            line_points.clear()  # 开始一条新线
+            line_points.append((x, y))
+        elif event == cv2.EVENT_MOUSEMOVE:
+            if drawing:
+                line_points.append((x, y))
+        elif event == cv2.EVENT_LBUTTONUP:
+            drawing = False
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            # 在自由绘制模式下，右键单击清除当前线条
+            if line_points:
+                line_points.clear()
+                print("自由绘制模式: 线条已清除。")
 
 def interpolate_polyline(points, step=1.0):
     """
@@ -66,14 +85,19 @@ def interpolate_polyline(points, step=1.0):
 
 def draw_centerline():
     """
-    在深度图上通过多点标记的方式绘制理论中轴线并保存坐标。
+    在深度图上通过多点标记或自由绘制的方式绘制理论中轴线并保存坐标。
 
     使用方法:
         - 运行脚本，会显示一个实时深度图预览窗口。
         - 按 'c' 键捕获当前帧，然后开始在捕获的图像上绘制。
         - 在绘图窗口中:
-            - 左键点击: 添加一个点。点与点之间会自动连线。
-            - 右键点击: 移除上一个添加的点。
+            - 按 'm' 键切换“逐点模式”和“自由绘制模式”。
+            - 逐点模式:
+                - 左键点击: 添加一个点。
+                - 右键点击: 移除上一个添加的点。
+            - 自由绘制模式:
+                - 按住左键并拖动: 绘制一条线。
+                - 右键点击: 清除当前绘制的线。
             - 按 'r' 键: 清除所有已绘制的点，重新开始。
         - 绘制完成后，按 's' 键保存坐标。
         - 按 'q' 键退出。
@@ -146,24 +170,37 @@ def draw_centerline():
     cv2.namedWindow("Draw Theoretical Centerline")
     cv2.setMouseCallback("Draw Theoretical Centerline", mouse_callback)
 
-    print("\n--- 开始绘制中轴线 ---")
-    print("左键点击: 添加一个点")
-    print("右键点击: 移除上一个点")
-    print("按 'r' 键: 清除所有点 (Reset)")
-    print("按 's' 键: 保存并退出")
-    print("按 'q' 键: 不保存直接退出")
+    print("\n--- 绘制模式 ---")
+    print("按 'm' 键在“逐点模式”和“自由绘制模式”之间切换。")
+    print("\n--- 逐点模式 ---")
+    print("左键点击: 添加一个点。")
+    print("右键点击: 移除上一个点。")
+    print("\n--- 自由绘制模式 ---")
+    print("按住左键并拖动: 绘制一条线。")
+    print("右键点击: 清除当前线条。")
+    print("\n--- 通用操作 ---")
+    print("按 'r' 键: 重置所有点。")
+    print("按 's' 键: 保存并退出。")
+    print("按 'q' 键: 不保存直接退出。")
 
     vis_image = captured_image.copy()
+
+    global drawing_mode, line_points
 
     while True:
         # 创建一个副本用于实时显示，避免在原图上重复画线
         temp_vis_image = vis_image.copy()
 
-        # 绘制各个顶点
-        for point in line_points:
-            cv2.circle(temp_vis_image, point, radius=4, color=(0, 0, 255), thickness=-1)
+        # 显示当前模式
+        mode_text = f"Mode: {'Point' if drawing_mode == 'point' else 'Freehand'}"
+        cv2.putText(temp_vis_image, mode_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 0), 2)
 
-        # 绘制连接线
+        # 在逐点模式下，绘制各个顶点
+        if drawing_mode == 'point':
+            for point in line_points:
+                cv2.circle(temp_vis_image, point, radius=4, color=(0, 0, 255), thickness=-1)
+
+        # 绘制连接线（对两种模式都适用）
         if len(line_points) > 1:
             pts = np.array(line_points, np.int32).reshape((-1, 1, 2))
             cv2.polylines(temp_vis_image, [pts], isClosed=False, color=(0, 255, 0), thickness=2)
@@ -176,18 +213,25 @@ def draw_centerline():
         elif key == ord('s'):
             if line_points:
                 # 插值以创建密集的点集
-                dense_line_points = interpolate_polyline(line_points, step=2.0)
+                dense_line_points = interpolate_polyline(line_points, step=1.0)
                 points_to_save = np.array(dense_line_points)
 
                 # 保存为 .npy 文件
                 np.save('theoretical_centerline.npy', points_to_save)
-                print(f"成功保存 {len(points_to_save)} 个理论中轴线坐标点到 theoretical_centerline.npy (已插值)")
+                print(f"成功保存 {len(points_to_save)} 个理论中轴线坐标点到 theoretical_centerline.npy (折线)")
             else:
                 print("没有绘制任何点，未保存。")
             break
         elif key == ord('r'):
             line_points.clear()
             print("所有点都已清除。")
+        elif key == ord('m'):
+            if drawing_mode == 'point':
+                drawing_mode = 'freehand'
+            else:
+                drawing_mode = 'point'
+            line_points.clear() # 切换模式时清除点
+            print(f"已切换到 {drawing_mode.capitalize()} 模式。点已清除。")
 
     cv2.destroyAllWindows()
 
