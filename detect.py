@@ -705,6 +705,63 @@ def compare_centerlines(actual_points, theoretical_points, image_shape):
 
     return vis_image, match_score
 
+def calculate_deviation_vectors(actual_points, theoretical_points, num_key_points=10):
+    """
+    计算实际中轴线相对于理论中轴线的偏移向量。
+
+    该函数在理论中轴线上选取若干关键点，然后为每个关键点找到
+    实际中轴线上最近的对应点，并计算两者之间的偏移向量。
+
+    :param actual_points: (N, 2) numpy数组，实际中轴线坐标。
+    :param theoretical_points: (M, 2) numpy数组，理论中轴线坐标。
+    :param num_key_points: 要在理论中轴线上选取的关键点数量。
+    :return: 一个列表，每个元素是一个元组 (key_point, deviation_vector)，
+             其中 key_point 是理论关键点的坐标，deviation_vector 是 (dx, dy) 形式的偏移向量。
+             如果输入为空，则返回空列表。
+    """
+    if actual_points.size == 0 or theoretical_points.size == 0:
+        return []
+
+    # 1. 在理论中轴线上均匀选取关键点
+    key_point_indices = np.linspace(0, len(theoretical_points) - 1, num_key_points, dtype=int)
+    theory_key_points = theoretical_points[key_point_indices]
+
+    # 2. 构建实际中轴线点的 KDTree 以便快速查找最近邻
+    tree = cKDTree(actual_points)
+
+    deviation_results = []
+    # 3. 为每个理论关键点找到实际对应点并计算向量
+    for key_point in theory_key_points:
+        # 查找最近的实际点
+        distance, nearest_index = tree.query(key_point)
+        actual_corresponding_point = actual_points[nearest_index]
+
+        # 计算偏移向量
+        deviation_vector = actual_corresponding_point - key_point
+        deviation_results.append((key_point, deviation_vector))
+
+    return deviation_results
+
+def visualize_deviation_vectors(vis_image, deviation_results):
+    """
+    在图像上将偏移向量可视化为箭头。
+
+    :param vis_image: 要绘制的 BGR 图像。
+    :param deviation_results: calculate_deviation_vectors 函数的输出结果。
+    :return: 绘制了向量后的图像。
+    """
+    img_with_vectors = vis_image.copy()
+    for key_point, vector in deviation_results:
+        start_point = tuple(key_point.astype(int))
+        end_point = tuple((key_point + vector).astype(int))
+
+        # 绘制从理论点指向实际点的箭头，表示偏差方向
+        cv2.arrowedLine(img_with_vectors, start_point, end_point, (0, 255, 255), 2, tipLength=0.4) # 黄色箭头
+        # 标记理论关键点位置
+        cv2.circle(img_with_vectors, start_point, radius=5, color=(255, 0, 0), thickness=-1) # 蓝色圆点
+
+    return img_with_vectors
+
 
 def main():
     cl = PercipioSDK()
@@ -1029,15 +1086,33 @@ def main():
                         print("前5个点的全局坐标 (x, y):")
                         print(skeleton_points[:5])
 
-                    # --- 新增：比较中轴线 ---
+
+                    # --- 修改：比较中轴线并计算和显示偏移向量 ---
                     if theoretical_centerline is not None:
+                        # 步骤 1: 生成基础的对比图
                         comparison_vis, match_score = compare_centerlines(
                             skeleton_points,
                             theoretical_centerline,
                             (depth.shape[0], depth.shape[1])
                         )
-                        cv2.imshow("Centerline Comparison", comparison_vis)
                         print(f"中轴线匹配度: {match_score:.2f}")
+
+                        # 步骤 2: 计算偏移向量
+                        deviation_vectors = calculate_deviation_vectors(
+                            skeleton_points,
+                            theoretical_centerline,
+                            num_key_points=15  # 您可以调整关键点的数量
+                        )
+
+                        # 打印输出纠偏数据
+                        print("--- 关键点偏移向量 (理论点 -> 实际点) ---")
+                        for i, (key_pt, vec) in enumerate(deviation_vectors):
+                            print(f"  关键点 {i}: 理论位置 {key_pt.astype(int)}, 偏移 (dx, dy) = {vec.astype(int)}")
+
+                        # 步骤 3: 在对比图上可视化偏移向量
+                        final_vis = visualize_deviation_vectors(comparison_vis, deviation_vectors)
+                        cv2.imshow("Centerline Comparison with Deviation Vectors", final_vis)
+
                     # --- 结束新增 ---
 
                     if dilation_vis.ndim == 3 and dilation_vis.shape[2] == 3:
