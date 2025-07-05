@@ -487,6 +487,7 @@ def overlay_skeleton_with_scaling(cl: pcammls.PercipioSDK,
     cv2.imshow("MappedDepthRender", img_registration_render.as_nparray())
 
     # 显示最终的叠加结果
+    result = cv2.resize(result,(0,0),fx=0.5, fy=0.5)
     cv2.imshow("ColorSkeletonOverlay (Aligned)", result)
 
 
@@ -533,7 +534,7 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
     skeleton_img = (skeleton * 255).astype(np.uint8)
 
     # 4. 膨胀骨架使其更粗，便于观察和后续处理
-    kernel = np.ones((3, 3), np.uint8)
+    kernel = np.ones((1, 1), np.uint8)
     dilated_skeleton = cv2.dilate(skeleton_img, kernel, iterations=1)
 
     # 5. 可视化（如果需要）
@@ -755,13 +756,53 @@ def visualize_deviation_vectors(vis_image, deviation_results):
         start_point = tuple(key_point.astype(int))
         end_point = tuple((key_point + vector).astype(int))
 
-        # 绘制从理论点指向实际点的箭头，表示偏差方向
-        cv2.arrowedLine(img_with_vectors, start_point, end_point, (0, 255, 255), 2, tipLength=0.4) # 黄色箭头
+        # 绘制从实际点指向理论点的箭头，表示偏差方向
+
+        cv2.arrowedLine(img_with_vectors, end_point, start_point, (0, 255, 255), 2, tipLength=0.4) # 黄色箭头
         # 标记理论关键点位置
-        cv2.circle(img_with_vectors, start_point, radius=5, color=(255, 0, 0), thickness=-1) # 蓝色圆点
+        cv2.circle(img_with_vectors, start_point, radius=3, color=(255, 0, 0), thickness=-1) # 蓝色圆点
 
     return img_with_vectors
 
+def visualize_z_channel(p3d_array, window_name="Z-Channel Visualization"):
+    """
+    将点云的 Z 通道可视化为一张伪彩色深度图。
+
+    :param p3d_array: (H, W, 3) 的点云 NumPy 数组。
+    :param window_name: 显示窗口的名称。
+    """
+    # 1. 提取 Z 通道
+    z_channel = p3d_array[:, :, 2].copy()
+
+    # 2. 找到有效的 Z 值 (非无穷大或 NaN)
+    valid_mask = np.isfinite(z_channel) & (z_channel != 0)
+    if not np.any(valid_mask):
+        # 如果没有有效点，显示一张黑图
+        cv2.imshow(window_name, np.zeros((z_channel.shape[0], z_channel.shape[1], 3), dtype=np.uint8))
+        return
+
+    # 3. 将有效 Z 值归一化到 0-255 范围以便显示
+    z_valid = z_channel[valid_mask]
+    z_min, z_max = np.min(z_valid), np.max(z_valid)
+
+    if z_max - z_min > 0:
+        # 归一化
+        normalized_z = (z_channel - z_min) / (z_max - z_min) * 255
+    else:
+        # 如果所有值都一样，则设为中间值
+        normalized_z = np.full(z_channel.shape, 128)
+
+    # 将归一化后的值转换为 8 位无符号整数
+    z_uint8 = normalized_z.astype(np.uint8)
+
+    # 4. 应用伪彩色映射表以增强可视化效果
+    colored_z = cv2.applyColorMap(z_uint8, cv2.COLORMAP_JET)
+
+    # 在无效区域显示为黑色
+    colored_z[~valid_mask] = [0, 0, 0]
+
+    # 5. 显示图像
+    cv2.imshow(window_name, colored_z)
 
 def main():
     cl = PercipioSDK()
@@ -788,6 +829,13 @@ def main():
     except FileNotFoundError:
         print("警告: 未找到 'theoretical_centerline.npy'。请先运行 draw_centerline.py 创建理论中轴线。")
         theoretical_centerline = None
+    try:
+        rotation_matrix = np.load('tilt_correction_matrix.npy')
+        print("成功加载倾斜校正矩阵。")
+    except FileNotFoundError:
+        rotation_matrix = None
+        print("警告: 未找到 'tilt_correction_matrix.npy'。")
+        print("程序将不进行倾斜校正。请先运行 my_calibrate.py 进行校准。")
 
     handle = cl.Open(sn)
     if not cl.isValidHandle(handle):
@@ -1007,8 +1055,12 @@ def main():
                 # 长条的
                 # ROI_X1, ROI_Y1 = 668, 607  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 749, 813  # 右下角坐标
-                ROI_X1, ROI_Y1 = 680, 689  # 左上角坐标
-                ROI_X2, ROI_Y2 = 732, 803  # 右下角坐标
+                #backup
+                # ROI_X1, ROI_Y1 = 634, 717  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 767, 800  # 右下角坐标
+                ROI_X1, ROI_Y1 = 603, 731  # 左上角坐标
+                ROI_X2, ROI_Y2 = 736, 798  # 右下角坐标
+
 
                 # ROI_X1, ROI_Y1 = 876, 665  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 928, 810  # 右下角坐标
@@ -1020,7 +1072,25 @@ def main():
                 sz = pointcloud_data_arr.size()
                 print('get p3d size : {}'.format(sz))  # get p3d size : 3145728
                 p3d_nparray = pointcloud_data_arr.as_nparray()  # (1536, 2048, 3)
-                # cv2.imshow("p3d_nparray", p3d_nparray)
+                visualize_z_channel(p3d_nparray, "Z-Channel (Before Correction)")
+                # 点云校准
+                if rotation_matrix is not None:
+                    # 获取点云的原始形状
+                    original_shape = p3d_nparray.shape
+                    # 将点云数据从 (H, W, 3) 变形为 (N, 3) 以便进行矩阵乘法
+                    points = p3d_nparray.reshape(-1, 3)
+
+                    # 过滤掉无效点 (z<=0)，避免不必要的计算
+                    valid_points_mask = points[:, 2] > 0
+
+                    # 使用矩阵进行旋转：p' = R * p^T  (这里用 p @ R.T 更高效)
+                    # 只对有效点进行旋转
+                    points[valid_points_mask] = points[valid_points_mask] @ rotation_matrix.T
+
+                    # 将旋转后的点云数据恢复为原始的 (H, W, 3) 形状
+                    p3d_nparray = points.reshape(original_shape)
+                    print("已对点云应用倾斜校正。")
+                    visualize_z_channel(p3d_nparray, "Z-Channel (After Correction)")
 
                 # 深度图显示
                 cl.DeviceStreamDepthRender(frame, img_registration_depth)
@@ -1030,14 +1100,15 @@ def main():
                 roi_cloud = p3d_nparray[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
                 cv2.imshow("roi_p3d_nparray", roi_cloud)
 
+
                 surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=2.5)
                 if surface_mask is None:
                     print("无法提取表面掩码，跳过此帧。")
                     continue
                 cv2.imshow("Initial Surface Mask", surface_mask)
 
-                # 直接从 surface_mask 计算中轴线，不再使用 RANSAC
-                dilation_vis = extract_skeleton_from_surface_mask(surface_mask, visualize=True)
+                # # 直接从 surface_mask 计算中轴线，不再使用 RANSAC
+                # dilation_vis = extract_skeleton_from_surface_mask(surface_mask, visualize=True)
                 # # 使用通用骨架提取方法，能处理实心和空心物体
                 dilation_vis = extract_skeleton_universal(surface_mask, visualize=True)
 
@@ -1101,7 +1172,7 @@ def main():
                         deviation_vectors = calculate_deviation_vectors(
                             skeleton_points,
                             theoretical_centerline,
-                            num_key_points=15  # 您可以调整关键点的数量
+                            num_key_points=12
                         )
 
                         # 打印输出纠偏数据
@@ -1111,6 +1182,9 @@ def main():
 
                         # 步骤 3: 在对比图上可视化偏移向量
                         final_vis = visualize_deviation_vectors(comparison_vis, deviation_vectors)
+                        # # 窗口大小调整成一半
+                        # final_vis = cv2.resize(final_vis, (0, 0), fx=0.5, fy=0.5)
+
                         cv2.imshow("Centerline Comparison with Deviation Vectors", final_vis)
 
                     # --- 结束新增 ---
