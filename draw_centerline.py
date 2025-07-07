@@ -238,6 +238,12 @@ def auto_extract_centerline(cl, handle):
     print("4. 程序将自动提取ROI内的中轴线并显示预览。")
     print("5. 按 's' 保存, 'r' 重新选择ROI, 'q' 退出。")
 
+    try:
+        rotation_matrix = np.load('tilt_correction_matrix.npy')
+        print("成功加载倾斜校正矩阵。")
+    except FileNotFoundError:
+        rotation_matrix = None
+        print("警告: 未找到 'tilt_correction_matrix.npy'。将使用原始点云数据。")
     # 获取必要的相机参数
     scale_unit = cl.DeviceReadCalibDepthScaleUnit(handle)
     depth_calib_data = cl.DeviceReadCalibData(handle, PERCIPIO_STREAM_DEPTH)
@@ -271,6 +277,14 @@ def auto_extract_centerline(cl, handle):
             captured_frame = live_view
             cl.DeviceStreamMapDepthImageToPoint3D(depth_frame, depth_calib_data, scale_unit, pointcloud_data_arr)
             p3d_nparray = pointcloud_data_arr.as_nparray()
+            if rotation_matrix is not None:
+                print("旋转矩阵：", rotation_matrix)
+                original_shape = p3d_nparray.shape
+                points = p3d_nparray.reshape(-1, 3)
+                valid_points_mask = points[:, 2] > 0
+                points[valid_points_mask] = points[valid_points_mask] @ rotation_matrix.T
+                p3d_nparray = points.reshape(original_shape)
+                print("已对点云应用倾斜校正。")
             cv2.destroyWindow("Live View - Press 'c' to capture")
             print("图像已捕获。请选择ROI。")
             break
@@ -301,7 +315,7 @@ def auto_extract_centerline(cl, handle):
         roi_cloud = p3d_nparray[y1:y2, x1:x2]
 
         # 提取表面
-        surface_mask = extract_nearest_surface_mask(roi_cloud, depth_margin=2.5)
+        surface_mask = extract_nearest_surface_mask(roi_cloud, depth_margin=3.5)
         if surface_mask is None:
             print("在ROI内未找到有效表面，请重试。")
             continue
