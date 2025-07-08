@@ -1050,22 +1050,12 @@ def main():
                 # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
                 # 这里使用的是深度图分辨率的 ROI
                 # 正方形的
-                # ROI_X1, ROI_Y1 = 745, 591  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 1009, 813  # 右下角坐标
-                # 长条的
-                # ROI_X1, ROI_Y1 = 668, 607  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 749, 813  # 右下角坐标
+                ROI_X1, ROI_Y1 = 716, 593  # 左上角坐标
+                ROI_X2, ROI_Y2 = 907, 801  # 右下角坐标
                 #backup
-                # ROI_X1, ROI_Y1 = 634, 717  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 767, 800  # 右下角坐标
-                ROI_X1, ROI_Y1 = 603, 731  # 左上角坐标
-                ROI_X2, ROI_Y2 = 736, 798  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 603, 731  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 736, 798  # 右下角坐标
 
-
-                # ROI_X1, ROI_Y1 = 876, 665  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 928, 810  # 右下角坐标
-                # ROI_X1, ROI_Y1 = 865, 482  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 941, 669  # 右下角坐标
 
                 # 点云转换
                 cl.DeviceStreamMapDepthImageToPoint3D(frame, depth_calib_data, scale_unit, pointcloud_data_arr)
@@ -1101,7 +1091,7 @@ def main():
                 cv2.imshow("roi_p3d_nparray", roi_cloud)
 
 
-                surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=2.5)
+                surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=3.5)
                 if surface_mask is None:
                     print("无法提取表面掩码，跳过此帧。")
                     continue
@@ -1158,7 +1148,7 @@ def main():
                         print(skeleton_points[:5])
 
 
-                    # --- 修改：比较中轴线并计算和显示偏移向量 ---
+                    # --- 比较中轴线并计算和显示偏移向量 ---
                     if theoretical_centerline is not None:
                         # 步骤 1: 生成基础的对比图
                         comparison_vis, match_score = compare_centerlines(
@@ -1179,6 +1169,15 @@ def main():
                         print("--- 关键点偏移向量 (理论点 -> 实际点) ---")
                         for i, (key_pt, vec) in enumerate(deviation_vectors):
                             print(f"  关键点 {i}: 理论位置 {key_pt.astype(int)}, 偏移 (dx, dy) = {vec.astype(int)}")
+
+                        # 计算并输出平均偏移量
+                        if deviation_vectors:
+                            # 提取所有的偏移向量 (dx, dy)
+                            all_vectors = np.array([vec for _, vec in deviation_vectors])
+                            # 计算平均偏移量
+                            average_offset = np.mean(all_vectors, axis=0)
+                            print("--- 平均偏移量 (dx, dy) ---")
+                            print(f"  ({average_offset[0]:.2f}, {average_offset[1]:.2f})")
 
                         # 步骤 3: 在对比图上可视化偏移向量
                         final_vis = visualize_deviation_vectors(comparison_vis, deviation_vectors)
