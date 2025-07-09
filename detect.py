@@ -836,6 +836,13 @@ def main():
         rotation_matrix = None
         print("警告: 未找到 'tilt_correction_matrix.npy'。")
         print("程序将不进行倾斜校正。请先运行 my_calibrate.py 进行校准。")
+    try:
+        hand_eye_matrix = np.load('hand_eye_transform.npy')
+        print("成功加载手眼标定矩阵 'hand_eye_transform.npy'。")
+    except FileNotFoundError:
+        print("警告: 未找到手眼标定矩阵 'hand_eye_transform.npy'。")
+        print("将无法计算物理偏移量。请先运行 calibrate_hand_eye.py。")
+        hand_eye_matrix = None
 
     handle = cl.Open(sn)
     if not cl.isValidHandle(handle):
@@ -1178,6 +1185,16 @@ def main():
                             average_offset = np.mean(all_vectors, axis=0)
                             print("--- 平均偏移量 (dx, dy) ---")
                             print(f"  ({average_offset[0]:.2f}, {average_offset[1]:.2f})")
+
+                            if hand_eye_matrix is not None:
+                                # 提取矩阵的线性部分 (旋转和缩放)
+                                linear_transform = hand_eye_matrix[:, :2]
+
+                                # 计算物理世界中的偏移量 (dX, dY)
+                                physical_offset = linear_transform @ average_offset
+
+                                print("--- 纠正后的平均物理偏移量 (dX, dY) ---")
+                                print(f"  ({physical_offset[0]:.3f}, {physical_offset[1]:.3f}) mm")
 
                         # 步骤 3: 在对比图上可视化偏移向量
                         final_vis = visualize_deviation_vectors(comparison_vis, deviation_vectors)
