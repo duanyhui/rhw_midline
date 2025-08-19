@@ -162,6 +162,154 @@ def extract_nearest_surface_mask(roi_p3d_aligned, depth_margin):
 
     return surface_mask, z_min_val
 
+def extract_nearest_surface_mask_ransac(roi_p3d_aligned, depth_margin,
+                                        ransac_iters=400,
+                                        dist_thresh=0.8,
+                                        front_percentile=20.0,
+                                        subsample=50000,
+                                        random_state=None):
+    """
+    使用 RANSAC 在粗糙场景下提取“最近表面”的掩码（斜面近端带厚度）。
+
+    参数:
+        roi_p3d_aligned: np.ndarray, (H, W, 3)，ROI 内点云，单位 mm
+        depth_margin: float，最近表面沿相机 Z 方向的厚度阈值（mm）
+        ransac_iters: int，RANSAC 迭代次数
+        dist_thresh: float，RANSAC 评估平面的正交距离阈值（mm）
+        front_percentile: float，仅从靠前的这部分百分位（按Z从小到大）里随机采样构模，减少采到背景面的概率
+        subsample: int，为加速在大ROI下进行下采样的上限点数
+        random_state: Optional[int]，随机种子，便于复现实验
+
+    返回:
+        surface_mask: np.ndarray, (H, W) uint8，255表示属于最近表面区域
+        z_min_val: float，拟合后内点中的最小Z（mm），便于日志/对齐参考
+    """
+    import numpy as np
+
+    H, W, _ = roi_p3d_aligned.shape
+    z_img = roi_p3d_aligned[:, :, 2].copy()
+    z_img[z_img <= 0] = 0  # 过滤无效值
+    valid_mask = z_img > 0
+    if not np.any(valid_mask):
+        print("无有效深度值")
+        return None, None
+
+    rng = np.random.default_rng(random_state)
+
+    # --- 准备点集 ---
+    ys, xs = np.where(valid_mask)
+    pts = roi_p3d_aligned[ys, xs].reshape(-1, 3)  # Nx3
+    N = pts.shape[0]
+
+    # 仅在靠前(front)的点里采样建模，降低选到背景的概率
+    z_sorted = np.sort(pts[:, 2])
+    z_front_cut = z_sorted[int(np.clip((front_percentile / 100.0) * (N - 1), 0, N - 1))]
+    front_idx = np.where(pts[:, 2] <= z_front_cut)[0]
+    if front_idx.size < 3:
+        # 退化情况下扩大采样集合
+        front_idx = np.arange(N)
+
+    # 下采样以加速
+    if N > subsample:
+        keep = rng.choice(N, subsample, replace=False)
+        pts_eval = pts[keep]
+    else:
+        pts_eval = pts
+
+    # --- RANSAC: 拟合最“靠前”的大面 ---
+    best_inliers = None
+    best_inlier_count = 0
+    best_mean_z = np.inf
+    best_plane = None  # (a,b,c,d) with ||(a,b,c)||=1
+
+    for _ in range(int(ransac_iters)):
+        # 1) 随机取3点(来自前景子集)拟合候选平面
+        tri = rng.choice(front_idx, 3, replace=False)
+        p1, p2, p3 = pts[tri[0]], pts[tri[1]], pts[tri[2]]
+        v1, v2 = p2 - p1, p3 - p1
+        n = np.cross(v1, v2)
+        n_norm = np.linalg.norm(n)
+        if n_norm < 1e-9:
+            continue
+        n = n / n_norm
+        d = -np.dot(n, p1)  # 平面 ax+by+cz+d=0
+
+        # 2) 计算评估集到平面的正交距离
+        dists = np.abs(pts_eval @ n + d)  # 因为n单位化，无需再除以||n||
+        inliers_eval = dists < dist_thresh
+        inlier_count = int(inliers_eval.sum())
+        if inlier_count == 0:
+            continue
+
+        # 3) 在全体点上复核（只在更优时做）
+        if inlier_count > best_inlier_count:
+            dists_all = np.abs(pts @ n + d)
+            inliers_all = dists_all < dist_thresh
+            inlier_count_all = int(inliers_all.sum())
+            mean_z = float(pts[inliers_all, 2].mean()) if inlier_count_all > 0 else np.inf
+
+            # 选择：优先更多内点；若相同，更靠前（平均Z更小）
+            if (inlier_count_all > best_inlier_count) or \
+               (inlier_count_all == best_inlier_count and mean_z < best_mean_z):
+                best_inliers = inliers_all
+                best_inlier_count = inlier_count_all
+                best_mean_z = mean_z
+                best_plane = (n, d)
+
+    if best_inliers is None or best_inlier_count < 3:
+        # RANSAC 失败，退回到最简单“z层”方法
+        z_min_val = float(np.min(pts[:, 2]))
+        print("\t[RANSAC回退] 最小深度值:{}mm".format(z_min_val))
+        lower, upper = z_min_val, z_min_val + float(depth_margin)
+        surface_mask = ((z_img >= lower) & (z_img <= upper)).astype(np.uint8) * 255
+        return surface_mask, z_min_val
+
+    # --- 用最佳内点做一次 SVD 精拟合平面 ---
+    inlier_pts = pts[best_inliers]
+    centroid = inlier_pts.mean(axis=0)
+    X = inlier_pts - centroid
+    # SVD: 最小奇异值对应的法向
+    _, _, Vt = np.linalg.svd(X, full_matrices=False)
+    n_ref = Vt[-1, :]
+    n_ref_norm = np.linalg.norm(n_ref)
+    if n_ref_norm < 1e-9:
+        # 退化情况：沿用RANSAC的n,d
+        n_ref, d_ref = best_plane
+    else:
+        n_ref = n_ref / n_ref_norm
+        d_ref = -np.dot(n_ref, centroid)
+
+    # --- 生成掩码：沿相机Z方向的“上行厚度” ---
+    # 平面: a x + b y + c z + d = 0
+    a, b, c = n_ref
+    d = d_ref
+
+    surface_mask = np.zeros((H, W), dtype=np.uint8)
+    z_min_val = float(inlier_pts[:, 2].min())
+    print("\t[RANSAC] 最小深度值:{}mm".format(z_min_val))
+
+    if abs(c) >= 1e-8:
+        # 可用 z_plane 预测，保留 z - z_plane ∈ [0, depth_margin]
+        # 对有效像素进行向量化计算
+        xs_f = roi_p3d_aligned[valid_mask, 0]
+        ys_f = roi_p3d_aligned[valid_mask, 1]
+        zs_f = roi_p3d_aligned[valid_mask, 2]
+        z_plane = -(a * xs_f + b * ys_f + d) / c
+        dz = zs_f - z_plane
+        keep = (dz >= 0.0) & (dz <= float(depth_margin))
+        surface_mask[ys, xs] = (keep.astype(np.uint8) * 255)
+    else:
+        # 平面近似与Z轴平行，退而用“正交距离 + z阈值”的保守判定
+        dists_all = np.abs(roi_p3d_aligned[:, :, 0] * a +
+                           roi_p3d_aligned[:, :, 1] * b +
+                           roi_p3d_aligned[:, :, 2] * c + d)
+        # 取在平面附近且 z 不超过最近内点 + depth_margin
+        keep = (dists_all < float(dist_thresh)) & (z_img > 0) & (z_img <= (z_min_val + float(depth_margin)))
+        surface_mask[keep] = 255
+
+    return surface_mask, z_min_val
+
+
 
 
 
@@ -856,11 +1004,11 @@ def main():
                 # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
                 # 这里使用的是深度图分辨率的 ROI
                 # 正方形的
-                ROI_X1, ROI_Y1 = 693, 614  # 左上角坐标
-                ROI_X2, ROI_Y2 = 924, 806  # 右下角坐标
+                ROI_X1, ROI_Y1 = 993, 614  # 左上角坐标
+                ROI_X2, ROI_Y2 = 1186, 790  # 右下角坐标
                 #backup
-                # ROI_X1, ROI_Y1 = 603, 731  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 736, 798  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 915, 709  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 980, 790  # 右下角坐标
 
 
                 # 点云转换
@@ -896,15 +1044,19 @@ def main():
                 roi_cloud = p3d_nparray[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
                 cv2.imshow("roi_p3d_nparray", roi_cloud)
 
-                ### --- 核心修改：根据是否校正来选择不同的掩码提取方法 --- ###
+
                 if rotation_matrix is None:
                     print("未进行倾斜校正，使用原始方法提取掩码。")
                     surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=3.5)
                 else:
                     # 如果已校正，则使用正交投影生成无畸变掩码
                     print("已进行倾斜校正，使用正交投影生成无畸变掩码。")
-                    surface_mask, z_min = create_corrected_mask(roi_cloud, depth_margin=3.5, pixel_size_mm= 0.5)
-                    # surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=3.8)
+                    # surface_mask, z_min = create_corrected_mask(roi_cloud, depth_margin=5.5, pixel_size_mm= 0.5)
+                    # 使用原始方式，能更好地处理空心物体
+                    # surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=5.8)
+                    # 使用 RANSAC 方法提取表面掩码，适应粗糙表面
+                    surface_mask, z_min = extract_nearest_surface_mask_ransac(roi_cloud, depth_margin=3.8, ransac_iters=400,
+                                                        dist_thresh=0.8,front_percentile=20.0,subsample=50000,random_state=1)
                 if surface_mask is None:
                     print("无法提取表面掩码，跳过此帧。")
                     continue
