@@ -14,7 +14,7 @@ import csv
 import numpy as np
 import cv2
 
-# 导入用户算法模块
+# 导入用户算法模块（保持不改动原脚本）
 try:
     import detect_simplified as detect
 except Exception:
@@ -34,12 +34,18 @@ class ProcessingResult:
     avg_mm_offset: Optional[Tuple[float, float]] = None
     msg: str = ""
 
+@dataclass
+class PipelineConfig:
+    depth_margin: float = 3.5      # mm，离表面最近层的容忍范围
+    pixel_size_mm: float = 0.5     # mm/px，用于 create_corrected_mask 的栅格化
+
 class Pipeline:
     def __init__(self):
         self.theoretical_centerline = None      # (N,2)
         self.tilt_matrix = None                 # (3,3)
         self.hand_eye = None                    # (2,3)
         self._last_result: Optional[ProcessingResult] = None
+        self.cfg = PipelineConfig()
         self.load_assets()
 
     # ---------- Assets ----------
@@ -59,17 +65,33 @@ class Pipeline:
         except Exception:
             return None
 
+    # 允许在外部更新配置（GUI 可调用）
+    def set_config(self, depth_margin: Optional[float] = None, pixel_size_mm: Optional[float] = None):
+        if depth_margin is not None:
+            self.cfg.depth_margin = float(depth_margin)
+        if pixel_size_mm is not None:
+            self.cfg.pixel_size_mm = float(pixel_size_mm)
+
     # ---------- Processing ----------
     def process_frame(self,
                       p3d_nparray: np.ndarray,
                       depth_render_bgr: np.ndarray,
                       roi_xyxy: Tuple[int, int, int, int],
-                      num_key_points: int = 12) -> ProcessingResult:
+                      num_key_points: int = 12,
+                      depth_margin: Optional[float] = None,
+                      pixel_size_mm: Optional[float] = None) -> ProcessingResult:
         """
         在一帧数据上执行完整流程。
+        可选参数：
+        - depth_margin: 覆盖默认配置的 mm 容差
+        - pixel_size_mm: 覆盖默认配置的 mm/px，create_corrected_mask 时有效
         """
         if detect is None:
             raise RuntimeError("detect 模块导入失败，无法执行算法。")
+
+        # 解析参数（若未传则落到配置默认）
+        dm = float(depth_margin) if depth_margin is not None else self.cfg.depth_margin
+        pmm = float(pixel_size_mm) if pixel_size_mm is not None else self.cfg.pixel_size_mm
 
         x1, y1, x2, y2 = roi_xyxy
         # 保护边界
@@ -79,8 +101,8 @@ class Pipeline:
         if x2 <= x1 or y2 <= y1:
             return ProcessingResult(msg="ROI 无效。")
 
-        # 1) ROI 点云提取
-        roi_cloud = p3d_nparray[y1:y2, x1:x2].copy()  # (H_roi, W_roi, 3) 单位mm
+        # 1) ROI 点云
+        roi_cloud = p3d_nparray[y1:y2, x1:x2].copy()  # (H_roi, W_roi, 3) mm
 
         # 2) 倾斜校正（可选）
         if self.tilt_matrix is not None:
@@ -91,9 +113,17 @@ class Pipeline:
 
         # 3) 表面掩码
         if self.tilt_matrix is not None and hasattr(detect, "create_corrected_mask"):
-            surface_mask, z_min = detect.create_corrected_mask(roi_cloud, depth_margin=3.5, pixel_size_mm=0.5)  # 可能弹窗
+            # todo  都使用 create_corrected_mask方法，extract_nearest_surface_mask方法会导致物体中轴线映射到深度图后出现畸变，要寻找新的方法
+            surface_mask, z_min = detect.extract_nearest_surface_mask(
+                roi_cloud, depth_margin=dm
+            )
+            # surface_mask, z_min = detect.create_corrected_mask(
+            #     roi_cloud, depth_margin=dm, pixel_size_mm=pmm
+            # )
         else:
-            surface_mask, z_min = detect.extract_nearest_surface_mask(roi_cloud, depth_margin=3.5)
+            surface_mask, z_min = detect.extract_nearest_surface_mask(
+                roi_cloud, depth_margin=dm
+            )
         if surface_mask is None:
             return ProcessingResult(msg="未能提取表面掩码。")
 
@@ -103,10 +133,7 @@ class Pipeline:
         if skel_bgr is None:
             return ProcessingResult(surface_mask=surface_mask, msg="骨架提取失败。")
 
-        # 转灰度用于叠加
-        skel_gray = cv2.cvtColor(skel_bgr, cv2.COLOR_BGR2GRAY) if skel_bgr.ndim == 3 else skel_bgr
-
-        # 5) 提取骨架离散点（映射到全局坐标）
+        # 5) 骨架离散点（映射到全局）
         if hasattr(detect, "extract_skeleton_points_and_visualize"):
             actual_points = detect.extract_skeleton_points_and_visualize(
                 skel_bgr, origin_offset=(x1, y1), visualize=False
@@ -118,15 +145,16 @@ class Pipeline:
         if actual_points is None or len(actual_points) == 0:
             return ProcessingResult(surface_mask=surface_mask, msg="骨架点为空。")
 
-        # 6) 在深度渲染图上叠加骨架（UI展示）
+        # 6) 叠加到深度渲染
         depth_h, depth_w = depth_render_bgr.shape[:2]
+        skel_gray = cv2.cvtColor(skel_bgr, cv2.COLOR_BGR2GRAY) if skel_bgr.ndim == 3 else skel_bgr
         full_mask = np.zeros((depth_h, depth_w), dtype=np.uint8)
         full_mask[y1:y2, x1:x2] = skel_gray
         mask_color = np.zeros_like(depth_render_bgr)
         mask_color[full_mask > 0] = (102, 255, 255)
         overlay = cv2.addWeighted(depth_render_bgr, 0.7, mask_color, 0.6, 0.0)
 
-        # 7) 与理论中轴线比较 + 偏移
+        # 7) 比较 + 偏移
         comparison_img = None
         deviation_results = []
         avg_px = None
@@ -146,7 +174,7 @@ class Pipeline:
                 avg_px = (float(vecs[:,0].mean()), float(vecs[:,1].mean()))
                 # 物理(mm)偏移（若有手眼 2x3）
                 if self.hand_eye is not None:
-                    linear = self.hand_eye[:, :2]  # 2x2
+                    linear = self.hand_eye[:, :2]
                     mm = linear @ np.array([[avg_px[0]], [avg_px[1]]], dtype=np.float32)
                     avg_mm = (float(mm[0,0]), float(mm[1,0]))
             # 偏移箭头可视化
@@ -160,7 +188,7 @@ class Pipeline:
             deviation_results=deviation_results,
             avg_pixel_offset=avg_px,
             avg_mm_offset=avg_mm,
-            msg=f"提取点数: {len(actual_points)}"
+            msg=f"提取点数: {len(actual_points)} | depth_margin={dm}, pixel_size_mm={pmm}"
         )
         return self._last_result
 
@@ -181,15 +209,11 @@ class Pipeline:
             mag_px = float(np.linalg.norm(vec))
             mm_x, mm_y, mag_mm = "", "", ""
             if res.avg_mm_offset is not None and self.hand_eye is not None:
-                # 对单个向量也做 mm 变换（2x2）
                 linear = self.hand_eye[:, :2]
                 mm_vec = linear @ vec.reshape(2,1)
                 mm_x = float(mm_vec[0,0]); mm_y = float(mm_vec[1,0])
                 mag_mm = float(np.linalg.norm([mm_x, mm_y]))
-            rows.append([
-                i, float(kp[0]), float(kp[1]), float(vec[0]), float(vec[1]), mag_px, mm_x, mm_y, mag_mm
-            ])
-        # 平均
+            rows.append([i, float(kp[0]), float(kp[1]), float(vec[0]), float(vec[1]), mag_px, mm_x, mm_y, mag_mm])
         avg_px = res.avg_pixel_offset if res.avg_pixel_offset is not None else (None, None)
         avg_mm = res.avg_mm_offset if res.avg_mm_offset is not None else (None, None)
         rows.append(["AVERAGE", "", "", avg_px[0], avg_px[1],
@@ -197,7 +221,6 @@ class Pipeline:
                      avg_mm[0] if avg_mm[0] is not None else "",
                      avg_mm[1] if avg_mm[1] is not None else "",
                      "" if avg_mm[0] is None else float(np.linalg.norm(avg_mm))])
-
         with open(path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(["index","key_x","key_y","dx(px)","dy(px)","|d|(px)","dx(mm)","dy(mm)","|d|(mm)"])
