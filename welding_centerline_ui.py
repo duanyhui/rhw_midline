@@ -4,6 +4,7 @@ Welding Centerline UI (PySide6) — with configurable depth_margin & pixel_size_
 
 新增：
 - 控件可编辑 depth_margin(mm) 与 pixel_size_mm(mm/px)，覆盖 ui_pipeline 的默认配置。
+- 新增“表面掩码提取方法”选择（最近Z层 / RANSAC平面 / 倾斜校正网格），并提供 RANSAC 高级参数。
 """
 import os
 import sys
@@ -20,7 +21,7 @@ from PySide6.QtGui import QAction, QImage, QPixmap, QPainter, QColor, QPen
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QFileDialog, QMessageBox,
     QLabel, QPushButton, QVBoxLayout, QGroupBox, QFormLayout,
-    QGridLayout, QStatusBar, QSplitter, QSpinBox, QScrollArea, QDoubleSpinBox
+    QGridLayout, QStatusBar, QSplitter, QSpinBox, QScrollArea, QDoubleSpinBox, QComboBox, QHBoxLayout
 )
 
 # ---- Percipio SDK ----
@@ -251,13 +252,14 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea(); scroll.setWidget(right_content); scroll.setWidgetResizable(True)
         scroll.setStyleSheet("QScrollArea { background: #111; }")
 
-        # 控制 / 状态（新增可调参数）
+        # 控制 / 参数 / 状态
         ctrl_box = QGroupBox("控制 / 参数 / 状态")
         self.btn_process = QPushButton("处理选中 ROI")
         self.btn_export = QPushButton("导出 CSV")
         self.btn_reload_assets = QPushButton("重新加载参数(.npy)")
         self.ed_num_keypoints = QSpinBox(); self.ed_num_keypoints.setRange(4, 200); self.ed_num_keypoints.setValue(12)
 
+        # 通用参数
         self.ed_depth_margin = QDoubleSpinBox()
         self.ed_depth_margin.setRange(0.1, 50.0); self.ed_depth_margin.setSingleStep(0.1)
         self.ed_depth_margin.setDecimals(2); self.ed_depth_margin.setValue(3.5)
@@ -270,33 +272,62 @@ class MainWindow(QMainWindow):
         self.ed_pixel_size_mm.setSuffix(" mm/px")
         self.ed_pixel_size_mm.setToolTip("栅格像素对应的物理尺寸，仅 create_corrected_mask 时生效")
 
-        form = QFormLayout(ctrl_box)
-        form.addRow(self.btn_process, self.btn_export)
-        form.addRow("偏移关键点数量", self.ed_num_keypoints)
-        form.addRow("Depth Margin", self.ed_depth_margin)
-        form.addRow("Pixel Size (mm/px)", self.ed_pixel_size_mm)
-        form.addRow(self.btn_reload_assets)
+        # 表面方法选择
+        self.cmb_surface_method = QComboBox()
+        self.cmb_surface_method.addItems([
+            "最近Z层(快速)",               # nearest
+            "RANSAC平面(粗糙场景)",        # ransac
+            "倾斜校正网格(create_corrected_mask)"  # corrected
+        ])
+        self.cmb_surface_method.setCurrentIndex(0)  # 默认最近Z层
+
+        # RANSAC 高级参数
+        ran_box = QGroupBox("RANSAC 高级参数（粗糙场景）")
+        self.ed_ransac_iters = QSpinBox(); self.ed_ransac_iters.setRange(50, 5000); self.ed_ransac_iters.setValue(400)
+        self.ed_ransac_dist = QDoubleSpinBox(); self.ed_ransac_dist.setRange(0.05, 10.0); self.ed_ransac_dist.setDecimals(3); self.ed_ransac_dist.setValue(0.8); self.ed_ransac_dist.setSuffix(" mm")
+        self.ed_ransac_front = QDoubleSpinBox(); self.ed_ransac_front.setRange(1.0, 100.0); self.ed_ransac_front.setDecimals(1); self.ed_ransac_front.setValue(20.0); self.ed_ransac_front.setSuffix(" %")
+        self.ed_ransac_subs = QSpinBox(); self.ed_ransac_subs.setRange(1000, 2000000); self.ed_ransac_subs.setValue(50000)
+        self.ed_ransac_seed = QSpinBox(); self.ed_ransac_seed.setRange(-1, 10**9); self.ed_ransac_seed.setValue(-1)
+        rf = QFormLayout(ran_box)
+        rf.addRow("迭代次数", self.ed_ransac_iters)
+        rf.addRow("距离阈值", self.ed_ransac_dist)
+        rf.addRow("前景百分位", self.ed_ransac_front)
+        rf.addRow("下采样上限", self.ed_ransac_subs)
+        rf.addRow("随机种子(-1随机)", self.ed_ransac_seed)
 
         # 资产状态
         asset_box = QGroupBox("自动加载参数状态")
         self.lab_theory = QLabel("theoretical_centerline.npy: 未加载")
         self.lab_tilt = QLabel("tilt_correction_matrix.npy: 未加载")
         self.lab_handeye = QLabel("hand_eye_transform.npy: 未加载")
-        va = QVBoxLayout(asset_box); va.addWidget(self.lab_theory); va.addWidget(self.lab_tilt); va.addWidget(self.lab_handeye)
 
         # 偏移输出
         out_box = QGroupBox("偏移输出"); self.lab_px = QLabel("平均像素偏移: -"); self.lab_mm = QLabel("平均物理偏移: -")
+
+        # 布局
+        form = QFormLayout(ctrl_box)
+        form.addRow(self.btn_process, self.btn_export)
+        form.addRow("表面方法", self.cmb_surface_method)
+        form.addRow("Depth Margin", self.ed_depth_margin)
+        form.addRow("Pixel Size (mm/px)", self.ed_pixel_size_mm)
+        form.addRow("偏移关键点数量", self.ed_num_keypoints)
+        form.addRow(ran_box)
+        form.addRow(self.btn_reload_assets)
+
+        va = QVBoxLayout(asset_box); va.addWidget(self.lab_theory); va.addWidget(self.lab_tilt); va.addWidget(self.lab_handeye)
         vo = QVBoxLayout(out_box); vo.addWidget(self.lab_px); vo.addWidget(self.lab_mm)
 
-        # 底部日志
         self.log = QLabel("Ready."); self.log.setStyleSheet("color:#aaa")
 
-        # 左侧组装
         left_panel = QWidget(); left_v = QVBoxLayout(left_panel)
         left_v.addWidget(left_box); left_v.addWidget(ctrl_box); left_v.addWidget(asset_box); left_v.addWidget(out_box); left_v.addWidget(self.log)
 
         splitter = QSplitter(); splitter.addWidget(left_panel); splitter.addWidget(scroll); splitter.setSizes([620, 660])
         self.setCentralWidget(splitter); self.setStatusBar(QStatusBar())
+
+        # 初始：根据方法选择显示/隐藏 RANSAC 框
+        ran_box.setVisible(self.cmb_surface_method.currentIndex() == 1)
+        self._ran_box = ran_box  # 持有引用，便于切换可见性
 
     def _connect_signals(self):
         self.act_connect.triggered.connect(self.start_camera)
@@ -314,6 +345,28 @@ class MainWindow(QMainWindow):
         # 当参数改变时，同步到 Pipeline 的默认配置（即使不点处理也先存起来）
         self.ed_depth_margin.valueChanged.connect(lambda v: self.pipeline.set_config(depth_margin=v))
         self.ed_pixel_size_mm.valueChanged.connect(lambda v: self.pipeline.set_config(pixel_size_mm=v))
+
+        self.cmb_surface_method.currentIndexChanged.connect(self._on_surface_method_changed)
+
+        # RANSAC 实时同步默认配置
+        self.ed_ransac_iters.valueChanged.connect(lambda v: self.pipeline.set_config(ransac_iters=v))
+        self.ed_ransac_dist.valueChanged.connect(lambda v: self.pipeline.set_config(ransac_dist_thresh=v))
+        self.ed_ransac_front.valueChanged.connect(lambda v: self.pipeline.set_config(ransac_front_percentile=v))
+        self.ed_ransac_subs.valueChanged.connect(lambda v: self.pipeline.set_config(ransac_subsample=v))
+        self.ed_ransac_seed.valueChanged.connect(lambda v: self.pipeline.set_config(ransac_seed=v))
+
+        # 初始化一次默认方法
+        self.pipeline.set_config(surface_method=self._current_method_key())
+
+    def _current_method_key(self) -> str:
+        idx = self.cmb_surface_method.currentIndex()
+        return ("nearest", "ransac", "corrected")[idx]
+
+    def _on_surface_method_changed(self, idx: int):
+        # 切换 RANSAC 参数框可见性
+        self._ran_box.setVisible(idx == 1)
+        # 同步配置
+        self.pipeline.set_config(surface_method=self._current_method_key())
 
     # ---- 设备 ----
     def start_camera(self):
@@ -346,6 +399,14 @@ class MainWindow(QMainWindow):
 
         dm = float(self.ed_depth_margin.value())
         pmm = float(self.ed_pixel_size_mm.value())
+        method_key = self._current_method_key()
+
+        # RANSAC 参数（仅当选择 RANSAC 时会真正影响）
+        iters = int(self.ed_ransac_iters.value())
+        dist_th = float(self.ed_ransac_dist.value())
+        front_p = float(self.ed_ransac_front.value())
+        subs = int(self.ed_ransac_subs.value())
+        seed = int(self.ed_ransac_seed.value())
 
         try:
             res: ProcessingResult = self.pipeline.process_frame(
@@ -354,7 +415,13 @@ class MainWindow(QMainWindow):
                 roi_xyxy=roi,
                 num_key_points=self.ed_num_keypoints.value(),
                 depth_margin=dm,
-                pixel_size_mm=pmm
+                pixel_size_mm=pmm,
+                surface_method=method_key,
+                ransac_iters=iters,
+                ransac_dist_thresh=dist_th,
+                ransac_front_percentile=front_p,
+                ransac_subsample=subs,
+                ransac_seed=seed
             )
         except Exception as e:
             traceback.print_exc(); QMessageBox.critical(self, "处理失败", str(e)); return
