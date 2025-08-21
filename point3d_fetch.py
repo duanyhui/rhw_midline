@@ -119,7 +119,15 @@ def main():
           print('\tp3d data : {} {} {}'.format(p3d.getX(), p3d.getY(), p3d.getZ()))
 
       k = cv2.waitKey(10)
+      import open3d as o3d
       if k==ord('q'): 
+        # 保存点云文件
+        pcd = o3d.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(p3d_nparray[:, :3])
+        pcd.colors = o3d.utility.Vector3dVector(p3d_nparray[:, 3:6] / 255.0)
+        o3d.io.write_point_cloud('pointcloud.pcd', pcd)
+        
+
         break
 
     cl.DeviceStreamOff(handle)    
