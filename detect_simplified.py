@@ -427,6 +427,47 @@ def extract_contours_segmented(surface_mask, target_vertices=12, segment_ratio=0
     
     return fitted_contours
 
+def extract_contours_spline_smooth(surface_mask, target_vertices=12, smoothing_s=0):
+    """
+    使用样条曲线进行平滑拟合
+    """
+    from scipy.interpolate import splprep, splev
+    
+    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    fitted_contours = []
+    
+    for cnt in contours[:2]:
+        contour_points = cnt.reshape(-1, 2)
+        
+        if len(contour_points) < 4:
+            continue
+            
+        # 使用B样条进行平滑
+        try:
+            # 参数化轮廓
+            tck, u = splprep([contour_points[:, 0], contour_points[:, 1]], 
+                           s=smoothing_s, per=True)  # per=True表示闭合曲线
+            
+            # 生成平滑的点
+            u_new = np.linspace(0, 1, target_vertices, endpoint=False)
+            smooth_points = splev(u_new, tck)
+            
+            # 转换为OpenCV格式
+            smooth_contour = np.column_stack((smooth_points[0], smooth_points[1]))
+            result_contour = smooth_contour.reshape(-1, 1, 2).astype(np.int32)
+            fitted_contours.append(result_contour)
+            
+        except Exception as e:
+            print(f"样条拟合失败: {e}")
+            # 回退到原始轮廓
+            fitted_contours.append(cnt)
+    
+    return fitted_contours
+
 def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
                                      distance_threshold,
                                      ransac_n: int = 65,
