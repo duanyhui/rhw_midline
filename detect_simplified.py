@@ -373,6 +373,59 @@ def extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=12, max
 
     return fitted_contours
 
+def extract_contours_segmented(surface_mask, target_vertices=12, segment_ratio=0.3):
+    """
+    通过分段处理来保持复杂形状的更多顶点
+    """
+    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return []
+    
+    contours = sorted(contours, key=cv2.contourArea, reverse=True)
+    fitted_contours = []
+    
+    for cnt in contours[:2]:
+        # 将轮廓分成若干段分别拟合
+        contour_points = cnt.reshape(-1, 2)
+        n_points = len(contour_points)
+        segment_size = int(n_points * segment_ratio)
+        
+        if segment_size < 10:  # 最小段长度
+            segment_size = max(10, n_points // 4)
+            
+        all_vertices = []
+        
+        # 分段处理
+        for i in range(0, n_points, segment_size):
+            end_idx = min(i + segment_size + 5, n_points)  # 添加重叠
+            segment = contour_points[i:end_idx]
+            
+            if len(segment) < 3:
+                continue
+                
+            # 为每个段计算适合的epsilon
+            segment_contour = segment.reshape(-1, 1, 2).astype(np.int32)
+            perimeter = cv2.arcLength(segment_contour, False)
+            epsilon = 0.01 * perimeter
+            
+            # 拟合该段
+            approx_segment = cv2.approxPolyDP(segment_contour, epsilon, False)
+            
+            # 添加顶点（避免重复）
+            for pt in approx_segment.reshape(-1, 2):
+                if len(all_vertices) == 0 or np.linalg.norm(pt - all_vertices[-1]) > 5:
+                    all_vertices.append(pt)
+        
+        # 闭合轮廓
+        if len(all_vertices) > 0 and np.linalg.norm(all_vertices[0] - all_vertices[-1]) > 5:
+            all_vertices.append(all_vertices[0])
+            
+        # 转换为OpenCV格式
+        if len(all_vertices) > 3:
+            result_contour = np.array(all_vertices).reshape(-1, 1, 2).astype(np.int32)
+            fitted_contours.append(result_contour)
+    
+    return fitted_contours
 
 def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
                                      distance_threshold,
