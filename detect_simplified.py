@@ -315,65 +315,127 @@ def extract_nearest_surface_mask_ransac(roi_p3d_aligned, depth_margin,
 
 
 
-def extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=12, max_iterations=20,
-                              initial_epsilon_factor=0.01):
+def extract_contours_adaptive(surface_mask,
+                              min_vertices=16,
+                              max_vertices=64,
+                              max_iterations=30,
+                              initial_epsilon_factor=0.01,
+                              smooth_iters=2,
+                              fixed_vertices=None):
     """
-    自适应轮廓提取（优化版）：
-    通过二分搜索寻找最佳epsilon，将轮廓拟合到指定的顶点数范围内，以适应包含曲线和直线的复杂形状。
-    此版本移除了凸包计算，以保留轮廓的原始凹凸形状。
+    自适应轮廓提取（替换版）：
+    - 不做凸包，保留原始凹凸；
+    - findContours 使用 CHAIN_APPROX_NONE 保留所有边界点；
+    - 通过二分搜索 epsilon，让多边形顶点数落在 [min_vertices, max_vertices]；
+    - 用 Chaikin 进行平滑（iters 可调）；
+    - 如需“恰好 N 个点”，设置 fixed_vertices=N，会在平滑后按弧长重采样。
 
-    :param surface_mask: 输入的二值图像掩码。
-    :param min_vertices: 拟合后多边形的最小顶点数。
-    :param max_vertices: 拟合后多边形的最大顶点数。
-    :param max_iterations: 为找到合适epsilon值的最大迭代次数。
-    :param initial_epsilon_factor: (已弃用)
-    :return: 包含拟合后轮廓的列表。
+    参数：
+        surface_mask: 二值图像（单通道）
+        min_vertices: 目标最小顶点数（想要 >8，请设置为 9 或更高，例如 16）
+        max_vertices: 目标最大顶点数
+        max_iterations: 二分搜索最大迭代次数
+        initial_epsilon_factor:（兼容旧签名，已弃用）
+        smooth_iters: Chaikin 平滑迭代次数；<=0 则不平滑
+        fixed_vertices: 若为正整数，则返回恰好该数量的顶点（等弧长采样）
+    返回：
+        fitted_contours: List[np.ndarray]；每个元素形如 (N,1,2)、dtype=int32，可直接用于 cv2.polylines
     """
-    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    import cv2
+    import numpy as np
+
+    assert min_vertices >= 3 and max_vertices >= min_vertices
+
+    # ------- 工具函数 -------
+    def chaikin_smooth(poly, iters=2, closed=True):
+        """Chaikin 角切平滑（不依赖 SciPy）。poly: (N,1,2) 或 (N,2)"""
+        P = poly.reshape(-1, 2).astype(np.float32)
+        if len(P) < 3 or iters <= 0:
+            return poly.astype(np.int32).reshape(-1, 1, 2)
+        for _ in range(iters):
+            Q = []
+            n = len(P)
+            last = n if closed else n - 1
+            for i in range(last):
+                p0, p1 = P[i], P[(i + 1) % n]
+                Q.append(0.75 * p0 + 0.25 * p1)
+                Q.append(0.25 * p0 + 0.75 * p1)
+            P = np.asarray(Q, dtype=np.float32)
+        return P.reshape(-1, 1, 2).astype(np.int32)
+
+    def resample_closed(poly, N):
+        """对闭合折线按弧长等距重采样到 N 点。poly: (N,1,2) 或 (N,2)"""
+        P = poly.reshape(-1, 2).astype(np.float32)
+        n = len(P)
+        if n < 2 or N <= 1:
+            return poly.astype(np.int32).reshape(-1, 1, 2)
+        # 每条边（包含末端到起点）长度
+        d = np.sqrt(((np.roll(P, -1, axis=0) - P) ** 2).sum(1))
+        cum = np.concatenate(([0.0], np.cumsum(d)))  # 长度 n+1
+        total = cum[-1] if cum[-1] > 0 else 1.0
+        # 目标采样位置（[0, total) 等距）
+        u = np.linspace(0.0, total, N, endpoint=False)
+        # 对应到区间索引
+        idx = np.searchsorted(cum, u, side="right") - 1
+        idx = np.clip(idx, 0, n - 1)
+        seg_len = cum[idx + 1] - cum[idx]
+        seg_len[seg_len == 0] = 1e-12
+        t = (u - cum[idx]) / seg_len
+        P_next = P[(idx + 1) % n]
+        Q = (1 - t)[:, None] * P[idx] + t[:, None] * P_next
+        return Q.reshape(-1, 1, 2).astype(np.int32)
+
+    # ------- 提取轮廓（不做凸包，保留细节） -------
+    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return []
 
-    # 按面积从大到小排序
+    # 按面积排序，只取前两个（与原实现一致；如需全部可去掉 [:2]）
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
     fitted_contours = []
-    # 只处理前两个最大轮廓
+
     for cnt in contours[:2]:
-        perimeter = cv2.arcLength(cnt, True)
-        if perimeter == 0:
+        peri = cv2.arcLength(cnt, True)
+        if peri <= 0:
             continue
 
-        # --- 核心修改：使用二分搜索寻找最佳 Epsilon ---
-        low_eps = 0.0
-        high_eps = perimeter * 0.1  # Epsilon上限设为周长的10%
-        best_approx = cnt  # 默认值为原始轮廓
+        # 二分搜索 epsilon；上界设为 50% 周长，范围更充足
+        lo, hi = 0.0, 0.5 * peri
+        best = cnt  # 兜底：原始轮廓
 
         for _ in range(max_iterations):
-            if high_eps - low_eps < 1e-6: # 精度足够高
+            eps = (lo + hi) / 2.0
+            approx = cv2.approxPolyDP(cnt, eps, closed=True)
+            n = len(approx)
+
+            if min_vertices <= n <= max_vertices:
+                best = approx
+                # 命中区间后继续尝试更小的 eps 以保留更多形状细节
+                hi = eps
+            elif n > max_vertices:
+                # 顶点太多 -> 增大 eps
+                lo = eps
+            else:
+                # 顶点太少 -> 减小 eps
+                hi = eps
+
+            if hi - lo < 1e-6:
                 break
 
-            current_eps = (low_eps + high_eps) / 2.0
-            approx = cv2.approxPolyDP(cnt, current_eps, closed=True)
-            num_vertices = len(approx)
+        # 平滑（可选）
+        if smooth_iters and smooth_iters > 0:
+            best = chaikin_smooth(best, iters=smooth_iters, closed=True)
 
-            # 暂存当前最接近且不超过max_vertices的结果
-            if min_vertices <= num_vertices <= max_vertices:
-                best_approx = approx
+        # 固定顶点数（可选）
+        if isinstance(fixed_vertices, int) and fixed_vertices > 2:
+            best = resample_closed(best, fixed_vertices)
 
-            if num_vertices > max_vertices:
-                # 顶点太多，需要更强的简化 -> 增大epsilon
-                low_eps = current_eps
-            else: # num_vertices <= max_vertices
-                # 顶点太少或正好，尝试更精细的拟合 -> 减小epsilon
-                high_eps = current_eps
-                # 如果顶点数在范围内，这是一个潜在的好结果
-                if min_vertices <= num_vertices:
-                     best_approx = approx
-
-
-        fitted_contours.append(best_approx)
+        # 统一输出类型
+        best = best.reshape(-1, 1, 2).astype(np.int32)
+        fitted_contours.append(best)
 
     return fitted_contours
+
 
 def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
                                      distance_threshold,
