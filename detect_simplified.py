@@ -315,17 +315,18 @@ def extract_nearest_surface_mask_ransac(roi_p3d_aligned, depth_margin,
 
 
 
-def extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=12, max_iterations=10,
+def extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=12, max_iterations=20,
                               initial_epsilon_factor=0.01):
     """
-    自适应轮廓提取：
-    通过迭代增加epsilon，将轮廓拟合到指定的顶点数范围内，以适应包含曲线和直线的形状。
+    自适应轮廓提取（优化版）：
+    通过二分搜索寻找最佳epsilon，将轮廓拟合到指定的顶点数范围内，以适应包含曲线和直线的复杂形状。
+    此版本移除了凸包计算，以保留轮廓的原始凹凸形状。
 
     :param surface_mask: 输入的二值图像掩码。
     :param min_vertices: 拟合后多边形的最小顶点数。
     :param max_vertices: 拟合后多边形的最大顶点数。
     :param max_iterations: 为找到合适epsilon值的最大迭代次数。
-    :param initial_epsilon_factor: 初始的epsilon系数（相对于周长）。
+    :param initial_epsilon_factor: (已弃用)
     :return: 包含拟合后轮廓的列表。
     """
     contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
@@ -338,133 +339,42 @@ def extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=12, max
     fitted_contours = []
     # 只处理前两个最大轮廓
     for cnt in contours[:2]:
-        # 步骤1：计算凸包以平滑轮廓
-        hull = cv2.convexHull(cnt)
-        perimeter = cv2.arcLength(hull, True)
-
+        perimeter = cv2.arcLength(cnt, True)
         if perimeter == 0:
             continue
 
-        # 步骤2：迭代寻找最佳epsilon
-        epsilon_factor = initial_epsilon_factor
-        best_approx = hull  # 默认值为原始凸包
+        # --- 核心修改：使用二分搜索寻找最佳 Epsilon ---
+        low_eps = 0.0
+        high_eps = perimeter * 0.1  # Epsilon上限设为周长的10%
+        best_approx = cnt  # 默认值为原始轮廓
 
         for _ in range(max_iterations):
-            epsilon = epsilon_factor * perimeter
-            approx = cv2.approxPolyDP(hull, epsilon, closed=True)
+            if high_eps - low_eps < 1e-6: # 精度足够高
+                break
 
-            # 如果顶点数在理想范围内，则采用此结果并退出循环
-            if min_vertices <= len(approx) <= max_vertices:
+            current_eps = (low_eps + high_eps) / 2.0
+            approx = cv2.approxPolyDP(cnt, current_eps, closed=True)
+            num_vertices = len(approx)
+
+            # 暂存当前最接近且不超过max_vertices的结果
+            if min_vertices <= num_vertices <= max_vertices:
                 best_approx = approx
-                break
 
-            # 如果顶点数太多，说明epsilon太小，需要增加它以简化更多
-            if len(approx) > max_vertices:
-                epsilon_factor *= 1.5  # 增加epsilon的系数
-                best_approx = approx  # 暂存当前最接近的结果
-            # 如果顶点数太少，说明epsilon过大，已经过度简化了。
-            # 此时可以停止，并使用上一次迭代的结果（如果需要更精确控制）。
-            # 在这个简化模型中，我们只在顶点过多时调整，最终会得到一个结果。
-            else:  # len(approx) < min_vertices
-                # 已经过度简化，跳出循环，使用上一次或当前的结果
-                break
+            if num_vertices > max_vertices:
+                # 顶点太多，需要更强的简化 -> 增大epsilon
+                low_eps = current_eps
+            else: # num_vertices <= max_vertices
+                # 顶点太少或正好，尝试更精细的拟合 -> 减小epsilon
+                high_eps = current_eps
+                # 如果顶点数在范围内，这是一个潜在的好结果
+                if min_vertices <= num_vertices:
+                     best_approx = approx
+
 
         fitted_contours.append(best_approx)
 
     return fitted_contours
 
-def extract_contours_segmented(surface_mask, target_vertices=12, segment_ratio=0.3):
-    """
-    通过分段处理来保持复杂形状的更多顶点
-    """
-    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return []
-    
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    fitted_contours = []
-    
-    for cnt in contours[:2]:
-        # 将轮廓分成若干段分别拟合
-        contour_points = cnt.reshape(-1, 2)
-        n_points = len(contour_points)
-        segment_size = int(n_points * segment_ratio)
-        
-        if segment_size < 10:  # 最小段长度
-            segment_size = max(10, n_points // 4)
-            
-        all_vertices = []
-        
-        # 分段处理
-        for i in range(0, n_points, segment_size):
-            end_idx = min(i + segment_size + 5, n_points)  # 添加重叠
-            segment = contour_points[i:end_idx]
-            
-            if len(segment) < 3:
-                continue
-                
-            # 为每个段计算适合的epsilon
-            segment_contour = segment.reshape(-1, 1, 2).astype(np.int32)
-            perimeter = cv2.arcLength(segment_contour, False)
-            epsilon = 0.01 * perimeter
-            
-            # 拟合该段
-            approx_segment = cv2.approxPolyDP(segment_contour, epsilon, False)
-            
-            # 添加顶点（避免重复）
-            for pt in approx_segment.reshape(-1, 2):
-                if len(all_vertices) == 0 or np.linalg.norm(pt - all_vertices[-1]) > 5:
-                    all_vertices.append(pt)
-        
-        # 闭合轮廓
-        if len(all_vertices) > 0 and np.linalg.norm(all_vertices[0] - all_vertices[-1]) > 5:
-            all_vertices.append(all_vertices[0])
-            
-        # 转换为OpenCV格式
-        if len(all_vertices) > 3:
-            result_contour = np.array(all_vertices).reshape(-1, 1, 2).astype(np.int32)
-            fitted_contours.append(result_contour)
-    
-    return fitted_contours
-
-def extract_contours_segmented_smooth(surface_mask, target_vertices=12, segment_ratio=0.3, smoothing_factor=0.02):
-    """
-    改进的分段拟合，添加平滑处理
-    """
-    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return []
-    
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)
-    fitted_contours = []
-    
-    for cnt in contours[:2]:
-        # 首先对轮廓进行高斯平滑
-        contour_points = cnt.reshape(-1, 2).astype(np.float32)
-        
-        # 使用多项式拟合进行平滑
-        if len(contour_points) > 10:
-            # 参数化轮廓点
-            t = np.linspace(0, 1, len(contour_points))
-            
-            # 分别对x和y坐标进行多项式拟合
-            degree = min(8, len(contour_points) - 1)  # 限制多项式次数
-            x_poly = np.polyfit(t, contour_points[:, 0], degree)
-            y_poly = np.polyfit(t, contour_points[:, 1], degree)
-            
-            # 生成平滑的点
-            t_smooth = np.linspace(0, 1, target_vertices)
-            x_smooth = np.polyval(x_poly, t_smooth)
-            y_smooth = np.polyval(y_poly, t_smooth)
-            
-            smooth_points = np.column_stack((x_smooth, y_smooth))
-            result_contour = smooth_points.reshape(-1, 1, 2).astype(np.int32)
-            fitted_contours.append(result_contour)
-        else:
-            # 点太少，直接使用原轮廓
-            fitted_contours.append(cnt)
-    
-    return fitted_contours
 def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
                                      distance_threshold,
                                      ransac_n: int = 65,
