@@ -1182,8 +1182,8 @@ def main():
                 # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
                 # 这里使用的是深度图分辨率的 ROI
                 # 正方形的
-                ROI_X1, ROI_Y1 = 993, 614  # 左上角坐标
-                ROI_X2, ROI_Y2 = 1186, 790  # 右下角坐标
+                ROI_X1, ROI_Y1 = 723, 477  # 左上角坐标
+                ROI_X2, ROI_Y2 = 1517, 923  # 右下角坐标
                 #backup
                 # ROI_X1, ROI_Y1 = 915, 709  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 980, 790  # 右下角坐标
@@ -1231,10 +1231,11 @@ def main():
                     print("已进行倾斜校正，使用正交投影生成无畸变掩码。")
                     # surface_mask, z_min = create_corrected_mask(roi_cloud, depth_margin=5.5, pixel_size_mm= 0.5)
                     # 使用原始方式，能更好地处理空心物体
-                    # surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=5.8)
+                    surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=23.8)
                     # 使用 RANSAC 方法提取表面掩码，适应粗糙表面
-                    surface_mask, z_min = extract_nearest_surface_mask_ransac(roi_cloud, depth_margin=3.8, ransac_iters=400,
-                                                        dist_thresh=0.8,front_percentile=20.0,subsample=50000,random_state=1)
+                    # surface_mask, z_min = extract_nearest_surface_mask_ransac(roi_cloud, depth_margin=16.8, ransac_iters=400,
+                    #                                     dist_thresh=0.8,front_percentile=20.0,subsample=50000,random_state=1)
+
                 if surface_mask is None:
                     print("无法提取表面掩码，跳过此帧。")
                     continue
