@@ -315,61 +315,124 @@ def extract_nearest_surface_mask_ransac(roi_p3d_aligned, depth_margin,
 
 
 
-def extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=12, max_iterations=10,
-                              initial_epsilon_factor=0.01):
+def extract_contours_adaptive(surface_mask,
+                              min_vertices=16,
+                              max_vertices=64,
+                              max_iterations=30,
+                              initial_epsilon_factor=0.01,
+                              smooth_iters=2,
+                              fixed_vertices=None):
     """
-    自适应轮廓提取：
-    通过迭代增加epsilon，将轮廓拟合到指定的顶点数范围内，以适应包含曲线和直线的形状。
+    自适应轮廓提取（替换版）：
+    - 不做凸包，保留原始凹凸；
+    - findContours 使用 CHAIN_APPROX_NONE 保留所有边界点；
+    - 通过二分搜索 epsilon，让多边形顶点数落在 [min_vertices, max_vertices]；
+    - 用 Chaikin 进行平滑（iters 可调）；
+    - 如需“恰好 N 个点”，设置 fixed_vertices=N，会在平滑后按弧长重采样。
 
-    :param surface_mask: 输入的二值图像掩码。
-    :param min_vertices: 拟合后多边形的最小顶点数。
-    :param max_vertices: 拟合后多边形的最大顶点数。
-    :param max_iterations: 为找到合适epsilon值的最大迭代次数。
-    :param initial_epsilon_factor: 初始的epsilon系数（相对于周长）。
-    :return: 包含拟合后轮廓的列表。
+    参数：
+        surface_mask: 二值图像（单通道）
+        min_vertices: 目标最小顶点数（想要 >8，请设置为 9 或更高，例如 16）
+        max_vertices: 目标最大顶点数
+        max_iterations: 二分搜索最大迭代次数
+        initial_epsilon_factor:（兼容旧签名，已弃用）
+        smooth_iters: Chaikin 平滑迭代次数；<=0 则不平滑
+        fixed_vertices: 若为正整数，则返回恰好该数量的顶点（等弧长采样）
+    返回：
+        fitted_contours: List[np.ndarray]；每个元素形如 (N,1,2)、dtype=int32，可直接用于 cv2.polylines
     """
-    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+    import cv2
+    import numpy as np
+
+    assert min_vertices >= 3 and max_vertices >= min_vertices
+
+    # ------- 工具函数 -------
+    def chaikin_smooth(poly, iters=2, closed=True):
+        """Chaikin 角切平滑（不依赖 SciPy）。poly: (N,1,2) 或 (N,2)"""
+        P = poly.reshape(-1, 2).astype(np.float32)
+        if len(P) < 3 or iters <= 0:
+            return poly.astype(np.int32).reshape(-1, 1, 2)
+        for _ in range(iters):
+            Q = []
+            n = len(P)
+            last = n if closed else n - 1
+            for i in range(last):
+                p0, p1 = P[i], P[(i + 1) % n]
+                Q.append(0.75 * p0 + 0.25 * p1)
+                Q.append(0.25 * p0 + 0.75 * p1)
+            P = np.asarray(Q, dtype=np.float32)
+        return P.reshape(-1, 1, 2).astype(np.int32)
+
+    def resample_closed(poly, N):
+        """对闭合折线按弧长等距重采样到 N 点。poly: (N,1,2) 或 (N,2)"""
+        P = poly.reshape(-1, 2).astype(np.float32)
+        n = len(P)
+        if n < 2 or N <= 1:
+            return poly.astype(np.int32).reshape(-1, 1, 2)
+        # 每条边（包含末端到起点）长度
+        d = np.sqrt(((np.roll(P, -1, axis=0) - P) ** 2).sum(1))
+        cum = np.concatenate(([0.0], np.cumsum(d)))  # 长度 n+1
+        total = cum[-1] if cum[-1] > 0 else 1.0
+        # 目标采样位置（[0, total) 等距）
+        u = np.linspace(0.0, total, N, endpoint=False)
+        # 对应到区间索引
+        idx = np.searchsorted(cum, u, side="right") - 1
+        idx = np.clip(idx, 0, n - 1)
+        seg_len = cum[idx + 1] - cum[idx]
+        seg_len[seg_len == 0] = 1e-12
+        t = (u - cum[idx]) / seg_len
+        P_next = P[(idx + 1) % n]
+        Q = (1 - t)[:, None] * P[idx] + t[:, None] * P_next
+        return Q.reshape(-1, 1, 2).astype(np.int32)
+
+    # ------- 提取轮廓（不做凸包，保留细节） -------
+    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return []
 
-    # 按面积从大到小排序
+    # 按面积排序，只取前两个（与原实现一致；如需全部可去掉 [:2]）
     contours = sorted(contours, key=cv2.contourArea, reverse=True)
-
     fitted_contours = []
-    # 只处理前两个最大轮廓
-    for cnt in contours[:2]:
-        # 步骤1：计算凸包以平滑轮廓
-        hull = cv2.convexHull(cnt)
-        perimeter = cv2.arcLength(hull, True)
 
-        if perimeter == 0:
+    for cnt in contours[:2]:
+        peri = cv2.arcLength(cnt, True)
+        if peri <= 0:
             continue
 
-        # 步骤2：迭代寻找最佳epsilon
-        epsilon_factor = initial_epsilon_factor
-        best_approx = hull  # 默认值为原始凸包
+        # 二分搜索 epsilon；上界设为 50% 周长，范围更充足
+        lo, hi = 0.0, 0.5 * peri
+        best = cnt  # 兜底：原始轮廓
 
         for _ in range(max_iterations):
-            epsilon = epsilon_factor * perimeter
-            approx = cv2.approxPolyDP(hull, epsilon, closed=True)
+            eps = (lo + hi) / 2.0
+            approx = cv2.approxPolyDP(cnt, eps, closed=True)
+            n = len(approx)
 
-            # 如果顶点数在理想范围内，则采用此结果并退出循环
-            if min_vertices <= len(approx) <= max_vertices:
-                best_approx = approx
+            if min_vertices <= n <= max_vertices:
+                best = approx
+                # 命中区间后继续尝试更小的 eps 以保留更多形状细节
+                hi = eps
+            elif n > max_vertices:
+                # 顶点太多 -> 增大 eps
+                lo = eps
+            else:
+                # 顶点太少 -> 减小 eps
+                hi = eps
+
+            if hi - lo < 1e-6:
                 break
 
-            # 如果顶点数太多，说明epsilon太小，需要增加它以简化更多
-            if len(approx) > max_vertices:
-                epsilon_factor *= 1.5  # 增加epsilon的系数
-                best_approx = approx  # 暂存当前最接近的结果
-            # 如果顶点数太少，说明epsilon过大，已经过度简化了。
-            # 此时可以停止，并使用上一次迭代的结果（如果需要更精确控制）。
-            # 在这个简化模型中，我们只在顶点过多时调整，最终会得到一个结果。
-            else:  # len(approx) < min_vertices
-                # 已经过度简化，跳出循环，使用上一次或当前的结果
-                break
+        # 平滑（可选）
+        if smooth_iters and smooth_iters > 0:
+            best = chaikin_smooth(best, iters=smooth_iters, closed=True)
 
-        fitted_contours.append(best_approx)
+        # 固定顶点数（可选）
+        if isinstance(fixed_vertices, int) and fixed_vertices > 2:
+            best = resample_closed(best, fixed_vertices)
+
+        # 统一输出类型
+        best = best.reshape(-1, 1, 2).astype(np.int32)
+        fitted_contours.append(best)
 
     return fitted_contours
 
@@ -569,6 +632,7 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
 
     # 1. 从掩码中提取内外轮廓（通常是面积最大的两个）
 
+    # contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=16,initial_epsilon_factor=0.001)
     contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=16,initial_epsilon_factor=0.001)
 
     if len(contours) < 2:
@@ -627,8 +691,11 @@ def extract_skeleton_universal(surface_mask: np.ndarray, visualize: bool = True)
         return None
 
     # 1. 提取轮廓并进行自适应拟合
-    contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=16, initial_epsilon_factor=0.001)
+    # contours = extract_contours_adaptive(surface_mask, min_vertices=16, max_vertices=20, initial_epsilon_factor=0.001,max_iterations=5000)
+    contours = extract_contours_adaptive(surface_mask, min_vertices=16, max_vertices=48, initial_epsilon_factor=0.001,smooth_iters=0)
 
+    # contours = extract_contours_segmented(surface_mask,target_vertices=10,segment_ratio=0.01)
+    # contours = extract_contours_spline_smooth(surface_mask,target_vertices=16,smoothing_s=0.5)
     if not contours:
         print("未能找到任何轮廓。")
         return None
@@ -1004,8 +1071,8 @@ def main():
                 # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
                 # 这里使用的是深度图分辨率的 ROI
                 # 正方形的
-                ROI_X1, ROI_Y1 = 993, 614  # 左上角坐标
-                ROI_X2, ROI_Y2 = 1186, 790  # 右下角坐标
+                ROI_X1, ROI_Y1 = 768, 464  # 左上角坐标
+                ROI_X2, ROI_Y2 = 1695, 821  # 右下角坐标
                 #backup
                 # ROI_X1, ROI_Y1 = 915, 709  # 左上角坐标
                 # ROI_X2, ROI_Y2 = 980, 790  # 右下角坐标
@@ -1053,10 +1120,10 @@ def main():
                     print("已进行倾斜校正，使用正交投影生成无畸变掩码。")
                     # surface_mask, z_min = create_corrected_mask(roi_cloud, depth_margin=5.5, pixel_size_mm= 0.5)
                     # 使用原始方式，能更好地处理空心物体
-                    # surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=5.8)
+                    surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=14.8)
                     # 使用 RANSAC 方法提取表面掩码，适应粗糙表面
-                    surface_mask, z_min = extract_nearest_surface_mask_ransac(roi_cloud, depth_margin=3.8, ransac_iters=400,
-                                                        dist_thresh=0.8,front_percentile=20.0,subsample=50000,random_state=1)
+                    # surface_mask, z_min = extract_nearest_surface_mask_ransac(roi_cloud, depth_margin=6.8, ransac_iters=400,
+                    #                                     dist_thresh=0.8,front_percentile=20.0,subsample=50000,random_state=1)
                 if surface_mask is None:
                     print("无法提取表面掩码，跳过此帧。")
                     continue
