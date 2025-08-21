@@ -321,7 +321,10 @@ def extract_contours_adaptive(surface_mask,
                               max_iterations=30,
                               initial_epsilon_factor=0.01,
                               smooth_iters=2,
-                              fixed_vertices=None):
+                              fixed_vertices=None,
+                              pre_smooth=False,
+                              morph_kernel=3,
+                              morph_iters=1):
     """
     自适应轮廓提取（替换版）：
     - 不做凸包，保留原始凹凸；
@@ -329,6 +332,7 @@ def extract_contours_adaptive(surface_mask,
     - 通过二分搜索 epsilon，让多边形顶点数落在 [min_vertices, max_vertices]；
     - 用 Chaikin 进行平滑（iters 可调）；
     - 如需“恰好 N 个点”，设置 fixed_vertices=N，会在平滑后按弧长重采样。
+    - 可选：预形态学平滑 pre_smooth=True（先闭再开）以减少毛刺，尽量保持多边形角点。
 
     参数：
         surface_mask: 二值图像（单通道）
@@ -338,6 +342,9 @@ def extract_contours_adaptive(surface_mask,
         initial_epsilon_factor:（兼容旧签名，已弃用）
         smooth_iters: Chaikin 平滑迭代次数；<=0 则不平滑
         fixed_vertices: 若为正整数，则返回恰好该数量的顶点（等弧长采样）
+        pre_smooth: 是否在提取轮廓前做形态学平滑（闭+开）
+        morph_kernel: 预平滑核大小（奇数）
+        morph_iters: 闭运算迭代次数
     返回：
         fitted_contours: List[np.ndarray]；每个元素形如 (N,1,2)、dtype=int32，可直接用于 cv2.polylines
     """
@@ -385,8 +392,20 @@ def extract_contours_adaptive(surface_mask,
         Q = (1 - t)[:, None] * P[idx] + t[:, None] * P_next
         return Q.reshape(-1, 1, 2).astype(np.int32)
 
+    # ------- 掩码预处理（可选） -------
+    mask_use = surface_mask
+    if pre_smooth:
+        k = int(max(1, morph_kernel))
+        if k % 2 == 0:
+            k += 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+        tmp = cv2.morphologyEx(mask_use, cv2.MORPH_CLOSE, kernel, iterations=int(max(1, morph_iters)))
+        tmp = cv2.morphologyEx(tmp, cv2.MORPH_OPEN, kernel, iterations=1)
+        if np.count_nonzero(tmp) > 0:
+            mask_use = tmp
+
     # ------- 提取轮廓（不做凸包，保留细节） -------
-    contours, _ = cv2.findContours(surface_mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(mask_use, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return []
 
@@ -435,6 +454,27 @@ def extract_contours_adaptive(surface_mask,
         fitted_contours.append(best)
 
     return fitted_contours
+
+
+# --- 新增：骨架去毛刺（迭代移除端点） ---
+def prune_skeleton_spurs(skeleton_bool, max_iter=50):
+    """
+    对二值骨架(布尔或0/1)进行简单去毛刺：
+    反复检测端点(8邻域度=1)并删除，直至无端点或达到迭代上限。
+    适用于环形骨架（无端点），可有效清理小分支毛刺。
+    """
+    skel = (skeleton_bool > 0).astype(np.uint8)
+    if skel.ndim != 2:
+        return (skel > 0)
+    kernel = np.ones((3, 3), np.uint8)
+    for _ in range(int(max_iter)):
+        neighbor_inc_center = cv2.filter2D(skel, cv2.CV_32S, kernel, borderType=cv2.BORDER_CONSTANT)
+        neighbors = neighbor_inc_center - skel.astype(np.int32)  # 去掉中心像素
+        endpoints = (skel == 1) & (neighbors == 1)
+        if not np.any(endpoints):
+            break
+        skel[endpoints] = 0
+    return skel.astype(bool)
 
 
 def fit_plane_and_extract_height_map(roi_p3d: np.ndarray,
@@ -613,7 +653,7 @@ def overlay_skeleton_with_scaling(cl: pcammls.PercipioSDK,
 
 def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool = True):
     """
-    直接从表面掩码（如 Z 值提取的掩码）中提取内外轮廓并计算中轴线（骨架）。
+    直接从表面掩码中提取内外轮廓并计算中轴线（骨架）。
     此函数绕过了 RANSAC 拟合，直接处理给定的二值掩码。
 
     参数:
@@ -630,11 +670,13 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
         print("输入的 surface_mask 为空或不包含有效区域。")
         return None
 
-    # 1. 从掩码中提取内外轮廓（通常是面积最大的两个）
-
-    # contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=16,initial_epsilon_factor=0.001)
-    contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=16,initial_epsilon_factor=0.001)
-
+    # 1. 轮廓：固定16顶点，多边形更贴合
+    contours = extract_contours_adaptive(surface_mask,
+                                         min_vertices=16, max_vertices=64,
+                                         initial_epsilon_factor=0.001,
+                                         smooth_iters=0,
+                                         fixed_vertices=16,
+                                         pre_smooth=True, morph_kernel=3, morph_iters=1)
     if len(contours) < 2:
         print("未能找到足够的内外轮廓来生成环状区域。")
         return None
@@ -651,10 +693,11 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
     # 使用 scikit-image 的 skeletonize 函数，效果较好
     from skimage.morphology import skeletonize
     skeleton = skeletonize(ring_mask > 0)
+    skeleton = prune_skeleton_spurs(skeleton, max_iter=50)
     skeleton_img = (skeleton * 255).astype(np.uint8)
 
     # 4. 膨胀骨架使其更粗，便于观察和后续处理
-    kernel = np.ones((1, 1), np.uint8)
+    kernel = np.ones((3, 3), np.uint8)
     dilated_skeleton = cv2.dilate(skeleton_img, kernel, iterations=1)
 
     # 5. 可视化（如果需要）
@@ -676,31 +719,24 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
 
 def extract_skeleton_universal(surface_mask: np.ndarray, visualize: bool = True):
     """
-    通用的骨架提取函数，能同时处理实心和空心（有镂空）的物体。
-
-    该函数通过检测轮廓数量来自动判断物体类型，并相应地创建用于骨架化的目标掩码。
-    - 如果只有一个轮廓，则处理为实心物体。
-    - 如果有多个轮廓，则取最大的两个创建环形区域进行处理。
-
-    :param surface_mask: (H, W) 的二值掩码 (uint8), 255 代表目标区域。
-    :param visualize: 是否显示中间过程和结果的可视化窗口。
-    :return: (H, W, 3) 的 BGR 图像，包含膨胀后的骨架线。如果无法生成，则返回 None。
+    通用的骨架提取（实心/空心自适应），并对骨架去毛刺。
     """
     if surface_mask is None or np.count_nonzero(surface_mask) == 0:
         print("输入的 surface_mask 为空或不包含有效区域。")
         return None
 
-    # 1. 提取轮廓并进行自适应拟合
-    # contours = extract_contours_adaptive(surface_mask, min_vertices=16, max_vertices=20, initial_epsilon_factor=0.001,max_iterations=5000)
-    contours = extract_contours_adaptive(surface_mask, min_vertices=16, max_vertices=48, initial_epsilon_factor=0.001,smooth_iters=0)
-
-    # contours = extract_contours_segmented(surface_mask,target_vertices=10,segment_ratio=0.01)
-    # contours = extract_contours_spline_smooth(surface_mask,target_vertices=16,smoothing_s=0.5)
+    # 1. 提取轮廓：固定为16顶点，启用预平滑，避免边界毛刺影响
+    contours = extract_contours_adaptive(surface_mask,
+                                         min_vertices=16, max_vertices=64,
+                                         initial_epsilon_factor=0.001,
+                                         smooth_iters=0,
+                                         fixed_vertices=16,
+                                         pre_smooth=True, morph_kernel=3, morph_iters=1)
     if not contours:
         print("未能找到任何轮廓。")
         return None
 
-    # 2. ★★★ 核心改动：根据轮廓数量决定处理方式 ★★★
+    # 2. 根据轮廓数量决定处理方式
     target_mask = np.zeros_like(surface_mask, dtype=np.uint8)
     outer_cnt = contours[0]
     inner_cnt = None
@@ -718,24 +754,22 @@ def extract_skeleton_universal(surface_mask: np.ndarray, visualize: bool = True)
         # 创建实心区域
         cv2.drawContours(target_mask, [outer_cnt], -1, 255, cv2.FILLED)
 
-    # 3. 提取骨架
+    # 3. 骨架 + 去毛刺
     skeleton = skeletonize(target_mask > 0)
+    skeleton = prune_skeleton_spurs(skeleton, max_iter=50)
     skeleton_img = (skeleton * 255).astype(np.uint8)
 
-    # 4. 膨胀骨架使其更粗
+    # 4. 膨胀骨架
     kernel = np.ones((3, 3), np.uint8)
     dilated_skeleton = cv2.dilate(skeleton_img, kernel, iterations=1)
 
     # 5. 可视化
     if visualize:
         vis_img = cv2.cvtColor(surface_mask, cv2.COLOR_GRAY2BGR)
-        cv2.drawContours(vis_img, [outer_cnt], -1, (0, 0, 255), 2)  # 外轮廓红色
+        cv2.drawContours(vis_img, [outer_cnt], -1, (0, 0, 255), 2)
         if inner_cnt is not None:
-            cv2.drawContours(vis_img, [inner_cnt], -1, (0, 255, 0), 2)  # 内轮廓绿色
-
-        # 将骨架叠加为蓝色
+            cv2.drawContours(vis_img, [inner_cnt], -1, (0, 255, 0), 2)
         vis_img[dilated_skeleton != 0] = (255, 0, 0)
-
         cv2.imshow("Target Mask for Skeletonization", target_mask)
         cv2.imshow("Universal Skeleton Extraction", vis_img)
 
