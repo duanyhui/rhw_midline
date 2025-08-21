@@ -468,8 +468,9 @@ def prune_skeleton_spurs(skeleton_bool, max_iter=50):
         return (skel > 0)
     kernel = np.ones((3, 3), np.uint8)
     for _ in range(int(max_iter)):
-        neighbor_inc_center = cv2.filter2D(skel, cv2.CV_32S, kernel, borderType=cv2.BORDER_CONSTANT)
-        neighbors = neighbor_inc_center - skel.astype(np.int32)  # 去掉中心像素
+        # 兼容性修复：使用 ddepth=-1，结果为 uint8（0..9），再转高位类型做减法
+        neighbor_inc_center_u8 = cv2.filter2D(skel, -1, kernel, borderType=cv2.BORDER_CONSTANT)
+        neighbors = neighbor_inc_center_u8.astype(np.int16) - skel.astype(np.int16)
         endpoints = (skel == 1) & (neighbors == 1)
         if not np.any(endpoints):
             break
@@ -684,7 +685,7 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
     outer_cnt = contours[0]
     inner_cnt = contours[1]
 
-    # 2. 创建环状区域掩膜 (Ring Mask)
+    # 2. 创建环状区域掩 mask (Ring Mask)
     ring_mask = np.zeros_like(surface_mask, dtype=np.uint8)
     cv2.drawContours(ring_mask, [outer_cnt], -1, 255, cv2.FILLED)  # 填充外轮廓
     cv2.drawContours(ring_mask, [inner_cnt], -1, 0, cv2.FILLED)   # 在内轮廓区域挖一个洞
