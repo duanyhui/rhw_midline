@@ -11,6 +11,8 @@ import cv2
 import numpy
 import sys
 import os
+import datetime                     # NEW: 时间戳用于命名输出文件
+import open3d as o3d                # NEW: 用于保存点云
 
 class PythonPercipioDeviceEvent(pcammls.DeviceEvent):
     Offline = False
@@ -97,6 +99,8 @@ def main():
     cl.DeviceStreamOn(handle)
 
     pointcloud_data_arr = pointcloud_data_list()
+    last_points = None                  # NEW: 保存最近一帧可用点云（N×3）
+
     while True:
       if event.IsOffline():
         break
@@ -111,23 +115,40 @@ def main():
           print('get p3d size : {}'.format(sz))
           center = frame.width * frame.height / 2 + frame.width / 2
 
-          #show p3d arr data
+          # 取出点云为 numpy 数组
           p3d_nparray = pointcloud_data_arr.as_nparray()
-          cv2.imshow('p3d',p3d_nparray)
 
+          #（可选）OpenCV 无法直接显示 3D 点云，这行通常不会得到可视化效果，建议注释掉
+          cv2.imshow('p3d', p3d_nparray)          # CHG: 注释掉或自行改成可视化工具
+
+          # 取一例点查看
           p3d = pointcloud_data_arr.get_value(int(center))
           print('\tp3d data : {} {} {}'.format(p3d.getX(), p3d.getY(), p3d.getZ()))
 
-      k = cv2.waitKey(10)
-      import open3d as o3d
-      if k==ord('q'): 
-        # 保存点云文件
-        pcd = o3d.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(p3d_nparray[:, :3])
-        pcd.colors = o3d.utility.Vector3dVector(p3d_nparray[:, 3:6] / 255.0)
-        o3d.io.write_point_cloud('pointcloud.pcd', pcd)
-        
+          # NEW: 规范化形状并过滤无效点（Z<=0 或 非数）
+          if p3d_nparray.ndim == 3:
+              pts = p3d_nparray.reshape(-1, 3)
+          else:
+              pts = p3d_nparray
+          mask = numpy.isfinite(pts).all(axis=1) & (pts[:, 2] > 0)
+          last_points = pts[mask]
 
+      k = cv2.waitKey(10)
+
+      if k==ord('q'):                   # CHG: 按下 q 保存点云并退出
+        if last_points is None or last_points.size == 0:
+          print('No point cloud to save.')
+        else:
+          pcd = o3d.geometry.PointCloud()
+          # Open3D 需要 float64
+          pcd.points = o3d.utility.Vector3dVector(last_points.astype(numpy.float64))
+          # 生成时间戳文件名（当前目录）
+          fname = datetime.datetime.now().strftime('pointcloud_%Y%m%d_%H%M%S.ply')
+          ok = o3d.io.write_point_cloud(fname, pcd, write_ascii=False, compressed=False)
+          if ok:
+            print('Saved point cloud: {} ({} points)'.format(fname, len(last_points)))
+          else:
+            print('Failed to save point cloud.')
         break
 
     cl.DeviceStreamOff(handle)    
@@ -136,4 +157,3 @@ def main():
 
 if __name__=='__main__':
     main()
-
