@@ -788,69 +788,201 @@ def extract_skeleton_from_surface_mask(surface_mask: np.ndarray, visualize: bool
     return cv2.cvtColor(dilated_skeleton, cv2.COLOR_GRAY2BGR)
 
 
+# ================== 1) 轻量净化 & 小连通域去除（保持不变也可） ==================
+import numpy as np
+import cv2
+
+def _remove_small_blobs(binary, min_area=300):
+    if binary.ndim == 3:
+        binary = cv2.cvtColor(binary, cv2.COLOR_BGR2GRAY)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats((binary > 0).astype(np.uint8), 8)
+    keep = np.zeros_like(binary, dtype=np.uint8)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            keep[labels == i] = 255
+    return keep
+
+def _clean_mask_for_skeleton(mask):
+    if mask.ndim == 3:
+        mask = cv2.cvtColor(mask, cv2.COLOR_BGR2GRAY)
+    mask = (mask > 0).astype(np.uint8) * 255
+    k5 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    k3 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k5, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k3, iterations=1)
+    mask = _remove_small_blobs(mask, min_area=600)  # 适当加大一点，压掉孔洞噪声
+    return mask
+
+# ================== 2) 从层级里拿“正确的外/内轮廓” ==================
+def _get_outer_inner_contours(ring_mask):
+    """
+    返回 (outer_cnt, inner_cnt)：
+    - outer_cnt: 最大的外部轮廓（hierarchy parent == -1）
+    - inner_cnt: outer_cnt 的子洞里面积最大的那个；若无洞则返回 None
+    """
+    contours, hierarchy = cv2.findContours(ring_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    if not contours or hierarchy is None:
+        return None, None
+
+    hierarchy = hierarchy[0]  # (N,4): [next, prev, child, parent]
+    # 选最大的“顶层外轮廓”
+    outer_idx = -1
+    outer_area = -1
+    for i, h in enumerate(hierarchy):
+        if h[3] == -1:  # 没有 parent -> 外层
+            a = cv2.contourArea(contours[i])
+            if a > outer_area:
+                outer_area = a
+                outer_idx = i
+    if outer_idx < 0:
+        return None, None
+
+    # 在 outer 的子链表中找面积最大的“洞”
+    child = hierarchy[outer_idx][2]
+    inner_idx = -1
+    inner_area = -1
+    while child != -1:
+        a = cv2.contourArea(contours[child])
+        if a > inner_area:
+            inner_area = a
+            inner_idx = child
+        child = hierarchy[child][0]  # 下一个兄弟
+    outer_cnt = contours[outer_idx]
+    inner_cnt = contours[inner_idx] if inner_idx >= 0 else None
+    return outer_cnt, inner_cnt
+
+# ================== 3) 骨架短枝修剪（与你之前相同，略微整理） ==================
+def _prune_skeleton_spurs(skel_u8, min_branch_len=12, max_pass=6):
+    skel = (skel_u8 > 0).astype(np.uint8)
+
+    def neighbors(y, x):
+        ys = [y-1, y-1, y-1, y,   y,   y+1, y+1, y+1]
+        xs = [x-1, x,   x+1, x-1, x+1, x-1, x,   x+1]
+        out = []
+        H, W = skel.shape
+        for yy, xx in zip(ys, xs):
+            if 0 <= yy < H and 0 <= xx < W and skel[yy, xx]:
+                out.append((yy, xx))
+        return out
+
+    k = np.array([[1,1,1],[1,10,1],[1,1,1]], np.uint8)
+    for _ in range(max_pass):
+        nbr_cnt = cv2.filter2D(skel, -1, k, borderType=cv2.BORDER_CONSTANT)
+        endpoints = np.argwhere((skel == 1) & (nbr_cnt == 11))  # 自身10 + 1邻居
+        if len(endpoints) == 0:
+            break
+        removed_any = False
+        for y, x in endpoints:
+            if skel[y, x] == 0:
+                continue
+            path = [(y, x)]
+            prev = None
+            cur = (y, x)
+            while True:
+                nbrs = neighbors(*cur)
+                if prev is not None and prev in nbrs:
+                    nbrs.remove(prev)
+                if len(nbrs) == 0 or len(nbrs) > 1:
+                    break
+                nxt = nbrs[0]
+                path.append(nxt)
+                prev, cur = cur, nxt
+                y2, x2 = cur
+                if cv2.filter2D(skel, -1, k, borderType=cv2.BORDER_CONSTANT)[y2, x2] == 11 and len(path) > 1:
+                    break
+            if len(path) < min_branch_len:
+                for yy, xx in path:
+                    skel[yy, xx] = 0
+                removed_any = True
+        if not removed_any:
+            break
+    return (skel * 255).astype(np.uint8)
+
+# ================== 4) 核心：基于等距约束的中心线 ==================
+from skimage.morphology import skeletonize as _sk_skeletonize
+
 def extract_skeleton_universal(surface_mask: np.ndarray, visualize: bool = True):
     """
-    通用的骨架提取函数，能同时处理实心和空心（有镂空）的物体。
-
-    该函数通过检测轮廓数量来自动判断物体类型，并相应地创建用于骨架化的目标掩码。
-    - 如果只有一个轮廓，则处理为实心物体。
-    - 如果有多个轮廓，则取最大的两个创建环形区域进行处理。
-
-    :param surface_mask: (H, W) 的二值掩码 (uint8), 255 代表目标区域。
-    :param visualize: 是否显示中间过程和结果的可视化窗口。
-    :return: (H, W, 3) 的 BGR 图像，包含膨胀后的骨架线。如果无法生成，则返回 None。
+    基于“等距中心线”的通用骨架（改造版，接口不变）：
+    1) 清洗环形掩码；
+    2) 用层级轮廓拿到正确的 outer/inner；
+    3) 距离变换 -> 取 |d_out - d_in| 的“零等值带”；
+    4) 细化 + 修剪，输出 1px 中轴线。
     """
     if surface_mask is None or np.count_nonzero(surface_mask) == 0:
         print("输入的 surface_mask 为空或不包含有效区域。")
         return None
 
-    # 1. 提取轮廓并进行自适应拟合
-    contours = extract_contours_adaptive(surface_mask, min_vertices=4, max_vertices=16, initial_epsilon_factor=0.001)
-
-    if not contours:
-        print("未能找到任何轮廓。")
+    # 1) 掩码净化（不改变拓扑）
+    ring_mask = _clean_mask_for_skeleton(surface_mask)
+    if np.count_nonzero(ring_mask) == 0:
+        print("净化后掩码为空。")
         return None
 
-    # 2. ★★★ 核心改动：根据轮廓数量决定处理方式 ★★★
-    target_mask = np.zeros_like(surface_mask, dtype=np.uint8)
-    outer_cnt = contours[0]
-    inner_cnt = None
+    # 2) 正确的外/内轮廓
+    outer_cnt, inner_cnt = _get_outer_inner_contours(ring_mask)
+    if outer_cnt is None:
+        print("未找到外轮廓。")
+        return None
+    # 若没有内洞，退化为实心物体 —— 直接 skeletonize(ring_mask)
+    if inner_cnt is None:
+        skel = _sk_skeletonize(ring_mask > 0)
+        skel_u8 = (skel.astype(np.uint8) * 255)
+        skel_u8 = _prune_skeleton_spurs(skel_u8, 12, 6)
+        if visualize:
+            vis = cv2.cvtColor(surface_mask, cv2.COLOR_GRAY2BGR)
+            cv2.drawContours(vis, [outer_cnt], -1, (0, 0, 255), 2)
+            vis[skel_u8 > 0] = (255, 0, 0)
+            cv2.imshow("Target Mask for Skeletonization", ring_mask)
+            cv2.imshow("Universal Skeleton Extraction", vis)
+        return cv2.cvtColor(skel_u8, cv2.COLOR_GRAY2BGR)
 
-    if len(contours) >= 2:
-        # 情况一：空心物体（至少有两个轮廓）
-        print("检测到空心物体，生成环形掩码。")
-        inner_cnt = contours[1]
-        # 创建环形区域
-        cv2.drawContours(target_mask, [outer_cnt], -1, 255, cv2.FILLED)
-        cv2.drawContours(target_mask, [inner_cnt], -1, 0, cv2.FILLED)
-    else:
-        # 情况二：实心物体（只有一个轮廓）
-        print("检测到实心物体，生成填充掩码。")
-        # 创建实心区域
-        cv2.drawContours(target_mask, [outer_cnt], -1, 255, cv2.FILLED)
+    H, W = ring_mask.shape
 
-    # 3. 提取骨架
-    skeleton = skeletonize(target_mask > 0)
-    skeleton_img = (skeleton * 255).astype(np.uint8)
+    # 3) 距离变换（到“线”的距离）
+    #   为了让 distanceTransform 计算“到零像素的距离”，我们构造“线为0，其余255”的底图
+    outer_line = np.full((H, W), 255, np.uint8)
+    inner_line = np.full((H, W), 255, np.uint8)
+    cv2.drawContours(outer_line, [outer_cnt], -1, 0, 1)
+    cv2.drawContours(inner_line, [inner_cnt], -1, 0, 1)
 
-    # 4. 膨胀骨架使其更粗
-    kernel = np.ones((3, 3), np.uint8)
-    dilated_skeleton = cv2.dilate(skeleton_img, kernel, iterations=1)
+    d_out = cv2.distanceTransform(outer_line, cv2.DIST_L2, 5).astype(np.float32)
+    d_in  = cv2.distanceTransform(inner_line,  cv2.DIST_L2, 5).astype(np.float32)
 
-    # 5. 可视化
+    # 4) 取“等距带”：|d_out - d_in| <= τ，τ 随宽度自适应
+    dist_sum = d_out + d_in + 1e-6
+    diff = np.abs(d_out - d_in)
+
+    # α 越大，带越宽；建议 0.03~0.06 之间
+    alpha = 0.04
+    tau = np.maximum(1.0, alpha * dist_sum)  # 至少 1px，宽处给更宽容带
+    equi_band = ((diff <= tau) & (ring_mask > 0)).astype(np.uint8) * 255
+
+    # 带子可能有裂缝：小闭运算一把
+    equi_band = cv2.morphologyEx(equi_band, cv2.MORPH_CLOSE,
+                                 cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), 1)
+
+    # 5) 细化 + 修剪
+    skel = _sk_skeletonize(equi_band > 0)
+    skel_u8 = (skel.astype(np.uint8) * 255)
+    skel_u8 = _remove_small_blobs(skel_u8, min_area=50)   # 去除偶发短线
+    skel_u8 = _prune_skeleton_spurs(skel_u8, min_branch_len=12, max_pass=6)
+
+    # 6) 轻度膨胀便于观察（若你要像素级坐标，可注释掉）
+    skel_show = cv2.dilate(skel_u8, cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)), 1)
+
     if visualize:
-        vis_img = cv2.cvtColor(surface_mask, cv2.COLOR_GRAY2BGR)
-        cv2.drawContours(vis_img, [outer_cnt], -1, (0, 0, 255), 2)  # 外轮廓红色
-        if inner_cnt is not None:
-            cv2.drawContours(vis_img, [inner_cnt], -1, (0, 255, 0), 2)  # 内轮廓绿色
+        # 仅用于展示的叠加：外(红)/内(绿)/中轴(蓝)
+        vis = cv2.cvtColor(np.zeros_like(ring_mask), cv2.COLOR_GRAY2BGR)
+        cv2.drawContours(vis, [outer_cnt], -1, (0, 0, 255), 2)
+        cv2.drawContours(vis, [inner_cnt], -1, (0, 255, 0), 2)
+        vis[skel_show > 0] = (255, 0, 0)
+        cv2.imshow("Target Mask for Skeletonization", ring_mask)
+        cv2.imshow("Universal Skeleton Extraction", vis)
+        # 如需观察等距带，可打开：
+        # cv2.imshow("Equidistance Band", equi_band)
 
-        # 将骨架叠加为蓝色
-        vis_img[dilated_skeleton != 0] = (255, 0, 0)
-
-        cv2.imshow("Target Mask for Skeletonization", target_mask)
-        cv2.imshow("Universal Skeleton Extraction", vis_img)
-
-    return cv2.cvtColor(dilated_skeleton, cv2.COLOR_GRAY2BGR)
+    return cv2.cvtColor(skel_u8, cv2.COLOR_GRAY2BGR)
 
 def extract_skeleton_points_and_visualize(skeleton_image, origin_offset=(0, 0), visualize=True):
     """
@@ -1361,4 +1493,4 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
+
