@@ -645,6 +645,23 @@ def _auto_size_from_valid(P_mach_flat: np.ndarray, qlo=5.0, qhi=95.0) -> tuple[n
     size = np.clip(size, 20.0, 1200.0)
     return np.array([cx, cy], float), size
 
+def morph_cleanup(mask: np.ndarray, open_k: int, close_k: int) -> np.ndarray:
+    """
+    对二值掩码做开/闭运算清理。
+    - open_k: 开运算核尺寸（像素，>1 时生效）
+    - close_k: 闭运算核尺寸（像素，>1 时生效）
+    返回：uint8 掩码（0/255）
+    """
+    m = (mask > 0).astype(np.uint8) * 255
+    if open_k and open_k > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k, open_k))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
+    if close_k and close_k > 1:
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k, close_k))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
+    return m
+
+
 
 def main():
     # 外参
