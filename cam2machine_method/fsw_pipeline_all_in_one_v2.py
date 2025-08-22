@@ -429,6 +429,7 @@ def _curvature(px: np.ndarray) -> np.ndarray:
     return kappa
 
 
+
 def fit_centerline(mask: np.ndarray, origin_xy: Tuple[float,float], pix_mm: float,
                    background: Optional[np.ndarray]=None,
                    cfg: Optional[Dict]=None):
@@ -684,6 +685,467 @@ def draw_deviation_overlay(vis_top: np.ndarray, ref_xy: np.ndarray, actual_xy: n
         out = np.vstack([out, bar])
     return out
 
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+中心线提取增强补丁（骨架补齐 + 去毛刺 + 分支选择 + 可视化）
+====================================================
+
+用途
+----
+将本文件中的函数粘贴到你的 `fsw_pipeline_all_in_one_v2.py` 中（**替换原有的中轴线相关实现**），
+即可获得更稳健的“实际中轴线”提取：
+- 原生骨架 → **端点桥接（补齐）** → **毛刺剪枝** → **按参考路径选择主分支** → RDP/平滑/等弧长采样。
+- 提供丰富调试图：原掩码、原始骨架、桥接线、剪枝后骨架、最终主路径（曲率着色）、端点/分叉、法线箭头、指标条。
+
+如何接入（两行改动）
+--------------------
+1) 在文件顶部保留/导入所需依赖（本补丁仅用到已有依赖：numpy、cv2、可选 ximgproc/skimage/scipy）。
+2) 在主循环里**把原来的** `fit_centerline(...)` **调用替换为**：
+   ```python
+   centerline_xy, dbg_centerline, metrics = fit_centerline_plus(
+       mask_used, origin_xy, pix_mm,
+       background=vis_top,
+       ref_xy=g_xy,            # 可为 None；若提供则按参考路径选择主分支
+       ref_tree=ref_tree,      # 可为 None；若提供用于快速距离评估
+       cfg=dict(               # 可不传，沿用 CONFIG 缺省
+           spur_len_mm=5.0,
+           bridge_max_gap_mm=8.0,
+           min_component_len_mm=30.0,
+       )
+   )
+   ```
+   其它代码不需要改。
+
+注意
+----
+- 本补丁**不删除**你原文件的注释与函数命名；你可以保留原 `fit_centerline`，另行调用 `fit_centerline_plus`；
+  若希望完全替换，只需把旧调用点换成 `fit_centerline_plus` 即可。
+- 需要 `KDTree` 时若未安装 `scipy`，会自动回退到线性搜索实现（已有）。
+"""
+from typing import Tuple, Optional, Dict
+import numpy as np
+import cv2
+
+# 若你的文件里已有以下符号，请删除本段重复定义或保持一致：
+try:
+    import cv2.ximgproc as xip
+except Exception:
+    xip = None
+try:
+    from skimage.morphology import skeletonize as sk_skeletonize
+except Exception:
+    sk_skeletonize = None
+
+# =============== 基础工具（与原文件一致/兼容） ===============
+
+def _safe_uint8(bw: np.ndarray) -> np.ndarray:
+    m = (bw > 0).astype(np.uint8) * 255
+    return m
+
+
+def _skeletonize_enhanced(mask: np.ndarray) -> np.ndarray:
+    """优先用 ximgproc thinning；失败时 skimage；再失败走距离场脊线回退。"""
+    m = (mask > 0).astype(np.uint8)
+    if xip is not None:
+        try:
+            sk = xip.thinning(m, thinningType=xip.THINNING_ZHANGSUEN)
+            return (sk > 0).astype(np.uint8) * 255
+        except Exception:
+            pass
+    if sk_skeletonize is not None:
+        try:
+            sk = sk_skeletonize(m.astype(bool))
+            return (sk.astype(np.uint8)) * 255
+        except Exception:
+            pass
+    # 回退：距离变换脊线近似
+    dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
+    sk = np.zeros_like(m)
+    for dy in (-1, 0, 1):
+        for dx in (-1, 0, 1):
+            if dx == 0 and dy == 0:
+                continue
+            sk = np.maximum(sk, (dist < np.roll(np.roll(dist, dy, 0), dx, 1)).astype(np.uint8))
+    ridge = (sk == 0).astype(np.uint8) & (m > 0)
+    return ridge.astype(np.uint8) * 255
+
+
+def _skeleton_graph(skel: np.ndarray):
+    ys, xs = np.where(skel > 0)
+    nodes = list(zip(ys.tolist(), xs.tolist()))
+    S = set(nodes)
+    adj = {n: set() for n in nodes}
+    H, W = skel.shape
+    for y, x in nodes:
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dx == 0 and dy == 0:
+                    continue
+                yy, xx = y + dy, x + dx
+                if 0 <= yy < H and 0 <= xx < W and (yy, xx) in S:
+                    adj[(y, x)].add((yy, xx))
+    deg = {n: len(adj[n]) for n in nodes}
+    endpoints = [n for n, d in deg.items() if d == 1]
+    junctions = [n for n, d in deg.items() if d >= 3]
+    return nodes, adj, endpoints, junctions
+
+
+def _longest_path_from_graph(adj, endpoints):
+    import collections
+    def bfs(start):
+        vis = {start: None}; q = collections.deque([start])
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if v not in vis:
+                    vis[v] = u; q.append(v)
+        far = max(vis.keys(), key=lambda k: (abs(k[0] - start[0]) + abs(k[1] - start[1])))
+        return far, vis
+    if endpoints:
+        a = endpoints[0]; b, pre = bfs(a); c, pre2 = bfs(b)
+        path = [c]; p = pre2[c]
+        while p is not None:
+            path.append(p); p = pre2[p]
+        return path[::-1]
+    anyn = next(iter(adj.keys())); b, pre = bfs(anyn); c, pre2 = bfs(b)
+    path = [c]; p = pre2[c]
+    while p is not None:
+        path.append(p); p = pre2[p]
+    return path[::-1]
+
+
+def _connected_components(skel: np.ndarray):
+    nodes, adj, endpoints, junctions = _skeleton_graph(skel)
+    seen = set(); comps = []
+    for n in nodes:
+        if n in seen: continue
+        stack = [n]; comp = set([n]); seen.add(n)
+        while stack:
+            u = stack.pop()
+            for v in adj[u]:
+                if v not in seen:
+                    seen.add(v); comp.add(v); stack.append(v)
+        comps.append(comp)
+    return comps, adj, endpoints, junctions
+
+
+def _spur_prune(skel: np.ndarray, spur_len_px: int) -> np.ndarray:
+    """多轮移除短毛刺：从端点向内累积像素距离，短于阈值则删除。"""
+    sk = (skel > 0).astype(np.uint8)
+    if spur_len_px <= 1: return sk * 255
+    for _ in range(5):  # 最多 5 轮
+        nodes, adj, endpoints, _ = _skeleton_graph(sk * 255)
+        if not endpoints: break
+        removed = 0
+        for epi in endpoints:
+            # 沿端点向内走 spur_len_px 步
+            path = [epi]; cur = epi; prev = None
+            for _step in range(spur_len_px):
+                nxts = [v for v in adj.get(cur, []) if v != prev]
+                if not nxts: break
+                nxt = nxts[0] if len(nxts) == 1 else nxts[0]
+                path.append(nxt); prev, cur = cur, nxt
+                # 到达分叉即停止
+                if len(adj[cur]) >= 3: break
+            # 若没有遇到分叉，认为是毛刺，删除 path
+            if len(adj.get(cur, [])) <= 2:  # 仍未进入主干
+                for y, x in path:
+                    sk[y, x] = 0; removed += 1
+        if removed == 0: break
+    return sk.astype(np.uint8) * 255
+
+
+def _bridge_endpoints(mask: np.ndarray, skel: np.ndarray, max_gap_px: int, max_bridges: int = 20) -> Tuple[np.ndarray, int, np.ndarray]:
+    """在小间隙内桥接端点对：返回新掩码、桥接次数、桥接可视化层。"""
+    if max_gap_px <= 1: return mask.copy(), 0, np.zeros((*mask.shape, 3), np.uint8)
+    nodes, adj, endpoints, _ = _skeleton_graph(skel)
+    pts = np.array([[x, y] for (y, x) in endpoints], np.int32)
+    if len(pts) < 2:
+        return mask.copy(), 0, np.zeros((*mask.shape, 3), np.uint8)
+    M = _safe_uint8(mask)
+    vis = np.zeros((*mask.shape, 3), np.uint8)
+    dil = cv2.dilate(M, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    used = np.zeros(len(pts), np.bool_)
+    bridges = 0
+    for i in range(len(pts)):
+        if used[i]: continue
+        pi = pts[i]
+        # 选最近的未使用端点
+        d2 = np.sum((pts - pi) ** 2, axis=1)
+        order = np.argsort(d2)
+        for j in order:
+            if j == i or used[j]:
+                continue
+            pj = pts[j]
+            dist = np.sqrt(float(d2[j]))
+            if dist > max_gap_px: break
+            # 直线是否“可行”：落在 dil 区域的比例 >= 0.6
+            line_mask = np.zeros_like(M)
+            cv2.line(line_mask, tuple(pi), tuple(pj), 255, 1, cv2.LINE_8)
+            inter = cv2.bitwise_and(line_mask, dil)
+            ratio = float(np.count_nonzero(inter)) / max(1, int(dist))
+            if ratio >= 0.6:
+                # 桥接：在原掩码上画线
+                cv2.line(M, tuple(pi), tuple(pj), 255, 1, cv2.LINE_8)
+                cv2.line(vis, tuple(pi), tuple(pj), (255, 0, 255), 1, cv2.LINE_AA)
+                used[i] = used[j] = True
+                bridges += 1
+                break
+        if bridges >= max_bridges:
+            break
+    return M, bridges, vis
+
+
+def _rdp(points: np.ndarray, eps: float) -> np.ndarray:
+    if len(points) < 3: return points
+    a, b = points[0], points[-1]
+    ab = b - a; lab2 = (ab * ab).sum() + 1e-12
+    dmax = -1; idx = -1
+    for i in range(1, len(points) - 1):
+        ap = points[i] - a
+        t = np.clip(np.dot(ap, ab) / lab2, 0, 1)
+        proj = a + t * ab
+        d = np.linalg.norm(points[i] - proj)
+        if d > dmax: dmax = d; idx = i
+    if dmax > eps:
+        left = _rdp(points[:idx + 1], eps)
+        right = _rdp(points[idx:], eps)
+        return np.vstack([left[:-1], right])
+    else:
+        return np.vstack([a, b])
+
+
+def _smooth_polyline(px: np.ndarray, window: int, polyorder: int) -> np.ndarray:
+    try:
+        from scipy.signal import savgol_filter
+    except Exception:
+        savgol_filter = None
+    if len(px) < max(5, window): return px
+    if savgol_filter is not None and window % 2 == 1:
+        xs = savgol_filter(px[:, 0], window, polyorder)
+        ys = savgol_filter(px[:, 1], window, polyorder)
+        return np.stack([xs, ys], axis=1)
+    # 回退：移动平均
+    k = max(3, window | 1); pad = k // 2
+    ext = np.pad(px, ((pad, pad), (0, 0)), mode='edge')
+    ker = np.ones((k, 1)) / k
+    xs = np.convolve(ext[:, 0], ker[:, 0], mode='valid')
+    ys = np.convolve(ext[:, 1], ker[:, 0], mode='valid')
+    return np.stack([xs, ys], axis=1)
+
+
+def _resample_polyline(px: np.ndarray, step: float) -> np.ndarray:
+    if len(px) < 2: return px
+    seg = np.linalg.norm(np.diff(px, axis=0), axis=1)
+    L = float(seg.sum())
+    if L < 1e-9: return px[[0]].copy()
+    n = max(2, int(np.ceil(L / step)))
+    s = np.linspace(0.0, L, n)
+    cs = np.concatenate([[0.0], np.cumsum(seg)])
+    out = []; j = 0
+    for si in s:
+        while j < len(seg) and si > cs[j + 1]: j += 1
+        if j >= len(seg): out.append(px[-1]); continue
+        t = (si - cs[j]) / max(seg[j], 1e-9)
+        out.append(px[j] * (1 - t) + px[j + 1] * t)
+    return np.asarray(out, float)
+
+
+def _curvature(px: np.ndarray) -> np.ndarray:
+    if len(px) < 3: return np.zeros((len(px),), float)
+    d1 = np.gradient(px, axis=0); d2 = np.gradient(d1, axis=0)
+    num = np.abs(d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0])
+    den = (d1[:, 0] ** 2 + d1[:, 1] ** 2) ** 1.5 + 1e-12
+    kappa = num / den; kappa[~np.isfinite(kappa)] = 0
+    return kappa
+
+
+# =============== 入口函数：fit_centerline_plus ===============
+
+def fit_centerline_plus(mask: np.ndarray,
+                        origin_xy: Tuple[float, float],
+                        pix_mm: float,
+                        background: Optional[np.ndarray] = None,
+                        ref_xy: Optional[np.ndarray] = None,
+                        ref_tree: Optional[object] = None,
+                        cfg: Optional[Dict] = None):
+    """从掩码拟合机床系 XY 中轴线（增强版），并返回调试可视化与指标。"""
+    # 默认参数（可从外部 cfg 覆盖）
+    C = dict(
+        spur_len_mm=5.0,
+        bridge_max_gap_mm=8.0,
+        min_component_len_mm=30.0,
+        rdp_epsilon_px=2.0,
+        sg_window=11,
+        sg_polyorder=2,
+        resample_step_mm=1.0,
+        curvature_amp=200.0,
+        colormap=getattr(cv2, 'COLORMAP_TURBO', getattr(cv2, 'COLORMAP_JET', 2)),
+        normal_stride_px=20,
+    )
+    if cfg: C.update(cfg)
+
+    H, W = mask.shape
+    spur_len_px = max(1, int(round(C['spur_len_mm'] / max(1e-6, pix_mm))))
+    bridge_gap_px = max(1, int(round(C['bridge_max_gap_mm'] / max(1e-6, pix_mm))))
+    min_comp_len_px = max(2, int(round(C['min_component_len_mm'] / max(1e-6, pix_mm))))
+
+    # ---------- (1) 基线：原始骨架 ----------
+    M0 = _safe_uint8(mask)
+    sk_raw = _skeletonize_enhanced(M0)
+
+    # ---------- (2) 端点桥接（补齐） ----------
+    M_bridge, n_bridges, vis_bridge = _bridge_endpoints(M0, sk_raw, bridge_gap_px)
+
+    # ---------- (3) 再骨架 + 毛刺剪枝 ----------
+    sk_b = _skeletonize_enhanced(M_bridge)
+    sk_pruned = _spur_prune(sk_b, spur_len_px)
+
+    # ---------- (4) 组件与主路径选择 ----------
+    comps, adj, endpoints, junctions = _connected_components(sk_pruned)
+    chosen_path_px = None
+    best_score = 1e18
+    for comp in comps:
+        # 组件像素集合 → 子图 → 最长路
+        sub_nodes = list(comp)
+        sub_adj = {n: (adj[n] & comp) for n in sub_nodes}
+        sub_endpoints = [n for n in sub_nodes if len(sub_adj[n]) == 1]
+        if len(sub_nodes) < min_comp_len_px:
+            continue
+        path_nodes = _longest_path_from_graph(sub_adj, sub_endpoints)
+        path_px = np.array([[x, y] for (y, x) in path_nodes], dtype=np.float32)
+        if path_px.shape[0] < 2:
+            continue
+        # 距参考路径的得分（若无参考，则用负长度当分数）
+        if ref_xy is not None and ref_xy.size > 0:
+            # 用简化后的少量采样做 KD 查询
+            sample = path_px[::max(1, path_px.shape[0] // 100)]  # 最多 100 个点
+            # 像素→机床系
+            x0, y0 = origin_xy
+            SX = x0 + (sample[:, 0] + 0.5) * pix_mm
+            SY = y0 + (sample[:, 1] + 0.5) * pix_mm
+            S = np.stack([SX, SY], axis=1)
+            if ref_tree is None:
+                # 线性回退
+                d2 = np.min(np.sum((S[:, None, :] - ref_xy[None, :, :]) ** 2, axis=2), axis=1)
+            else:
+                _d, _i = ref_tree.query(S)
+                d2 = _d ** 2
+            score = float(np.mean(d2))
+        else:
+            # 没有参考路径时，优先最长
+            score = -float(path_px.shape[0])
+        if score < best_score:
+            best_score = score
+            chosen_path_px = path_px
+
+    if chosen_path_px is None:
+        # 回退：对全图取最长路
+        nodes, adj_all, endpoints_all, _ = _skeleton_graph(sk_pruned)
+        if len(nodes) >= 2:
+            chosen = _longest_path_from_graph(adj_all, endpoints_all)
+            chosen_path_px = np.array([[x, y] for (y, x) in chosen], dtype=np.float32)
+        else:
+            dbg = cv2.cvtColor(M0, cv2.COLOR_GRAY2BGR)
+            cv2.putText(dbg, 'no-skeleton', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            return np.empty((0, 2), float), dbg, dict(reason='no-skeleton')
+
+    # ---------- (5) RDP/平滑/等弧长采样 ----------
+    path_px = chosen_path_px
+    if path_px.shape[0] >= 3:
+        path_px = _rdp(path_px, float(C['rdp_epsilon_px']))
+    path_px = _smooth_polyline(path_px, int(C['sg_window']), int(C['sg_polyorder']))
+    step_px = max(1.0, float(C['resample_step_mm']) / max(1e-6, pix_mm))
+    path_px = _resample_polyline(path_px, step_px)
+    # 清理/裁剪/取整
+    path_px = path_px[np.all(np.isfinite(path_px), axis=1)]
+    if len(path_px) < 2:
+        dbg = cv2.cvtColor(M0, cv2.COLOR_GRAY2BGR)
+        cv2.putText(dbg, 'short-path', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        return np.empty((0, 2), float), dbg, dict(reason='short-path')
+    path_px[:, 0] = np.clip(path_px[:, 0], 0, W - 1)
+    path_px[:, 1] = np.clip(path_px[:, 1], 0, H - 1)
+    path_int = np.round(path_px).astype(np.int32)
+
+    # ---------- (6) 曲率/法线 ----------
+    kappa = _curvature(path_px)
+    d = np.gradient(path_px, axis=0)
+    T = d / (np.linalg.norm(d, axis=1, keepdims=True) + 1e-9)
+    N = np.stack([-T[:, 1], T[:, 0]], axis=1)
+
+    # ---------- (7) 可视化合成 ----------
+    if background is None:
+        vis = cv2.cvtColor(M0, cv2.COLOR_GRAY2BGR)
+    else:
+        vis = background.copy()
+        if vis.shape[:2] != mask.shape:
+            vis = cv2.resize(vis, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    # 原始骨架（青）
+    sk3 = cv2.cvtColor(sk_raw, cv2.COLOR_GRAY2BGR)
+    sk3[:, :, 1] = np.maximum(sk3[:, :, 1], sk3[:, :, 0])  # 偏青
+    vis = cv2.addWeighted(vis, 0.85, sk3, 0.35, 0)
+
+    # 桥接线（品红）
+    vis = cv2.addWeighted(vis, 1.0, vis_bridge, 0.9, 0)
+
+    # 剪枝后骨架（黄）
+    skp = cv2.cvtColor(sk_pruned, cv2.COLOR_GRAY2BGR)
+    skp[:, :, 2] = 0; skp[:, :, 1] = np.maximum(skp[:, :, 1], skp[:, :, 0])  # 偏黄
+    vis = cv2.addWeighted(vis, 0.9, skp, 0.4, 0)
+
+    # 端点/分叉
+    nodes2, adj2, endpoints2, junctions2 = _skeleton_graph(sk_pruned)
+    for y, x in endpoints2: cv2.circle(vis, (int(x), int(y)), 3, (0, 255, 255), -1)
+    for y, x in junctions2: cv2.circle(vis, (int(x), int(y)), 3, (0, 165, 255), -1)
+
+    # 主路径曲率着色
+    if len(path_int) >= 2:
+        k = np.clip(np.nan_to_num(kappa * float(C['curvature_amp']), nan=0.0, posinf=1.0, neginf=0.0), 0, 1)
+        lut_in = (k * 255).astype(np.uint8).reshape(-1, 1)
+        colors = cv2.applyColorMap(lut_in, int(C['colormap'])).reshape(-1, 3)
+        for i in range(len(path_int) - 1):
+            c = tuple(int(v) for v in colors[i])
+            p1 = (int(path_int[i, 0]), int(path_int[i, 1]))
+            p2 = (int(path_int[i + 1, 0]), int(path_int[i + 1, 1]))
+            cv2.line(vis, p1, p2, c, 2, cv2.LINE_AA)
+        # 法线箭头
+        stride = int(C['normal_stride_px'])
+        for i in range(0, len(path_int), max(1, stride)):
+            x, y = int(path_int[i, 0]), int(path_int[i, 1])
+            nx, ny = N[i] * 12.0
+            tx, ty = int(np.clip(x + nx, 0, W - 1)), int(np.clip(y + ny, 0, H - 1))
+            cv2.arrowedLine(vis, (x, y), (tx, ty), (0, 255, 0), 1, cv2.LINE_AA, tipLength=0.3)
+            cv2.putText(vis, str(i), (x + 3, y - 3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+
+    # 指标条
+    legend = np.zeros((64, vis.shape[1], 3), np.uint8)
+    comps_count = len(comps)
+    spur_px_est = spur_len_px
+    Lpx = float(np.linalg.norm(np.diff(path_px, axis=0), axis=1).sum()) if len(path_px) > 1 else 0.0
+    Lmm = Lpx * pix_mm
+    info = (f"components={comps_count}  bridges={n_bridges}  spur_prune~{spur_px_est}px  "
+            f"len={Lmm:.1f}mm  step={C['resample_step_mm']:.1f}mm")
+    cv2.putText(legend, info, (10, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1, cv2.LINE_AA)
+    dbg = np.vstack([vis, legend])
+
+    # ---------- (8) 像素路径 -> 机床系 XY ----------
+    x0, y0 = origin_xy
+    X = x0 + (path_px[:, 0] + 0.5) * pix_mm
+    Y = y0 + (path_px[:, 1] + 0.5) * pix_mm
+    centerline_xy = np.stack([X, Y], axis=1)
+
+    metrics = dict(
+        components=int(comps_count),
+        bridges=int(n_bridges),
+        spur_len_px=int(spur_px_est),
+        length_mm=float(Lmm),
+        n_points=int(centerline_xy.shape[0])
+    )
+    return centerline_xy, dbg, metrics
+
+
 # =============================
 # 相机（保留）
 # =============================
@@ -819,7 +1281,7 @@ def main():
 
             # 中轴线拟合（若开启 ROI 则用裁剪后掩码；否则直接用全场掩码，可能较慢/分叉多）
             mask_used = mask_for_fit if roi_mode!='camera_rect' else mask_clean
-            centerline_xy, dbg_centerline, diag = fit_centerline(
+            centerline_xy, dbg_centerline, diag = fit_centerline_plus(
                 mask_used, origin_xy, pix_mm, background=vis_top,
                 cfg=dict(resample_step_mm=CONFIG['resample_step_mm'])
             )
