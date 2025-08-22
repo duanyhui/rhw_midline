@@ -432,6 +432,7 @@ def _curvature(px: np.ndarray) -> np.ndarray:
 def fit_centerline(mask: np.ndarray, origin_xy: Tuple[float,float], pix_mm: float,
                    background: Optional[np.ndarray]=None,
                    cfg: Optional[Dict]=None):
+    """从掩码拟合机床系 XY 中轴线，并返回调试可视化。"""
     C = dict(
         use_ximgproc_first=True,
         rdp_epsilon_px=CONFIG['rdp_epsilon_px'],
@@ -443,65 +444,106 @@ def fit_centerline(mask: np.ndarray, origin_xy: Tuple[float,float], pix_mm: floa
     )
     if cfg: C.update(cfg)
 
+    # 1) 骨架
     skel = _skeletonize(mask, C['use_ximgproc_first'])
-    ys, xs = np.where(skel>0)
-    if len(xs)==0:
+    ys, xs = np.where(skel > 0)
+    if len(xs) == 0:
         dbg = background if background is not None else cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         return np.empty((0,2), float), dbg, dict(reason='empty-mask')
 
+    # 2) 建图 → 最长路 → 像素路径
     nodes, adj, endpoints, junctions = _skeleton_graph(skel)
-    path_nodes = _longest_path_from_graph(adj, endpoints)
-    path_px = np.array([[x,y] for (y,x) in path_nodes], float)
+    path_nodes = _longest_path_from_graph(adj, endpoints)  # [(y,x)]
+    path_px = np.array([[x, y] for (y, x) in path_nodes], dtype=np.float32)
 
-    if len(path_px)>=3:
-        path_px = _rdp(path_px, C['rdp_epsilon_px'])
-    path_px = _smooth_polyline(path_px, C['sg_window'], C['sg_polyorder'])
+    # 去除非有限值
+    if path_px.size == 0:
+        dbg = background if background is not None else cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        return np.empty((0,2), float), dbg, dict(reason='empty-path')
+    path_px = path_px[np.all(np.isfinite(path_px), axis=1)]
+    if len(path_px) < 2:
+        dbg = background if background is not None else cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        return np.empty((0,2), float), dbg, dict(reason='short-path')
 
+    # 3) 简化 + 平滑 + 等弧长重采样（像素域）
+    if len(path_px) >= 3:
+        path_px = _rdp(path_px, float(C['rdp_epsilon_px']))
+    path_px = _smooth_polyline(path_px, int(C['sg_window']), int(C['sg_polyorder']))
     step_px = max(1.0, float(C['resample_step_mm'])/max(1e-6, pix_mm))
     path_px = _resample_polyline(path_px, step_px)
 
-    # 曲率/法线可视化
-    kappa = _curvature(path_px)
+    # 再次去除非有限值并裁剪到图像范围，转 int 用于绘制
+    H, W = mask.shape
+    path_px = path_px[np.all(np.isfinite(path_px), axis=1)]
+    if len(path_px) < 2:
+        dbg = background if background is not None else cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+        return np.empty((0,2), float), dbg, dict(reason='short-after-clean')
+    path_px[:, 0] = np.clip(path_px[:, 0], 0, W - 1)
+    path_px[:, 1] = np.clip(path_px[:, 1], 0, H - 1)
+    path_int = np.round(path_px).astype(np.int32)
+
+    # 4) 曲率/法线（用于调试绘制）
+    def _curv(px):
+        if len(px) < 3: return np.zeros((len(px),), float)
+        d1 = np.gradient(px, axis=0); d2 = np.gradient(d1, axis=0)
+        num = np.abs(d1[:,0]*d2[:,1] - d1[:,1]*d2[:,0])
+        den = (d1[:,0]**2 + d1[:,1]**2)**1.5 + 1e-12
+        kappa = num/den; kappa[~np.isfinite(kappa)] = 0
+        return kappa
+    kappa = _curv(path_px)
     d = np.gradient(path_px, axis=0)
     T = d / (np.linalg.norm(d, axis=1, keepdims=True) + 1e-9)
     N = np.stack([-T[:,1], T[:,0]], axis=1)
 
-    # 背景叠加
-    H, W = mask.shape
-    vis = background.copy() if background is not None else cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    if vis.shape[:2] != mask.shape:
-        vis = cv2.resize(vis, (W, H), interpolation=cv2.INTER_NEAREST)
+    # 5) 调试可视化合成
+    if background is None:
+        vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    else:
+        vis = background.copy()
+        if vis.shape[:2] != mask.shape:
+            vis = cv2.resize(vis, (W, H), interpolation=cv2.INTER_NEAREST)
+
+    # 骨架淡显
     sk3 = cv2.cvtColor(((skel>0)*255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
     vis = cv2.addWeighted(vis, 0.9, sk3, 0.3, 0)
-    for y,x in endpoints: cv2.circle(vis, (x,y), 3, (0,255,255), -1)
-    for y,x in junctions: cv2.circle(vis, (x,y), 3, (0,165,255), -1)
-    if len(path_px) >= 2:
-        k = kappa.copy()
-        if k.size != len(path_px):
-            if kappa.size>1:
-                k = np.interp(np.linspace(0,1,len(path_px)), np.linspace(0,1,len(kappa)), kappa)
-            else:
-                k = np.zeros(len(path_px))
-        k = np.clip(k * C['curvature_amp'], 0, 1)
-        cm = cv2.applyColorMap((k*255).astype(np.uint8), C['colormap'])
-        for i in range(len(path_px)-1):
-            c = tuple(int(v) for v in cm[i,0].tolist())
-            cv2.line(vis, tuple(path_px[i][::-1]), tuple(path_px[i+1][::-1]), c, 2, cv2.LINE_AA)
-    for i in range(0, len(path_px), 20):
-        x,y = path_px[i]; nx,ny = N[i]*12
-        cv2.arrowedLine(vis, (int(x),int(y)), (int(x+nx),int(y+ny)), (0,255,0), 1, cv2.LINE_AA, tipLength=0.3)
-        cv2.putText(vis, str(i), (int(x)+3, int(y)-3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
+
+    # 端点/分叉
+    for y,x in endpoints: cv2.circle(vis, (int(x),int(y)), 3, (0,255,255), -1)
+    for y,x in junctions: cv2.circle(vis, (int(x),int(y)), 3, (0,165,255), -1)
+
+    # 主路径曲率着色（安全处理 NaN）
+    if len(path_int) >= 2:
+        k = np.clip(np.nan_to_num(kappa * float(C['curvature_amp']), nan=0.0, posinf=1.0, neginf=0.0), 0, 1)
+        # 做成 Nx1 的单通道“图像”喂给 applyColorMap
+        lut_in = (k * 255).astype(np.uint8).reshape(-1, 1)
+        colors = cv2.applyColorMap(lut_in, int(C['colormap'])).reshape(-1, 3)
+        for i in range(len(path_int) - 1):
+            c = tuple(int(v) for v in colors[i])
+            p1 = (int(path_int[i,0]),   int(path_int[i,1]))
+            p2 = (int(path_int[i+1,0]), int(path_int[i+1,1]))
+            cv2.line(vis, p1, p2, c, 2, cv2.LINE_AA)
+
+    # 法线箭头 + 索引
+    for i in range(0, len(path_int), 20):
+        x, y = int(path_int[i,0]), int(path_int[i,1])
+        nx, ny = N[i] * 12.0
+        tx, ty = int(np.clip(x + nx, 0, W-1)), int(np.clip(y + ny, 0, H-1))
+        cv2.arrowedLine(vis, (x,y), (tx,ty), (0,255,0), 1, cv2.LINE_AA, tipLength=0.3)
+        cv2.putText(vis, str(i), (x+3, y-3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
+
     legend = np.zeros((60, vis.shape[1], 3), np.uint8)
     cv2.putText(legend, 'yellow=endpoints  orange=junctions  line=curvature  green=normals',
                 (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
     dbg = np.vstack([vis, legend])
 
-    # 像素路径 -> 机床系 XY
+    # 6) 像素路径 -> 机床系 XY
     x0, y0 = origin_xy
     X = x0 + (path_px[:,0] + 0.5) * pix_mm
     Y = y0 + (path_px[:,1] + 0.5) * pix_mm
     centerline_xy = np.stack([X, Y], axis=1)
-    return centerline_xy, dbg, dict(path_px=path_px, curvature=kappa)
+
+    diag = dict(path_px=path_px, curvature=kappa)
+    return centerline_xy, dbg, diag
 
 # =============================
 # 偏差计算与控制（保留）
