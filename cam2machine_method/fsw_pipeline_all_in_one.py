@@ -59,18 +59,22 @@ except Exception:
 # 配置
 # =============================
 CONFIG: Dict = dict(
-    T_path='T_cam2machine.npy',
-    gcode_path='path/example.gcode',
-    pixel_size_mm=0.5,
-    roi_size_mm=120.0,
-    roi_center_xy=[0.0, 0.0],
-    z_select='max',                 # 'max' 或 'min'
-    min_points_per_cell=1,
-    morph_open=3,
-    morph_close=5,
+    # 文件
+    T_path='T-cam2machine.npy',     # 外参路径
+    gcode_path='',# G 代码路径（为空则只看点云与中轴线）
+
+    # 投影与 ROI（机床系）
+    pixel_size_mm=0.5,              # 栅格分辨率（mm/px）
+    roi_size_mm=120.0,              # ROI 边长（mm）
+    roi_center_xy=[0.0, 0.0],       # 初始 ROI 中心；[0,0] 则首帧取中位数
+    z_select='max',                 # 最近表面策略：'max' 或 'min'
+    min_points_per_cell=1,          # 栅格内最少点数
+    morph_open=3,                   # 开运算核尺寸（px）
+    morph_close=5,                  # 闭运算核尺寸（px）
     # 有效点判定
-    require_positive_z=True,        # 过滤 Z<=0
-    reject_zero_xyz=True,           # 过滤 (0,0,0)
+    require_positive_z=True,  # 过滤 Z<=0
+    reject_zero_xyz=True,  # 过滤 (0,0,0)
+
     # 中轴线拟合
     rdp_epsilon_px=2.0,
     sg_window=11,
