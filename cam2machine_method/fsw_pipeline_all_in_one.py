@@ -1,29 +1,28 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-FSW 在线视觉管线（All-in-One 单文件）
-=================================
+FSW 在线视觉管线（All-in-One 单文件，修正版）
+===========================================
 
-功能概述
+修复要点
 --------
-- 读取外参 `T_cam2machine.npy`（R, t），将相机点云转换到**机床坐标系**（mm）。
-- 通过 PCamMLS（PercipioSDK）实时采集深度并映射点云。
-- 在机床系下做 **Z 轴俯视正交投影**，生成 XY 栅格上的“最近表面”高度图与掩码，并可交互调整 ROI/分辨率。
-- 从掩码提取**中轴线**：骨架→建图→最长路→RDP 简化→平滑→等弧长重采样；输出机床系 XY 曲线。
-- 从 G 代码解析出**理论路径**（G0/G1），重采样并计算切线/法线场；与实际中轴线对比得到**横向偏差 eₙ**。
-- 控制整形：EMA 平滑、死区、硬限幅、限速/限步，输出 `(dx, dy)` 建议量（机床系）。
-- 丰富可视化：高度伪彩、掩码、理论路径、实际中轴线、偏差箭头与统计条、中轴线调试图（端点/分叉/曲率/法线）。
+- **ROI 内无有效点导致黑屏**：增加了**有效点筛选**（过滤 Z<=0、(0,0,0)、NaN），并基于有效点**自动居中/自适应** ROI。
+- **首帧自动居中更鲁棒**：只用“有效点”计算中位数；若还为空，提供 `c/C/a/A` 四个热键快速校正 ROI。
+- **可视化诊断**：HUD 中显示“总有效点数/ROI 内有效点数”；当 ROI 命中为 0 时在画面顶端显示红色提示条。
 
-依赖
+功能概述（与上一版一致）
+----------------------
+- 读取外参 `T_cam2machine.npy`，相机点云→机床坐标系。
+- 机床系下 **Z 轴俯视正交投影**，得到高度图与“最近表面”掩码。
+- 掩码→**中轴线拟合**（骨架/最长路/RDP/平滑/等弧长采样），输出机床系 XY 曲线与调试图。
+- 解析 G 代码（G0/G1），重采样、法向场；计算横向偏差 eₙ，EMA/死区/限速/限步输出 `(dx,dy)`。
+- 丰富可视化：高度伪彩、掩码、理论路径、实际中轴线、偏差箭头与统计条、中轴线调试图。
+
+热键
 ----
-必需：`numpy`, `opencv-python`, `pcammls`
-可选：`scikit-image`（更稳的骨架）、`scipy`（KDTree 与 Savitzky–Golay 平滑）。均缺省时有回退实现。
-
-使用方法
---------
-1) 先用你的标定脚本生成 `T_cam2machine.npy`。
-2) 运行本脚本，按提示输入外参与 G 代码路径；用窗口热键体验：
-   - `q` 退出；`s` 截图；`i/k/j/l` 平移 ROI；`[`/`]` 缩放 ROI；`-`/`=` 改栅格分辨率；`r` 重置。
+- `q` 退出；`s` 截图；`-`/`=` 改栅格分辨率；`i/k/j/l` 平移 ROI；`[`/`]` 缩放 ROI；`r` 重置。
+- `c`：把 ROI **居中到全局有效点中位数**；`C`：居中到**当前 ROI**内有效点中位数。
+- `a`：按全局有效点 **5–95% 分位**自适应 ROI；`A`：按 **1–99% 分位**自适应 ROI。
 """
 from __future__ import annotations
 from pathlib import Path
@@ -32,8 +31,7 @@ from typing import Tuple, Optional, Dict, List
 import collections
 import math
 import numpy as np
-
-import cv2  # 显示/形态学/着色
+import cv2
 
 # --- 可选依赖 ---
 try:
@@ -41,59 +39,56 @@ try:
 except Exception:
     pcammls = None
 try:
-    import cv2.ximgproc as xip  # 骨架 thinning
+    import cv2.ximgproc as xip
 except Exception:
     xip = None
 try:
-    from skimage.morphology import skeletonize as sk_skeletonize  # 备选骨架
+    from skimage.morphology import skeletonize as sk_skeletonize
 except Exception:
     sk_skeletonize = None
 try:
-    from scipy.spatial import cKDTree as KDTree  # 快速最近邻
+    from scipy.spatial import cKDTree as KDTree
 except Exception:
     KDTree = None
 try:
-    from scipy.signal import savgol_filter  # 平滑
+    from scipy.signal import savgol_filter
 except Exception:
     savgol_filter = None
 
 # =============================
-# 全局配置（可直接修改）
+# 配置
 # =============================
 CONFIG: Dict = dict(
-    # 文件
-    T_path='T_cam2machine.npy',     # 外参路径
-    gcode_path='path/example.gcode',# G 代码路径（为空则只看点云与中轴线）
-
-    # 投影与 ROI（机床系）
-    pixel_size_mm=0.5,              # 栅格分辨率（mm/px）
-    roi_size_mm=120.0,              # ROI 边长（mm）
-    roi_center_xy=[0.0, 0.0],       # 初始 ROI 中心；[0,0] 则首帧取中位数
-    z_select='max',                 # 最近表面策略：'max' 或 'min'
-    min_points_per_cell=1,          # 栅格内最少点数
-    morph_open=3,                   # 开运算核尺寸（px）
-    morph_close=5,                  # 闭运算核尺寸（px）
-
+    T_path='T_cam2machine.npy',
+    gcode_path='path/example.gcode',
+    pixel_size_mm=0.5,
+    roi_size_mm=120.0,
+    roi_center_xy=[0.0, 0.0],
+    z_select='max',                 # 'max' 或 'min'
+    min_points_per_cell=1,
+    morph_open=3,
+    morph_close=5,
+    # 有效点判定
+    require_positive_z=True,        # 过滤 Z<=0
+    reject_zero_xyz=True,           # 过滤 (0,0,0)
     # 中轴线拟合
     rdp_epsilon_px=2.0,
-    sg_window=11,                   # Savitzky–Golay 窗口（奇数）
+    sg_window=11,
     sg_polyorder=2,
-    resample_step_mm=1.0,           # 最终等弧长重采样步长（mm）
-
+    resample_step_mm=1.0,
     # 偏差控制
     ema_alpha=0.3,
     deadband_mm=0.05,
     clip_mm=2.0,
     max_step_mm=0.15,
     max_rate_mm_s=5.0,
-
     # 显示/输出
     colormap=getattr(cv2, 'COLORMAP_TURBO', getattr(cv2, 'COLORMAP_JET', 2)),
     out_dir='out/frames'
 )
 
 # =============================
-# 通用工具
+# 工具
 # =============================
 
 def ensure_dir(p: str | Path):
@@ -109,39 +104,39 @@ def transform_cam_to_machine(P_cam: np.ndarray, R: np.ndarray, t: np.ndarray) ->
     return (R @ P_cam.T).T + t
 
 # =============================
-# G 代码解析与几何场
+# G 代码与几何
 # =============================
 
 def parse_gcode_xy(path: str | Path) -> np.ndarray:
     pts: List[List[float]] = []
     if not path or not Path(path).exists():
-        return np.empty((0, 2), float)
+        return np.empty((0,2), float)
     with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-        x = y = None
+        x=y=None
         for raw in f:
             line = raw.strip()
             if not line or line.startswith(';') or line.startswith('('):
                 continue
             if ';' in line:
-                line = line.split(';', 1)[0]
+                line = line.split(';',1)[0]
             while '(' in line and ')' in line:
-                a, b = line.find('('), line.find(')')
-                if a < 0 or b < 0 or b <= a: break
+                a,b = line.find('('), line.find(')')
+                if a<0 or b<0 or b<=a: break
                 line = (line[:a] + ' ' + line[b+1:]).strip()
             toks = line.split()
             if not toks: continue
             cmd = toks[0].upper()
             if cmd in ('G0','G00','G1','G01'):
                 for t in toks[1:]:
-                    u = t.upper()
+                    u=t.upper()
                     if u.startswith('X'):
-                        try: x = float(u[1:])
+                        try: x=float(u[1:])
                         except: pass
                     elif u.startswith('Y'):
-                        try: y = float(u[1:])
+                        try: y=float(u[1:])
                         except: pass
                 if x is not None and y is not None:
-                    pts.append([x, y])
+                    pts.append([x,y])
     return np.asarray(pts, float) if pts else np.empty((0,2), float)
 
 
@@ -185,26 +180,34 @@ def build_kdtree(pts: np.ndarray):
     return _Lin(pts)
 
 # =============================
-# 机床系俯视正交投影
+# 俯视正交投影
 # =============================
 
 def orthographic_project_top(P_mach: np.ndarray, roi_center: np.ndarray, roi_size: float, pix_mm: float,
-                             z_select: str='max', min_points_per_cell: int=1):
-    """将点云在机床系下正交投影到 XY 栅格。
-    返回：height(HxW, float32, Z 值，NaN 为无效), mask(HxW, uint8), origin_xy(左下角像素对应机床坐标)
-    """
+                             z_select: str='max', min_points_per_cell: int=1) -> tuple[np.ndarray,np.ndarray,tuple[float,float],int]:
     half = roi_size*0.5
     cx, cy = float(roi_center[0]), float(roi_center[1])
     x0, x1 = cx-half, cx+half
     y0, y1 = cy-half, cy+half
+
     X,Y,Z = P_mach[:,0], P_mach[:,1], P_mach[:,2]
-    m = (X>=x0)&(X<x1)&(Y>=y0)&(Y<y1)&np.isfinite(Z)
+    # ROI + 有效性：Z>0、不是零向量、不是 NaN
+    valid = np.isfinite(X)&np.isfinite(Y)&np.isfinite(Z)
+    if CONFIG['require_positive_z']:
+        valid &= (Z > 0)
+    if CONFIG['reject_zero_xyz']:
+        valid &= (np.abs(X)+np.abs(Y)+np.abs(Z) > 1e-6)
+    inroi = (X>=x0)&(X<x1)&(Y>=y0)&(Y<y1)
+    sel = valid & inroi
+
     W = H = int(max(2, round(roi_size/pix_mm)))
-    if not np.any(m):
-        return np.full((H,W), np.nan, np.float32), np.zeros((H,W), np.uint8), (x0,y0)
-    X, Y, Z = X[m], Y[m], Z[m]
+    if not np.any(sel):
+        return np.full((H,W), np.nan, np.float32), np.zeros((H,W), np.uint8), (x0,y0), 0
+
+    X, Y, Z = X[sel], Y[sel], Z[sel]
     ix = np.clip(((X-x0)/pix_mm).astype(np.int32), 0, W-1)
     iy = np.clip(((Y-y0)/pix_mm).astype(np.int32), 0, H-1)
+
     height = np.full((H,W), np.nan, np.float32)
     count  = np.zeros((H,W), np.int32)
     if z_select=='max':
@@ -216,21 +219,10 @@ def orthographic_project_top(P_mach: np.ndarray, roi_center: np.ndarray, roi_siz
             if not np.isfinite(height[yg,xg]) or zg<height[yg,xg]: height[yg,xg]=zg
             count[yg,xg]+=1
     mask = (count>=min_points_per_cell).astype(np.uint8)*255
-    return height, mask, (x0,y0)
-
-
-def morph_cleanup(mask, open_k: int, close_k: int):
-    m = mask.copy()
-    if open_k and open_k>1:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_k,open_k))
-        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
-    if close_k and close_k>1:
-        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_k,close_k))
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
-    return m
+    return height, mask, (x0,y0), int(sel.sum())
 
 # =============================
-# 中轴线拟合（骨架→路径→平滑→重采样）
+# 中轴线拟合（骨架→路径）
 # =============================
 
 def _skeletonize(mask: np.ndarray, use_ximgproc_first: bool=True) -> np.ndarray:
@@ -247,7 +239,6 @@ def _skeletonize(mask: np.ndarray, use_ximgproc_first: bool=True) -> np.ndarray:
             return (sk.astype(np.uint8))*255
         except Exception:
             pass
-    # 回退：距离变换脊线近似（质量较差）
     dist = cv2.distanceTransform(m, cv2.DIST_L2, 3)
     sk = np.zeros_like(m)
     for dy in (-1,0,1):
@@ -324,7 +315,6 @@ def _smooth_polyline(px: np.ndarray, window: int, polyorder: int) -> np.ndarray:
         xs = savgol_filter(px[:,0], window, polyorder)
         ys = savgol_filter(px[:,1], window, polyorder)
         return np.stack([xs, ys], axis=1)
-    # 回退：移动平均
     k = max(3, window|1); pad=k//2
     ext = np.pad(px, ((pad,pad),(0,0)), mode='edge')
     ker = np.ones((k,1))/k
@@ -352,8 +342,7 @@ def _resample_polyline(px: np.ndarray, step: float) -> np.ndarray:
 
 def _curvature(px: np.ndarray) -> np.ndarray:
     if len(px) < 3: return np.zeros((len(px),), float)
-    d1 = np.gradient(px, axis=0)
-    d2 = np.gradient(d1, axis=0)
+    d1 = np.gradient(px, axis=0); d2 = np.gradient(d1, axis=0)
     num = np.abs(d1[:,0]*d2[:,1] - d1[:,1]*d2[:,0])
     den = (d1[:,0]**2 + d1[:,1]**2)**1.5 + 1e-12
     kappa = num/den; kappa[~np.isfinite(kappa)] = 0
@@ -363,15 +352,12 @@ def _curvature(px: np.ndarray) -> np.ndarray:
 def fit_centerline(mask: np.ndarray, origin_xy: Tuple[float,float], pix_mm: float,
                    background: Optional[np.ndarray]=None,
                    cfg: Optional[Dict]=None):
-    """从掩码拟合机床系 XY 中轴线，并返回调试可视化。"""
     C = dict(
         use_ximgproc_first=True,
         rdp_epsilon_px=CONFIG['rdp_epsilon_px'],
         sg_window=CONFIG['sg_window'],
         sg_polyorder=CONFIG['sg_polyorder'],
         resample_step_mm=CONFIG['resample_step_mm'],
-        normal_stride_px=20,
-        show_indices_every=20,
         curvature_amp=200.0,
         colormap=CONFIG['colormap'],
     )
@@ -384,7 +370,7 @@ def fit_centerline(mask: np.ndarray, origin_xy: Tuple[float,float], pix_mm: floa
         return np.empty((0,2), float), dbg, dict(reason='empty-mask')
 
     nodes, adj, endpoints, junctions = _skeleton_graph(skel)
-    path_nodes = _longest_path_from_graph(adj, endpoints)  # [(y,x)]
+    path_nodes = _longest_path_from_graph(adj, endpoints)
     path_px = np.array([[x,y] for (y,x) in path_nodes], float)
 
     if len(path_px)>=3:
@@ -394,21 +380,19 @@ def fit_centerline(mask: np.ndarray, origin_xy: Tuple[float,float], pix_mm: floa
     step_px = max(1.0, float(C['resample_step_mm'])/max(1e-6, pix_mm))
     path_px = _resample_polyline(path_px, step_px)
 
-    # 曲率 & 法线（可视化）
+    # 曲率可视化
     kappa = _curvature(path_px)
     d = np.gradient(path_px, axis=0)
     T = d / (np.linalg.norm(d, axis=1, keepdims=True) + 1e-9)
     N = np.stack([-T[:,1], T[:,0]], axis=1)
 
-    # 调试可视化合成
+    # 背景
     H, W = mask.shape
-    if background is None:
-        vis = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-    else:
-        vis = background.copy()
-        if vis.shape[:2] != mask.shape:
-            vis = cv2.resize(vis, (W, H), interpolation=cv2.INTER_NEAREST)
+    vis = background.copy() if background is not None else cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+    if vis.shape[:2] != mask.shape:
+        vis = cv2.resize(vis, (W, H), interpolation=cv2.INTER_NEAREST)
 
+    # 骨架淡显
     sk3 = cv2.cvtColor(((skel>0)*255).astype(np.uint8), cv2.COLOR_GRAY2BGR)
     vis = cv2.addWeighted(vis, 0.9, sk3, 0.3, 0)
 
@@ -430,17 +414,12 @@ def fit_centerline(mask: np.ndarray, origin_xy: Tuple[float,float], pix_mm: floa
             c = tuple(int(v) for v in cm[i,0].tolist())
             cv2.line(vis, tuple(path_px[i][::-1]), tuple(path_px[i+1][::-1]), c, 2, cv2.LINE_AA)
 
-    # 法线箭头 + 索引
-    stride = 20; Lpix=12
-    for i in range(0, len(path_px), stride):
-        x,y = path_px[i]
-        nx,ny = N[i]*Lpix
-        cv2.arrowedLine(vis, (int(x),int(y)), (int(x+nx),int(y+ny)), (0,255,0), 1, cv2.LINE_AA, tipLength=0.3)
+    # 法线与索引
     for i in range(0, len(path_px), 20):
-        x,y = path_px[i]
+        x,y = path_px[i]; nx,ny = N[i]*12
+        cv2.arrowedLine(vis, (int(x),int(y)), (int(x+nx),int(y+ny)), (0,255,0), 1, cv2.LINE_AA, tipLength=0.3)
         cv2.putText(vis, str(i), (int(x)+3, int(y)-3), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1, cv2.LINE_AA)
 
-    # 垫底图例
     legend = np.zeros((60, vis.shape[1], 3), np.uint8)
     cv2.putText(legend, 'yellow=endpoints  orange=junctions  line=curvature  green=normals',
                 (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1, cv2.LINE_AA)
@@ -452,11 +431,10 @@ def fit_centerline(mask: np.ndarray, origin_xy: Tuple[float,float], pix_mm: floa
     Y = y0 + (path_px[:,1] + 0.5) * pix_mm
     centerline_xy = np.stack([X, Y], axis=1)
 
-    diag = dict(path_px=path_px, curvature=kappa)
-    return centerline_xy, dbg, diag
+    return centerline_xy, dbg, dict(path_px=path_px, curvature=kappa)
 
 # =============================
-# 偏差计算与控制整形
+# 偏差计算/控制
 # =============================
 
 def project_points_to_path(points: np.ndarray, ref_xy: np.ndarray, ref_tree, ref_normals: np.ndarray):
@@ -466,8 +444,7 @@ def project_points_to_path(points: np.ndarray, ref_xy: np.ndarray, ref_tree, ref
     idx = np.asarray(idx, dtype=int)
     nearest = ref_xy[idx]
     N = ref_normals[np.clip(idx, 0, len(ref_normals)-1)]
-    dev_vec = points - nearest
-    e_n = (dev_vec * N).sum(axis=1)
+    e_n = ((points - nearest) * N).sum(axis=1)
     return idx, nearest, e_n
 
 @dataclass
@@ -497,8 +474,7 @@ class DeviationController:
         med = float(np.median(e_n))
         idx_med = int(np.argsort(e_n)[len(e_n)//2])
         nvec = normals[np.clip(idx_med, 0, len(normals)-1)]
-        if abs(med) < self.cfg.deadband_mm:
-            med = 0.0
+        if abs(med) < self.cfg.deadband_mm: med = 0.0
         med = float(np.clip(med, -self.cfg.clip_mm, self.cfg.clip_mm))
         med_s = self._smooth(med)
         target = nvec * med_s
@@ -590,7 +566,7 @@ def draw_deviation_overlay(vis_top: np.ndarray, ref_xy: np.ndarray, actual_xy: n
     return out
 
 # =============================
-# 相机（PCamMLS）
+# 相机
 # =============================
 class PCamMLSStream:
     def __init__(self):
@@ -604,7 +580,7 @@ class PCamMLSStream:
     def open(self):
         devs = self.cl.ListDevice()
         if len(devs)==0: raise SystemExit('未发现设备。')
-        print('检测到设备:')
+        print('检测到设备:');
         for i,d in enumerate(devs): print(f'  {i}: {d.id}\t{d.iface.id}')
         idx = 0 if len(devs)==1 else int(input('选择设备索引: '))
         sn = devs[idx].id
@@ -641,6 +617,35 @@ class PCamMLSStream:
 # 主程序
 # =============================
 
+def _auto_center_from_valid(P_mach_flat: np.ndarray) -> Optional[np.ndarray]:
+    X,Y,Z = P_mach_flat[:,0], P_mach_flat[:,1], P_mach_flat[:,2]
+    valid = np.isfinite(X)&np.isfinite(Y)&np.isfinite(Z)
+    if CONFIG['require_positive_z']:
+        valid &= (Z>0)
+    if CONFIG['reject_zero_xyz']:
+        valid &= (np.abs(X)+np.abs(Y)+np.abs(Z) > 1e-6)
+    if not np.any(valid):
+        return None
+    med = np.median(np.stack([X[valid], Y[valid]], axis=1), axis=0)
+    return med
+
+
+def _auto_size_from_valid(P_mach_flat: np.ndarray, qlo=5.0, qhi=95.0) -> tuple[np.ndarray, float]:
+    X,Y,Z = P_mach_flat[:,0], P_mach_flat[:,1], P_mach_flat[:,2]
+    valid = np.isfinite(X)&np.isfinite(Y)&np.isfinite(Z)
+    if CONFIG['require_positive_z']: valid &= (Z>0)
+    if CONFIG['reject_zero_xyz']: valid &= (np.abs(X)+np.abs(Y)+np.abs(Z) > 1e-6)
+    if not np.any(valid):
+        return np.array(CONFIG['roi_center_xy'], float), CONFIG['roi_size_mm']
+    xs, ys = X[valid], Y[valid]
+    x0, x1 = np.percentile(xs, qlo), np.percentile(xs, qhi)
+    y0, y1 = np.percentile(ys, qlo), np.percentile(ys, qhi)
+    cx, cy = (x0+x1)/2, (y0+y1)/2
+    size = float(max(x1-x0, y1-y0)) * 1.1
+    size = np.clip(size, 20.0, 1200.0)
+    return np.array([cx, cy], float), size
+
+
 def main():
     # 外参
     T_path = input(f"外参路径（默认 {CONFIG['T_path']}）：").strip() or CONFIG['T_path']
@@ -663,10 +668,8 @@ def main():
     # 相机
     stream = PCamMLSStream(); stream.open()
 
-    # 控制器与统计
     ctrl = DeviationController()
     dev_hist = collections.deque(maxlen=7)
-
     out_dir = Path(CONFIG['out_dir']); ensure_dir(out_dir)
     frame_id = 0
 
@@ -676,23 +679,30 @@ def main():
             if P_cam is None: continue
             P_mach = transform_cam_to_machine(P_cam.reshape(-1,3).astype(np.float32), R, t)
 
-            # 首帧自动 ROI 中心
-            if frame_id == 0 and (roi_center==0).all():
-                med = np.nanmedian(P_mach, axis=0)
-                if np.isfinite(med[0]) and np.isfinite(med[1]):
-                    roi_center = med[:2]
+            # 首帧/按键自动居中
+            if frame_id == 0 and (roi_center == 0).all():
+                med = _auto_center_from_valid(P_mach)
+                if med is not None:
+                    roi_center = med
 
-            # 投影与掩码
-            height, mask, origin_xy = orthographic_project_top(
+            # 投影 & 掩码（返回 ROI 内有效点数量）
+            height, mask, origin_xy, n_roi_valid = orthographic_project_top(
                 P_mach, roi_center, roi_size, pix_mm,
                 z_select=CONFIG['z_select'], min_points_per_cell=CONFIG['min_points_per_cell']
             )
             mask = morph_cleanup(mask, CONFIG['morph_open'], CONFIG['morph_close'])
 
-            # 顶视图（用于作为中轴线模块的背景）
+            # 顶视图
             vis_top = render_topdown(height, mask, origin_xy, pix_mm, g_xy, np.empty((0,2)))
 
-            # 中轴线拟合（机床系）+ 调试可视化
+            # 如果 ROI 内 0 点，给出明显提示
+            if n_roi_valid == 0:
+                warn = np.full((40, vis_top.shape[1], 3), (30,30,30), np.uint8)
+                cv2.putText(warn, 'ROI 命中 0 個有效點：請調整 ROI (i/j/k/l,[,],c,a)', (10, 26),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
+                vis_top = np.vstack([warn, vis_top])
+
+            # 中轴线拟合
             centerline_xy, dbg_centerline, diag = fit_centerline(
                 mask, origin_xy, pix_mm, background=vis_top,
                 cfg=dict(resample_step_mm=CONFIG['resample_step_mm'])
@@ -705,21 +715,18 @@ def main():
                 dxdy, stats = ctrl.update(e_n, N_ref[np.clip(idx,0,len(N_ref)-1)])
                 dev_hist.append(stats['mean'])
 
-            # 可视化叠加
+            # 偏差叠加 + 调试图拼接
             vis_dev = draw_deviation_overlay(vis_top, g_xy, centerline_xy, idx, e_n, origin_xy, pix_mm, stride=10)
             dbg_scaled = cv2.resize(dbg_centerline, (vis_dev.shape[1], vis_dev.shape[0]), interpolation=cv2.INTER_AREA)
             vis = np.vstack([vis_dev, dbg_scaled])
 
-            # HUD
+            # HUD：增加有效点统计
             avg = np.mean(dev_hist) if len(dev_hist)>0 else 0.0
-            cv2.putText(vis, f'pixel={pix_mm:.2f}mm  roi={roi_size:.0f}mm  dev_avg={avg: .3f}mm', (10, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
-            cv2.putText(vis, f'pixel={pix_mm:.2f}mm  roi={roi_size:.0f}mm  dev_avg={avg: .3f}mm', (10, 24),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
-            cv2.putText(vis, f'dx={dxdy[0]: .3f} mm  dy={dxdy[1]: .3f} mm  n={stats.get("n",0)}', (10, 48),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
-            cv2.putText(vis, f'dx={dxdy[0]: .3f} mm  dy={dxdy[1]: .3f} mm  n={stats.get("n",0)}', (10, 48),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
+            text1 = f'pixel={pix_mm:.2f}mm  roi={roi_size:.0f}mm  dev_avg={avg: .3f}mm'
+            text2 = f'dx={dxdy[0]: .3f} mm  dy={dxdy[1]: .3f} mm  valid(ROI/ALL)={n_roi_valid}/'+str(P_mach.shape[0])
+            for (y,txt) in [(24,text1),(48,text2)]:
+                cv2.putText(vis, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2, cv2.LINE_AA)
+                cv2.putText(vis, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
 
             cv2.imshow('FSW All-in-One (Top-Down + Centerline + Deviations)', vis)
 
@@ -735,11 +742,32 @@ def main():
             elif key == ord('j'): roi_center[0] -= roi_size*0.1
             elif key == ord('l'): roi_center[0] += roi_size*0.1
             elif key == ord('['): roi_size = max(20.0, roi_size*0.8)
-            elif key == ord(']'): roi_size = min(1000.0, roi_size/0.8)
+            elif key == ord(']'): roi_size = min(1200.0, roi_size/0.8)
             elif key == ord('r'):
                 roi_center = np.array(CONFIG['roi_center_xy'], float)
                 pix_mm = CONFIG['pixel_size_mm']
                 roi_size = CONFIG['roi_size_mm']
+            elif key == ord('c'):
+                med = _auto_center_from_valid(P_mach)
+                if med is not None: roi_center = med
+            elif key == ord('C'):
+                # 仅基于当前 ROI 内点
+                half = roi_size*0.5
+                x0,x1 = roi_center[0]-half, roi_center[0]+half
+                y0,y1 = roi_center[1]-half, roi_center[1]+half
+                X,Y,Z = P_mach[:,0], P_mach[:,1], P_mach[:,2]
+                valid = np.isfinite(X)&np.isfinite(Y)&np.isfinite(Z)
+                if CONFIG['require_positive_z']: valid &= (Z>0)
+                if CONFIG['reject_zero_xyz']: valid &= (np.abs(X)+np.abs(Y)+np.abs(Z) > 1e-6)
+                inroi = (X>=x0)&(X<x1)&(Y>=y0)&(Y<y1)
+                sel = valid & inroi
+                if np.any(sel):
+                    roi_center = np.median(np.stack([X[sel],Y[sel]], axis=1), axis=0)
+            elif key == ord('a'):
+                roi_center, roi_size = _auto_size_from_valid(P_mach, 5, 95)
+            elif key == ord('A'):
+                roi_center, roi_size = _auto_size_from_valid(P_mach, 1, 99)
+
             frame_id += 1
     finally:
         try: stream.close()
