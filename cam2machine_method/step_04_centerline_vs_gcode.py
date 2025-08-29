@@ -1,22 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Step 04 — 最近表面 → 中轴线 → 与 G 代码对比（右手系 +X→右, +Y→上）
+Step 04+ — 最近表面 → 拓扑感知中轴线 → 与 G 代码对比 & 连续纠偏输出
 ----------------------------------------------------------------
-- 输入：在线相机点云 (H,W,3) -> 机床系网格 (H,W,3)
-- ROI：camera_rect / machine / none（ROI 仅做掩码，保持网格形状）
-- 顶视投影：右手系映射（Y 越大像素行号越小）
-- 最近表面：在 height(Hg,Wg) 上提取薄层掩码
-- 中轴线：通用等距骨架（保留你全部可视化窗口）
-- 对比：中轴线机床 XY vs G 代码路径，给出法向偏差箭头/统计
+- 改进点1：骨架若是闭环，按像素邻接“绕环追踪”得到闭合折线，更贴近骨架轮廓；
+          若非闭环，回退到最长路（并可 RDP 简化）。
+- 改进点2：在终端持续打印可用于 G 代码的纠偏数据（dx, dy），
+          带 EMA 平滑、死区、限幅与最大步长。
 """
 
 from pathlib import Path
-from typing import Union, Tuple, Optional
+from typing import Union, Tuple, Optional, List, Dict
 import numpy as np
 import cv2
 import math
 import collections
+import time
 
 # ================ 配置 ================
 CONFIG = dict(
@@ -32,24 +31,34 @@ CONFIG = dict(
 
     # ROI：'none' / 'camera_rect' / 'machine'
     roi_mode='camera_rect',
-    cam_roi_xywh=(714, 839, 228, 191),  # x,y,w,h in px
+    cam_roi_xywh=(682, 847, 228, 185),  # x,y,w,h in px
     roi_center_xy=(0.0, 0.0),           # mm
     roi_size_mm=150.0,                  # mm
 
     # 最近表面
-    z_select='max',            # 'max': Z越大越近；'min': Z越小越近
+    z_select='max',
     nearest_use_percentile=True,
     nearest_qlo=1.0,
     nearest_qhi=99.0,
-    depth_margin_mm=5.0,
+    depth_margin_mm=3.0,
     morph_open=3,
     morph_close=5,
     min_component_area_px=600,
 
-    # 中轴线显示/对比
-    arrow_stride=12,          # 偏差箭头抽样步长（沿中轴点序号）
-    rdp_epsilon_px=2.0,       # 中轴像素路径RDP简化（可选）
-    show_skeleton_dilate=True, # 仅用于观察的轻度膨胀
+    # 中轴线
+    rdp_epsilon_px=1.5,        # RDP 简化（仅用于非闭环）
+    show_skeleton_dilate=True, # 只为观察
+    resample_step_px=1.0,      # 闭环追踪后按像素步长重采样（保证均匀密度）
+
+    # 偏差箭头
+    arrow_stride=12,
+
+    # 纠偏输出（EMA）
+    ema_alpha=0.35,
+    deadband_mm=0.05,
+    clip_mm=2.0,
+    max_step_mm=0.15,          # 每帧最大输出步长
+    print_corr=True,
 
     # 可视化
     colormap=getattr(cv2, 'COLORMAP_TURBO', cv2.COLORMAP_JET),
@@ -64,7 +73,6 @@ except Exception:
 
 
 # ============== 基础 IO/几何 ==============
-
 def load_extrinsic(T_path: Union[str, Path]):
     data = np.load(str(T_path), allow_pickle=True).item()
     R = np.asarray(data['R'], dtype=float)
@@ -72,19 +80,16 @@ def load_extrinsic(T_path: Union[str, Path]):
     T = np.asarray(data['T'], dtype=float)
     return R, t, T
 
-
 def parse_gcode_xy(path: Union[str, Path]) -> np.ndarray:
     p = Path(path) if not isinstance(path, Path) else path
-    if (not path) or (not p.exists()):
-        return np.empty((0, 2), float)
+    if (not path) or (not p.exists()): return np.empty((0,2), float)
     pts = []
     with p.open('r', encoding='utf-8', errors='ignore') as f:
         x = None; y = None
         for raw in f:
             line = raw.strip()
-            if (not line) or line.startswith(';') or line.startswith('('):
-                continue
-            if ';' in line: line = line.split(';', 1)[0]
+            if (not line) or line.startswith(';') or line.startswith('('): continue
+            if ';' in line: line = line.split(';',1)[0]
             while '(' in line and ')' in line:
                 a = line.find('('); b = line.find(')')
                 if a < 0 or b < 0 or b <= a: break
@@ -93,18 +98,17 @@ def parse_gcode_xy(path: Union[str, Path]) -> np.ndarray:
             if not toks: continue
             cmd = toks[0].upper()
             if cmd in ('G0','G00','G1','G01'):
-                for tkn in toks[1:]:
-                    u = tkn.upper()
-                    if u.startswith('X'):
-                        try: x = float(u[1:])
+                for u in toks[1:]:
+                    U = u.upper()
+                    if U.startswith('X'):
+                        try: x = float(U[1:])
                         except: pass
-                    elif u.startswith('Y'):
-                        try: y = float(u[1:])
+                    elif U.startswith('Y'):
+                        try: y = float(U[1:])
                         except: pass
                 if x is not None and y is not None:
                     pts.append([x,y])
     return np.asarray(pts, float) if pts else np.empty((0,2), float)
-
 
 def resample_polyline(poly: np.ndarray, step: float) -> np.ndarray:
     if poly.shape[0] < 2: return poly.copy()
@@ -122,7 +126,6 @@ def resample_polyline(poly: np.ndarray, step: float) -> np.ndarray:
         out.append(poly[j]*(1-t) + poly[j+1]*t)
     return np.asarray(out, float)
 
-
 def tangent_normal(poly: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     if poly.shape[0] < 2:
         return np.array([[1.0, 0.0]]), np.array([[0.0, 1.0]])
@@ -130,7 +133,6 @@ def tangent_normal(poly: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     T = d / np.maximum(1e-9, np.linalg.norm(d, axis=1, keepdims=True))
     N = np.stack([-T[:,1], T[:,0]], axis=1)
     return T, N
-
 
 def build_kdtree(pts: np.ndarray):
     try:
@@ -147,16 +149,14 @@ def build_kdtree(pts: np.ndarray):
                 return np.sqrt(d2[np.arange(len(B)), idx]), idx
         return _Lin(pts)
 
-
 def transform_cam_to_machine_grid(P_cam_hw3: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
     H, W, _ = P_cam_hw3.shape
     P = P_cam_hw3.reshape(-1, 3).astype(np.float32)
-    Pm = (R @ P.T).T + t  # (N,3)
+    Pm = (R @ P.T).T + t
     return Pm.reshape(H, W, 3)
 
 
 # ============== 相机封装 ==============
-
 class PCamMLSStream:
     def __init__(self):
         if pcammls is None:
@@ -200,7 +200,7 @@ class PCamMLSStream:
         if depth_fr is None:
             return None, None
         self.cl.DeviceStreamMapDepthImageToPoint3D(depth_fr, self.depth_calib, self.scale_unit, self.pcl_buf)
-        P_cam = self.pcl_buf.as_nparray()  # (H,W,3) mm, camera frame
+        P_cam = self.pcl_buf.as_nparray()  # (H,W,3) in mm
         return P_cam, depth_fr
 
     def close(self):
@@ -213,13 +213,11 @@ class PCamMLSStream:
 
 
 # ============== 掩码/投影/可视化（右手系） ==============
-
 def valid_mask_hw(P_hw3: np.ndarray) -> np.ndarray:
     X = P_hw3[:, :, 0]; Y = P_hw3[:, :, 1]; Z = P_hw3[:, :, 2]
     m = np.isfinite(X) & np.isfinite(Y) & np.isfinite(Z)
     m &= (np.abs(X) + np.abs(Y) + np.abs(Z) > 1e-6)
     return m
-
 
 def camera_rect_mask(H: int, W: int, xywh: Tuple[int,int,int,int]) -> np.ndarray:
     x, y, w, h = xywh
@@ -229,7 +227,6 @@ def camera_rect_mask(H: int, W: int, xywh: Tuple[int,int,int,int]) -> np.ndarray
     m[y:y+h, x:x+w] = True
     return m
 
-
 def machine_rect_mask(P_mach_hw3: np.ndarray, center_xy: Tuple[float,float], size_mm: float) -> np.ndarray:
     cx, cy = float(center_xy[0]), float(center_xy[1])
     half = float(size_mm) * 0.5
@@ -238,12 +235,10 @@ def machine_rect_mask(P_mach_hw3: np.ndarray, center_xy: Tuple[float,float], siz
     X = P_mach_hw3[:, :, 0]; Y = P_mach_hw3[:, :, 1]
     return (X >= x0) & (X <= x1) & (Y >= y0) & (Y <= y1)
 
-
 def masked_Pmach_hw3(P_mach_hw3: np.ndarray, m_select: np.ndarray) -> np.ndarray:
     out = P_mach_hw3.copy().astype(np.float32)
     out[~m_select] = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
     return out
-
 
 def compute_bounds_xy_from_mask(P_mach_hw3: np.ndarray, mask_hw: np.ndarray,
                                 qlo: float, qhi: float, margin: float) -> Tuple[float,float,float,float]:
@@ -257,7 +252,6 @@ def compute_bounds_xy_from_mask(P_mach_hw3: np.ndarray, mask_hw: np.ndarray,
     y0, y1 = np.percentile(Y, qlo), np.percentile(Y, qhi)
     return float(x0 - margin), float(x1 + margin), float(y0 - margin), float(y1 + margin)
 
-
 def adjust_pixel_size(x0,x1,y0,y1,pix_mm,max_pixels) -> float:
     W = max(2, int(round((x1-x0)/max(1e-6,pix_mm))))
     H = max(2, int(round((y1-y0)/max(1e-6,pix_mm))))
@@ -266,7 +260,6 @@ def adjust_pixel_size(x0,x1,y0,y1,pix_mm,max_pixels) -> float:
         W = max(2, int(round((x1-x0)/pix_mm)))
         H = max(2, int(round((y1-y0)/pix_mm)))
     return pix_mm
-
 
 def project_topdown_from_grid(P_mach_hw3: np.ndarray, select_mask_hw: np.ndarray,
                               pix_mm: float,
@@ -294,12 +287,9 @@ def project_topdown_from_grid(P_mach_hw3: np.ndarray, select_mask_hw: np.ndarray
     mask = (count > 0).astype(np.uint8) * 255
     return height, mask, (x0, y0)
 
-
 def render_topdown(height: np.ndarray, mask: np.ndarray,
                    origin_xy: Tuple[float,float], pix_mm: float,
-                   gcode_xy: Optional[np.ndarray]=None,
-                   machine_roi_rect_px: Optional[Tuple[int,int,int,int]]=None,
-                   roi_mode_text: str='') -> np.ndarray:
+                   gcode_xy: Optional[np.ndarray]=None) -> np.ndarray:
     H,W = height.shape
     if np.isfinite(height).any():
         vmin = float(np.nanpercentile(height, 5)); vmax = float(np.nanpercentile(height, 95))
@@ -321,15 +311,7 @@ def render_topdown(height: np.ndarray, mask: np.ndarray,
         pts = xy_to_px(gcode_xy)
         for i in range(len(pts)-1):
             cv2.line(vis, tuple(pts[i]), tuple(pts[i+1]), (255,255,255), 1, cv2.LINE_AA)
-
-    if machine_roi_rect_px is not None:
-        x,y,w,h = machine_roi_rect_px
-        cv2.rectangle(vis, (x,y), (x+w,y+h), (0,0,255), 2, cv2.LINE_AA)
-        if roi_mode_text:
-            cv2.putText(vis, roi_mode_text, (x+6, y+22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2, cv2.LINE_AA)
-
     return vis
-
 
 def draw_machine_axes_overlay(img: np.ndarray,
                               origin_xy: Tuple[float,float],
@@ -345,8 +327,7 @@ def draw_machine_axes_overlay(img: np.ndarray,
     return vis
 
 
-# ============== 最近表面（与 Step03 相同） ==============
-
+# ============== 最近表面 ==============
 def morph_cleanup(mask_u8: np.ndarray, open_k: int, close_k: int) -> np.ndarray:
     m = (mask_u8 > 0).astype(np.uint8) * 255
     if close_k and close_k > 1:
@@ -356,7 +337,6 @@ def morph_cleanup(mask_u8: np.ndarray, open_k: int, close_k: int) -> np.ndarray:
         k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(open_k), int(open_k)))
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
     return m
-
 
 def extract_nearest_surface_mask_from_height(
     height: np.ndarray,
@@ -409,9 +389,7 @@ def extract_nearest_surface_mask_from_height(
     return keep, z_ref, (low, high)
 
 
-# ============== 骨架（你提供的方法 + 回退） ==============
-
-# 回退 skeletonize
+# ============== 你的骨架提取（保留） ==============
 try:
     from skimage.morphology import skeletonize as _sk_skeletonize
 except Exception:
@@ -468,7 +446,6 @@ def _get_outer_inner_contours(ring_mask):
 
 def _prune_skeleton_spurs(skel_u8, min_branch_len=12, max_pass=6):
     skel = (skel_u8 > 0).astype(np.uint8)
-
     def neighbors(y, x):
         ys = [y-1, y-1, y-1, y,   y,   y+1, y+1, y+1]
         xs = [x-1, x,   x+1, x-1, x+1, x-1, x,   x+1]
@@ -478,7 +455,6 @@ def _prune_skeleton_spurs(skel_u8, min_branch_len=12, max_pass=6):
             if 0 <= yy < H and 0 <= xx < W and skel[yy, xx]:
                 out.append((yy, xx))
         return out
-
     k = np.array([[1,1,1],[1,10,1],[1,1,1]], np.uint8)
     for _ in range(max_pass):
         nbr_cnt = cv2.filter2D(skel, -1, k, borderType=cv2.BORDER_CONSTANT)
@@ -487,36 +463,25 @@ def _prune_skeleton_spurs(skel_u8, min_branch_len=12, max_pass=6):
             break
         removed_any = False
         for y, x in endpoints:
-            if skel[y, x] == 0:
-                continue
+            if skel[y, x] == 0: continue
             path = [(y, x)]
-            prev = None
-            cur = (y, x)
+            prev = None; cur = (y, x)
             while True:
                 nbrs = neighbors(*cur)
-                if prev is not None and prev in nbrs:
-                    nbrs.remove(prev)
-                if len(nbrs) == 0 or len(nbrs) > 1:
-                    break
-                nxt = nbrs[0]
-                path.append(nxt)
-                prev, cur = cur, nxt
+                if prev is not None and prev in nbrs: nbrs.remove(prev)
+                if len(nbrs) == 0 or len(nbrs) > 1: break
+                nxt = nbrs[0]; path.append(nxt); prev, cur = cur, nxt
                 y2, x2 = cur
                 if cv2.filter2D(skel, -1, k, borderType=cv2.BORDER_CONSTANT)[y2, x2] == 11 and len(path) > 1:
                     break
             if len(path) < min_branch_len:
-                for yy, xx in path:
-                    skel[yy, xx] = 0
-                removed_any = True
-        if not removed_any:
-            break
+                for yy, xx in path: skel[yy, xx] = 0; removed_any = True
+        if not removed_any: break
     return (skel * 255).astype(np.uint8)
 
 def _skeletonize_bool(bw_bool: np.ndarray) -> np.ndarray:
-    """返回 uint8 0/255 骨架，尽量使用 skimage；失败则 ximgproc；再失败距离场回退。"""
     if _sk_skeletonize is not None:
-        sk = _sk_skeletonize(bw_bool)
-        return (sk.astype(np.uint8) * 255)
+        sk = _sk_skeletonize(bw_bool); return (sk.astype(np.uint8) * 255)
     if xip is not None:
         try:
             u8 = (bw_bool.astype(np.uint8) * 255)
@@ -524,7 +489,6 @@ def _skeletonize_bool(bw_bool: np.ndarray) -> np.ndarray:
             return (sk > 0).astype(np.uint8) * 255
         except Exception:
             pass
-    # 距离场回退
     u8 = (bw_bool.astype(np.uint8) * 255)
     dist = cv2.distanceTransform(u8, cv2.DIST_L2, 3)
     sk = np.zeros_like(u8)
@@ -536,23 +500,14 @@ def _skeletonize_bool(bw_bool: np.ndarray) -> np.ndarray:
     return ridge.astype(np.uint8) * 255
 
 def extract_skeleton_universal(surface_mask: np.ndarray, visualize: bool = True):
-    """
-    你的通用等距中轴线算法（保持接口与可视化）。
-    返回：BGR 图像（蓝色像素为 1px 骨架，若 visualize=True 会弹出可视化窗口）
-    """
     if surface_mask is None or np.count_nonzero(surface_mask) == 0:
-        print("输入的 surface_mask 为空或不包含有效区域。")
-        return None
-
+        print("输入的 surface_mask 为空或不包含有效区域。"); return None
     ring_mask = _clean_mask_for_skeleton(surface_mask)
     if np.count_nonzero(ring_mask) == 0:
-        print("净化后掩码为空。")
-        return None
-
+        print("净化后掩码为空。"); return None
     outer_cnt, inner_cnt = _get_outer_inner_contours(ring_mask)
     if outer_cnt is None:
-        print("未找到外轮廓。")
-        return None
+        print("未找到外轮廓。"); return None
 
     if inner_cnt is None:
         skel_u8 = _skeletonize_bool(ring_mask > 0)
@@ -599,14 +554,12 @@ def extract_skeleton_universal(surface_mask: np.ndarray, visualize: bool = True)
         vis[skel_show > 0] = (255, 0, 0)
         cv2.imshow("Target Mask for Skeletonization", ring_mask)
         cv2.imshow("Universal Skeleton Extraction", vis)
-        # 如需观察等距带：
         cv2.imshow("Equidistance Band", equi_band)
 
     return cv2.cvtColor(skel_u8, cv2.COLOR_GRAY2BGR)
 
 
-# ============== 骨架像素路径 → 有序折线（最长路） ==============
-
+# ============== 骨架 → 拓扑感知折线 ==============
 def _skeleton_graph(skel_u8: np.ndarray):
     m = (skel_u8 > 0).astype(np.uint8)
     ys, xs = np.where(m > 0)
@@ -623,10 +576,9 @@ def _skeleton_graph(skel_u8: np.ndarray):
                     adj[(y,x)].add((yy,xx))
     deg = {n: len(adj[n]) for n in nodes}
     endpoints = [n for n,d in deg.items() if d == 1]
-    return adj, endpoints
+    return adj, endpoints, deg
 
 def _longest_path_from_graph(adj, endpoints):
-    import collections
     def bfs(start):
         vis = {start: None}
         q = collections.deque([start])
@@ -644,46 +596,144 @@ def _longest_path_from_graph(adj, endpoints):
     while p is not None: path.append(p); p = pre2[p]
     return path[::-1]  # [(y,x), ...]
 
-def skeleton_to_ordered_polyline_px(skel_gray_u8: np.ndarray) -> np.ndarray:
-    """输入灰度骨架(0/255) → 返回 Nx2 像素坐标序列 [x,y]（最长路径）"""
+def _trace_closed_loop(adj, deg) -> List[Tuple[int,int]]:
+    """闭环追踪：任选起点，按“上一次方向优先”走完一圈。"""
+    # 找一个度数==2的起点
+    start = None
+    for n, d in deg.items():
+        if d == 2: start = n; break
+    if start is None:
+        start = next(iter(adj.keys()))
+    path = [start]
+    prev = None
+    cur = start
+    visited = set([start])
+    for _ in range(200000):  # 防守性上限
+        nbrs = list(adj[cur])
+        # 选 != prev 的邻居；若两边都可，简单用几何“延续方向”原则
+        if prev is not None and len(nbrs) > 1:
+            if prev in nbrs: nbrs.remove(prev)
+        nxt = None
+        if len(nbrs) == 1:
+            nxt = nbrs[0]
+        else:
+            # 方向延续：选与 (cur - prev) 方向最接近的
+            if prev is None:
+                nxt = nbrs[0]
+            else:
+                v = np.array([cur[1]-prev[1], cur[0]-prev[0]], float) # [dx,dy]
+                best = -1e9
+                for cnd in nbrs:
+                    w = np.array([cnd[1]-cur[1], cnd[0]-cur[0]], float)
+                    score = float(np.dot(v, w) / (np.linalg.norm(v)*np.linalg.norm(w) + 1e-9))
+                    if score > best:
+                        best = score; nxt = cnd
+        if nxt is None: break
+        if nxt == start:  # 合上环
+            path.append(nxt)
+            break
+        path.append(nxt)
+        visited.add(nxt)
+        prev, cur = cur, nxt
+        # 终止条件：大部分闭环像素都会访问到；若出现分叉或异常跳出
+        if len(path) > 1 and deg.get(cur, 0) != 2:
+            break
+    # 去掉末尾重复起点
+    if len(path) >= 2 and path[-1] == path[0]:
+        path = path[:-1]
+    return path
+
+def _resample_px_chain(path_px: np.ndarray, step_px: float) -> np.ndarray:
+    if len(path_px) < 2: return path_px
+    seg = np.linalg.norm(np.diff(path_px, axis=0), axis=1)
+    L = float(seg.sum())
+    if L < 1e-6: return path_px[[0]].copy()
+    n = max(2, int(np.ceil(L / max(1e-6, step_px))))
+    s = np.linspace(0.0, L, n)
+    cs = np.concatenate([[0.0], np.cumsum(seg)])
+    out = []; j=0
+    for si in s:
+        while j < len(seg) and si > cs[j+1]: j += 1
+        if j >= len(seg): out.append(path_px[-1]); continue
+        t = (si - cs[j]) / max(seg[j], 1e-9)
+        out.append(path_px[j]*(1-t) + path_px[j+1]*t)
+    return np.asarray(out, float)
+
+def skeleton_to_path_px_topo(skel_gray_u8: np.ndarray) -> np.ndarray:
+    """拓扑感知骨架折线：
+       - 若为闭环（无端点，且所有结点度≈2），则绕环追踪，返回“整圈”折线；
+       - 否则回退到最长路；可选 RDP 简化。
+    """
     if skel_gray_u8.ndim == 3:
         skel_gray_u8 = cv2.cvtColor(skel_gray_u8, cv2.COLOR_BGR2GRAY)
     if np.count_nonzero(skel_gray_u8) < 2:
         return np.empty((0,2), float)
-    adj, endpoints = _skeleton_graph(skel_gray_u8)
-    path_nodes = _longest_path_from_graph(adj, endpoints)
-    path_px = np.array([[x, y] for (y, x) in path_nodes], dtype=np.float32)
-    # 可选：RDP 简化
-    eps = float(CONFIG.get('rdp_epsilon_px', 0.0))
-    if eps > 1e-6 and len(path_px) >= 3:
-        path_px = _rdp(path_px, eps)
-    return path_px
 
-def _rdp(points: np.ndarray, eps: float) -> np.ndarray:
-    if len(points) < 3: return points
-    a, b = points[0], points[-1]
-    ab = b - a; lab2 = (ab*ab).sum() + 1e-12
-    dmax = -1; idx = -1
-    for i in range(1, len(points)-1):
-        ap = points[i] - a
-        t = np.clip(np.dot(ap, ab)/lab2, 0, 1)
-        proj = a + t*ab
-        d = np.linalg.norm(points[i] - proj)
-        if d > dmax: dmax = d; idx = i
-    if dmax > eps:
-        left = _rdp(points[:idx+1], eps)
-        right = _rdp(points[idx:], eps)
-        return np.vstack([left[:-1], right])
+    adj, endpoints, deg = _skeleton_graph(skel_gray_u8)
+    is_closed = (len(endpoints) == 0) and all((d == 2) for d in deg.values())
+    if is_closed:
+        cyc_nodes = _trace_closed_loop(adj, deg)
+        path_px = np.array([[x, y] for (y, x) in cyc_nodes], dtype=np.float32)
+        # 均匀化采样：保证后续法向/配准稳定
+        step_px = float(CONFIG.get('resample_step_px', 1.0))
+        path_px = _resample_px_chain(path_px, max(0.5, step_px))
     else:
-        return np.vstack([a, b])
+        # 非闭环：仍取最长路，适度简化
+        nodes = _longest_path_from_graph(adj, endpoints)
+        path_px = np.array([[x, y] for (y, x) in nodes], dtype=np.float32)
+        eps = float(CONFIG.get('rdp_epsilon_px', 0.0))
+        if eps > 1e-6 and len(path_px) >= 3:
+            path_px = _rdp(path_px, eps)
+    return path_px
+def _rdp(points: np.ndarray, eps: float) -> np.ndarray:
+    """
+    Ramer–Douglas–Peucker 折线简化（2D）。
+    参数
+      points : (N,2) 折线顶点（float）
+      eps    : 允许的最大偏差（像素）
+    返回
+      (M,2) 简化后的折线（包含原始首尾点）
+    """
+    P = np.asarray(points, dtype=float)
+    n = P.shape[0]
+    if n < 3:
+        return P.copy()
 
+    a = P[0]
+    b = P[-1]
+    ab = b - a
+    lab2 = float(np.dot(ab, ab))
+
+    # 如果首尾非常接近，退化为以“最远点”为分割
+    if lab2 < 1e-12:
+        d2 = np.sum((P - a) ** 2, axis=1)
+        idx = int(np.argmax(d2))
+        if idx == 0 or idx == n - 1:
+            return np.vstack([a, b]).astype(P.dtype)
+        left = _rdp(P[:idx + 1], eps)
+        right = _rdp(P[idx:], eps)
+        return np.vstack([left[:-1], right]).astype(P.dtype)
+
+    # 到线段 ab 的垂直距离（2D：用标量叉积）
+    ap = P[1:-1] - a
+    cross = np.abs(ab[0] * ap[:, 1] - ab[1] * ap[:, 0])
+    dist = cross / (np.sqrt(lab2) + 1e-12)
+
+    i_rel = int(np.argmax(dist))
+    dmax = float(dist[i_rel])
+    i = 1 + i_rel  # 映射回原始索引
+
+    if dmax > eps:
+        left = _rdp(P[:i + 1], eps)
+        right = _rdp(P[i:], eps)
+        return np.vstack([left[:-1], right]).astype(P.dtype)
+    else:
+        # 所有点都在容差内：用首尾点代表
+        return np.vstack([a, b]).astype(P.dtype)
 
 # ============== 像素/机床坐标互换（右手系） ==============
-
 def px_to_mach_xy(path_px: np.ndarray, origin_xy: Tuple[float,float], pix_mm: float, Himg: int) -> np.ndarray:
-    """像素路径 → 机床系 XY；注意右手系 y 反向：Y = y1 - (py+0.5)*pix"""
-    if path_px.size == 0:
-        return np.empty((0,2), float)
+    if path_px.size == 0: return np.empty((0,2), float)
     x0, y0 = origin_xy
     y1 = y0 + Himg * pix_mm
     X = x0 + (path_px[:,0] + 0.5) * pix_mm
@@ -698,8 +748,7 @@ def mach_xy_to_px(xy: np.ndarray, origin_xy: Tuple[float,float], pix_mm: float, 
     return np.stack([xs,ys], axis=1)
 
 
-# ============== 偏差计算与可视化 ==============
-
+# ============== 偏差计算与纠偏输出 ==============
 def project_points_to_path(points_xy: np.ndarray, ref_xy: np.ndarray, ref_tree, ref_normals: np.ndarray):
     if points_xy.size == 0 or ref_xy.size == 0:
         return np.empty((0,), int), np.empty((0, 2)), np.empty((0,))
@@ -710,6 +759,41 @@ def project_points_to_path(points_xy: np.ndarray, ref_xy: np.ndarray, ref_tree, 
     e_n = ((points_xy - nearest) * N).sum(axis=1)
     return idx, nearest, e_n
 
+class EmaCorrector:
+    def __init__(self, alpha=0.35, deadband=0.05, clip_mm=2.0, max_step_mm=0.15):
+        self.a = float(alpha)
+        self.dead = float(deadband)
+        self.clip = float(clip_mm)
+        self.step = float(max_step_mm)
+        self._ema = 0.0
+        self._out_prev = np.zeros(2, float)
+
+    def update(self, e_idx: np.ndarray, e_n: np.ndarray, N_ref: np.ndarray):
+        if e_n.size == 0 or N_ref.size == 0:
+            return np.zeros(2, float), dict(mean=0.0, median=0.0, p95=0.0, n=0)
+        stats = dict(mean=float(np.mean(e_n)), median=float(np.median(e_n)),
+                     p95=float(np.percentile(np.abs(e_n), 95)), n=int(len(e_n)))
+
+        # 用中位数决定幅度，用对应法向决定方向
+        k = int(np.argsort(e_n)[len(e_n)//2])
+        i = int(np.clip(e_idx[k], 0, len(N_ref)-1))
+        nvec = N_ref[i]
+        med = stats['median']
+        if abs(med) < self.dead: med = 0.0
+        med = float(np.clip(med, -self.clip, self.clip))
+
+        self._ema = self.a * med + (1.0 - self.a) * self._ema
+        target = nvec * self._ema
+        # 限制每帧步长
+        delta = target - self._out_prev
+        mag = float(np.linalg.norm(delta))
+        if mag > self.step:
+            delta *= (self.step / (mag + 1e-9))
+        out = self._out_prev + delta
+        self._out_prev = out
+        return out, stats
+
+
 def draw_deviation_overlay(vis_top: np.ndarray,
                            origin_xy: Tuple[float,float], pix_mm: float,
                            gcode_xy: Optional[np.ndarray],
@@ -718,23 +802,18 @@ def draw_deviation_overlay(vis_top: np.ndarray,
                            arrow_stride: int = 10) -> np.ndarray:
     H, W = vis_top.shape[:2]
     out = vis_top.copy()
+    def xy_to_px(xy): return mach_xy_to_px(xy, origin_xy, pix_mm, H, W)
 
-    def xy_to_px(xy):
-        return mach_xy_to_px(xy, origin_xy, pix_mm, H, W)
-
-    # G代码（白）
     if gcode_xy is not None and gcode_xy.size > 0:
         p = xy_to_px(gcode_xy)
         for i in range(len(p)-1):
             cv2.line(out, tuple(p[i]), tuple(p[i+1]), (240,240,240), 1, cv2.LINE_AA)
 
-    # 中轴（青色）
     if centerline_xy is not None and centerline_xy.size > 0:
         q = xy_to_px(centerline_xy)
         for i in range(len(q)-1):
             cv2.line(out, tuple(q[i]), tuple(q[i+1]), (200,255,255), 2, cv2.LINE_AA)
 
-    # 偏差箭头（绿/橙）
     if e_n.size > 0 and gcode_xy is not None and gcode_xy.shape[0] > 1:
         seg = np.diff(gcode_xy, axis=0)
         T = seg / (np.linalg.norm(seg, axis=1, keepdims=True) + 1e-9)
@@ -752,32 +831,33 @@ def draw_deviation_overlay(vis_top: np.ndarray,
 
 
 # ============== 主流程 ==============
-
 def main():
-    # 读取外参与 G 代码
+    # 外参与 G 代码
     T_path = input('外参路径 (默认 {}): '.format(CONFIG['T_path'])).strip() or CONFIG['T_path']
     G_path = input('G代码路径 (默认 {}): '.format(CONFIG['gcode_path'])).strip() or CONFIG['gcode_path']
     if not Path(T_path).exists():
         raise SystemExit('外参文件不存在: {}'.format(T_path))
     R, t, _ = load_extrinsic(T_path)
     g_raw = parse_gcode_xy(G_path)
-    g_xy = resample_polyline(g_raw, 1.0) if g_raw.size > 0 else g_raw
+    g_xy  = resample_polyline(g_raw, 1.0) if g_raw.size > 0 else g_raw
     ref_tree = build_kdtree(g_xy) if g_xy.size > 0 else None
     _, N_ref = tangent_normal(g_xy) if g_xy.size > 0 else (np.zeros((0,2)), np.zeros((0,2)))
 
     # 相机
     stream = PCamMLSStream(); stream.open()
     out_dir = Path(CONFIG['out_dir']); out_dir.mkdir(parents=True, exist_ok=True)
-    frame_id = 0
 
     roi_mode = str(CONFIG.get('roi_mode', 'none')).lower()
+    corr = EmaCorrector(CONFIG['ema_alpha'], CONFIG['deadband_mm'],
+                        CONFIG['clip_mm'], CONFIG['max_step_mm'])
+
     print('[INFO] 拉流中… (q 退出, s 保存, -/= 像素尺寸)  mode={}'.format(roi_mode))
+    frame_id = 0
     try:
         while True:
             P_cam, _ = stream.read_pointcloud(2000)
             if P_cam is None:
                 print('[WARN] 无深度帧'); continue
-
             H, W, _ = P_cam.shape
             P_mach = transform_cam_to_machine_grid(P_cam, R, t)
 
@@ -786,16 +866,11 @@ def main():
             if roi_mode == 'camera_rect':
                 m_roi = camera_rect_mask(H, W, CONFIG['cam_roi_xywh'])
                 m_select = m_valid & m_roi
-                roi_text = 'ROI(camera_rect)'
             elif roi_mode == 'machine':
                 m_roi = machine_rect_mask(P_mach, CONFIG['roi_center_xy'], CONFIG['roi_size_mm'])
                 m_select = m_valid & m_roi
-                roi_text = 'ROI(machine)'
             else:
                 m_select = m_valid
-                roi_text = ''
-
-            P_mach_roi = masked_Pmach_hw3(P_mach, m_select)
 
             # 顶视边界/分辨率
             x0,x1,y0,y1 = compute_bounds_xy_from_mask(P_mach, m_select,
@@ -819,35 +894,37 @@ def main():
                 min_component_area_px=CONFIG['min_component_area_px']
             )
 
-            # === 骨架提取（保留你的可视化窗口） ===
+            # 骨架提取（含可视化窗口）
             skel_bgr = extract_skeleton_universal(nearest_mask, visualize=True)
             if skel_bgr is None:
-                # 正常会在函数里有提示并显示清理后的目标；这里继续下一帧
                 cv2.imshow('Centerline vs G-code (RHR)', np.zeros((480, 640, 3), np.uint8))
                 if cv2.waitKey(1) & 0xFF == ord('q'): break
                 continue
             skel_gray = cv2.cvtColor(skel_bgr, cv2.COLOR_BGR2GRAY)
 
-            # 像素骨架 → 有序像素路径
-            path_px = skeleton_to_ordered_polyline_px(skel_gray)
+            # —— 改进：拓扑感知骨架折线 ——
+            path_px = skeleton_to_path_px_topo(skel_gray)
             if path_px.size == 0:
                 cv2.imshow('Centerline vs G-code (RHR)', np.zeros((480, 640, 3), np.uint8))
                 if cv2.waitKey(1) & 0xFF == ord('q'): break
                 continue
 
-            # 像素路径 → 机床 XY（右手系）
+            # 像素路径 → 机床 XY
             Ht, Wt = height.shape
             centerline_xy = px_to_mach_xy(path_px, origin_xy, pix_mm, Ht)
 
-            # 顶视渲染 + 最近表面叠加
-            vis_top = render_topdown(height, mask_top, origin_xy, pix_mm,
-                                     gcode_xy=g_xy, machine_roi_rect_px=None, roi_mode_text=roi_text)
+            # 顶视渲染 + 最近表面 + 骨架叠加（便于核对）
+            vis_top = render_topdown(height, mask_top, origin_xy, pix_mm, gcode_xy=g_xy)
             overlay = vis_top.copy()
-            # recent surface（绿）
+            # 最近表面（绿）
             gmask = cv2.cvtColor(nearest_mask, cv2.COLOR_GRAY2BGR); gmask[:,:,1] = np.maximum(gmask[:,:,1], gmask[:,:,0])
             overlay = cv2.addWeighted(overlay, 1.0, gmask, 0.25, 0)
+            # 1px 骨架（蓝）
+            sk_show = cv2.cvtColor((skel_gray>0).astype(np.uint8)*255, cv2.COLOR_GRAY2BGR)
+            sk_show[:,:,0] = 255; sk_show[:,:,1:] = 0
+            overlay = cv2.addWeighted(overlay, 1.0, sk_show, 0.35, 0)
 
-            # 偏差计算
+            # 偏差
             e_idx = np.array([], int); e_n = np.array([])
             if g_xy.size > 1 and centerline_xy.size > 0 and ref_tree is not None and N_ref.size > 0:
                 e_idx, nearest_on_ref, e_n = project_points_to_path(centerline_xy, g_xy, ref_tree, N_ref)
@@ -857,32 +934,39 @@ def main():
                                              arrow_stride=int(CONFIG['arrow_stride']))
             vis_cmp = draw_machine_axes_overlay(vis_cmp, origin_xy, pix_mm)
 
+            # 纠偏输出（终端）
+            dxdy = np.zeros(2, float)
+            if CONFIG.get('print_corr', True) and e_n.size > 0 and N_ref.size > 0:
+                dxdy, stats = corr.update(e_idx, e_n, N_ref)
+                print("CORR frame={:06d}  mean={:+.3f}  med={:+.3f}  p95={:.3f}  ->  dx={:+.3f}  dy={:+.3f}  [mm]"
+                      .format(frame_id, stats['mean'], stats['median'], stats['p95'], dxdy[0], dxdy[1]))
+
             # HUD
             dev_mean = float(np.mean(e_n)) if e_n.size > 0 else 0.0
             dev_med  = float(np.median(e_n)) if e_n.size > 0 else 0.0
             dev_p95  = float(np.percentile(np.abs(e_n), 95)) if e_n.size > 0 else 0.0
-            txt = 'z_ref={:.2f}  band=[{:.2f},{:.2f}]mm  pix={:.2f}mm  grid={}x{}  dev(mean/med/p95)={:.3f}/{:.3f}/{:.3f} mm'.format(
-                z_ref, z_low, z_high, pix_mm, Wt, Ht, dev_mean, dev_med, dev_p95
+            txt = 'z_ref={:.2f}  band=[{:.2f},{:.2f}]mm  pix={:.2f}mm  grid={}x{}  dev(mean/med/p95)={:.3f}/{:.3f}/{:.3f}  corr=({:+.3f},{:+.3f})'.format(
+                z_ref, z_low, z_high, pix_mm, Wt, Ht, dev_mean, dev_med, dev_p95, dxdy[0], dxdy[1]
             )
-            cv2.putText(vis_cmp, txt, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,0,0), 2, cv2.LINE_AA)
-            cv2.putText(vis_cmp, txt, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255,255,255), 1, cv2.LINE_AA)
+            cv2.putText(vis_cmp, txt, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0,0,0), 2, cv2.LINE_AA)
+            cv2.putText(vis_cmp, txt, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255,255,255), 1, cv2.LINE_AA)
 
             # 展示
-            cv2.imshow('Top-Down + Nearest Surface', overlay)
+            cv2.imshow('Top-Down + Nearest Surface + Skeleton', overlay)
             cv2.imshow('NearestSurfaceMask', nearest_mask)
             cv2.imshow('Centerline vs G-code (RHR)', vis_cmp)
 
             # 交互
             k = cv2.waitKey(1) & 0xFF
-            if k == ord('q'):
-                break
+            if k == ord('q'): break
             elif k == ord('s'):
                 outp = out_dir / f'centerline_cmp_{frame_id:06d}.png'
-                cv2.imwrite(str(outp), vis_cmp); print('[SAVE]', outp); frame_id += 1
+                cv2.imwrite(str(outp), vis_cmp); print('[SAVE]', outp)
             elif k in (ord('='), ord('+')):
                 CONFIG['pixel_size_mm'] = max(0.1, float(CONFIG['pixel_size_mm'])*0.8)
             elif k == ord('-'):
                 CONFIG['pixel_size_mm'] = min(5.0, float(CONFIG['pixel_size_mm'])/0.8)
+            frame_id += 1
 
     finally:
         try: stream.close()
