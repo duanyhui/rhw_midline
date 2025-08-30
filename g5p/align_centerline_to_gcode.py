@@ -32,11 +32,11 @@ PARAMS = dict(
     max_grid_pixels=1_200_000,               # 顶视网格最大像素数
 
     # ROI 选择：'none' / 'camera_rect' / 'machine'
-    roi_mode='camera_rect',
+    roi_mode='machine',
     cam_roi_xywh=(682, 847, 228, 185),       # 相机像素系矩形 ROI (x,y,w,h)
     # cam_roi_xywh=(574, 612, 291, 209),
-    roi_center_xy=(0.0, 0.0),                # 机床坐标系下 ROI 中心 (mm)
-    roi_size_mm=150.0,                       # ROI 边长 (mm)
+    roi_center_xy=(50.0,50.0),                # 机床坐标系下 ROI 中心 (mm)
+    roi_size_mm=250.0,                       # ROI 边长 (mm)
 
     # 最近表面提取
     z_select='max',                          # 'max' 最高层，'min' 最低层
@@ -47,17 +47,17 @@ PARAMS = dict(
     min_component_area_px=600,
 
     # 骨架/折线
-    rdp_epsilon_px=1.5,
+    rdp_epsilon_px=3,  # 增大到 3.0-5.0，容差越大点越少
     show_skeleton_dilate=True,
     resample_step_px=1.0,
 
     # G 代码引导中轴线（核心）
     guide_enable=True,
-    guide_step_mm=1.0,                       # 将 G 代码重采样为该步长
+    guide_step_mm=2.0,                       # 将 G 代码重采样为该步长
     guide_halfwidth_mm=6.0,                  # 法向扫描半宽
     guide_use_dt=True,                       # True: 距离变换峰值；False: 边界中点
     guide_min_on_count=3,
-    guide_smooth_win=7,                      # 滑动平均窗口（奇数）
+    guide_smooth_win=7,                      # 滑动平均窗口（奇数） - 越大越平滑
     guide_max_offset_mm=8.0,                 # 对 guided 中轴线的最大偏移限幅
     guide_min_valid_ratio=0.35,
     guide_fallback_to_skeleton=True,
@@ -972,6 +972,133 @@ def write_linear_gcode(xy: np.ndarray, out_path: Union[str, Path], feed: Optiona
                 f.write(f'G1 X{x:.4f} Y{y:.4f}\n')
     print('[SAVE]', out_path)
 
+# === 1) 计算外/内轮廓距离场（基于你等距带代码） ===
+def _outer_inner_distance_fields(nearest_mask_u8: np.ndarray):
+    ring_mask = _clean_mask_for_skeleton(nearest_mask_u8)
+    if np.count_nonzero(ring_mask) == 0:
+        return None, None, None
+    contours, hierarchy = cv2.findContours(ring_mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_NONE)
+    if not contours or hierarchy is None: return None, None, None
+    hierarchy = hierarchy[0]
+    outer_idx, outer_area = -1, -1
+    for i, h in enumerate(hierarchy):
+        if h[3] == -1:
+            a = cv2.contourArea(contours[i])
+            if a > outer_area:
+                outer_area = a; outer_idx = i
+    if outer_idx < 0: return None, None, None
+    child = hierarchy[outer_idx][2]
+    inner_idx, inner_area = -1, -1
+    while child != -1:
+        a = cv2.contourArea(contours[child])
+        if a > inner_area:
+            inner_area = a; inner_idx = child
+        child = hierarchy[child][0]
+    if inner_idx < 0:
+        # 非环形结构：无法做等距，交由单边DT备用
+        return ring_mask, None, None
+
+    H, W = ring_mask.shape
+    outer_line = np.full((H, W), 255, np.uint8)
+    inner_line = np.full((H, W), 255, np.uint8)
+    cv2.drawContours(outer_line, [contours[outer_idx]], -1, 0, 1)
+    cv2.drawContours(inner_line,  [contours[inner_idx]], -1, 0, 1)
+
+    d_out = cv2.distanceTransform(outer_line, cv2.DIST_L2, 5).astype(np.float32)
+    d_in  = cv2.distanceTransform(inner_line,  cv2.DIST_L2, 5).astype(np.float32)
+    return ring_mask, d_out, d_in
+
+# === 2) 沿 G 代码法向，求“等距零点”的法向位移 δ(s)，并仅对 δ 平滑 ===
+def gcode_guided_centerline_v2(
+    nearest_mask: np.ndarray,
+    origin_xy: Tuple[float,float],
+    pix_mm: float,
+    gcode_xy: np.ndarray,
+    gcode_normals: np.ndarray,
+    *,
+    halfwidth_mm: float = None,
+    smooth_win: int = None,
+    max_abs_mm: float = None
+):
+    H, W = nearest_mask.shape[:2]
+    halfw_mm = float(halfwidth_mm if halfwidth_mm is not None else PARAMS['guide_halfwidth_mm'])
+    halfw_px = max(1.0, halfw_mm / max(1e-9, pix_mm))
+    win = int(smooth_win if smooth_win is not None else PARAMS['guide_smooth_win'])
+    max_abs = float(max_abs_mm if max_abs_mm is not None else PARAMS['guide_max_offset_mm'])
+
+    ring_mask, d_out, d_in = _outer_inner_distance_fields(nearest_mask)
+
+    use_equidist = (d_out is not None) and (d_in is not None)
+    if not use_equidist:
+        # 退化到：单边DT峰值（与旧法一致，用作兜底）
+        dt = cv2.distanceTransform((nearest_mask>0).astype(np.uint8), cv2.DIST_L2, 3).astype(np.float32)
+
+    g_px = mach_xy_to_px_float(gcode_xy, origin_xy, pix_mm, H)
+    delta_n = np.full(g_px.shape[0], np.nan, np.float32)
+
+    def bil(img, xy):
+        return _bilinear_at(img, xy)
+
+    for i in range(g_px.shape[0]):
+        p  = g_px[i]
+        n  = gcode_normals[min(i, len(gcode_normals)-1)]
+        n_px = np.array([n[0]/pix_mm, -n[1]/pix_mm], dtype=np.float32)
+        n_px /= (np.linalg.norm(n_px) + 1e-12)
+
+        # 探测线
+        M  = max(7, int(np.ceil(2*halfw_px)))     # 至少 7 个采样点
+        ts = np.linspace(-halfw_px, +halfw_px, M).astype(np.float32)
+        line_xy = p[None,:] + ts[:,None] * n_px[None,:]
+
+        if use_equidist:
+            phi = bil(d_out, line_xy) - bil(d_in, line_xy)      # 目标：phi ≈ 0
+            in_ring = bil((ring_mask>0).astype(np.float32), line_xy) >= 0.5
+            phi[~in_ring] = np.nan
+            # 优先找零交叉，否则取 |phi| 最小
+            idx = np.where(np.isfinite(phi))[0]
+            if idx.size == 0:
+                continue
+            # 零交叉
+            z = None
+            for a,b in zip(idx[:-1], idx[1:]):
+                if np.sign(phi[a]) == 0:
+                    z = ts[a]; break
+                if np.sign(phi[a]) * np.sign(phi[b]) < 0:
+                    # 线性插值零点
+                    t0,t1, f0,f1 = ts[a], ts[b], phi[a], phi[b]
+                    z = t0 - f0*(t1-t0)/max(1e-9, (f1-f0))
+                    break
+            if z is None:
+                k = int(np.nanargmin(np.abs(phi)))
+                z = ts[k]
+            delta_n[i] = float(z * pix_mm)
+        else:
+            # 单边DT峰值（掩码内）
+            on = bil((nearest_mask>0).astype(np.float32), line_xy) >= 0.5
+            if not np.any(on):
+                continue
+            dvals = bil(dt, line_xy); dvals[~on] = -1.0
+            k = int(np.argmax(dvals))
+            if dvals[k] > 0:
+                delta_n[i] = float(ts[k] * pix_mm)
+
+    # 插值/平滑/限幅
+    ok = np.isfinite(delta_n)
+    if ok.any() and (~ok).any():
+        I = np.arange(len(delta_n))
+        delta_n[~ok] = np.interp(I[~ok], I[ok], delta_n[ok])
+    # 仅对 δ 做 1D 平滑（而非 XY 坐标！）
+    delta_n = moving_average_1d(delta_n, win)
+    delta_n = np.clip(delta_n, -max_abs, +max_abs)
+
+    # 重建中轴线：c = g + δ·N
+    centerline_xy = gcode_xy + gcode_normals * delta_n[:,None]
+    # 成功率统计
+    ratio = float(np.count_nonzero(ok)) / max(1,len(delta_n))
+    stats = dict(valid=int(np.count_nonzero(ok)), total=int(len(delta_n)), ratio=ratio)
+    return centerline_xy.astype(np.float32), delta_n.astype(np.float32), stats
+
+
 # ============================ 主流程（无命令行） ============================
 def run():
     cfg = PARAMS
@@ -1045,31 +1172,25 @@ def run():
             path_px = skeleton_to_path_px_topo(skel_gray)
 
             # 8) G 代码引导的中轴线（核心）
-            use_guided = bool(cfg.get('guide_enable', True)) and g_xy.size>1
+            use_guided = bool(PARAMS.get('guide_enable', True)) and g_xy.size > 1
             if use_guided:
-                centerline_xy_guided, rep = gcode_guided_centerline(
-                    nearest_mask, origin_xy, pix_mm, g_xy, N_ref, path_px_skeleton=path_px
+                centerline_xy, delta_n, rep = gcode_guided_centerline_v2(
+                    nearest_mask, origin_xy, pix_mm, g_xy, N_ref,
+                    halfwidth_mm=PARAMS['guide_halfwidth_mm'],
+                    smooth_win=PARAMS['guide_smooth_win'],
+                    max_abs_mm=PARAMS['guide_max_offset_mm']
                 )
-                if rep['ratio'] < float(cfg['guide_min_valid_ratio']) or centerline_xy_guided.size == 0:
-                    Ht, Wt = height.shape
-                    centerline_xy = px_to_mach_xy(path_px, origin_xy, pix_mm, Ht)
+                if rep['ratio'] < PARAMS['guide_min_valid_ratio']:
+                    # 回退：骨架像素 → 机床系；再 KDTree 对比
+                    centerline_xy = px_to_mach_xy(path_px, origin_xy, pix_mm, height.shape[0])
+                    e_idx, _, e_n = project_points_to_path(centerline_xy, g_xy, ref_tree, N_ref)
                 else:
-                    centerline_xy = centerline_xy_guided
+                    # 成功：一一对应
+                    e_idx = np.arange(len(delta_n), dtype=int)
+                    e_n = delta_n
             else:
-                Ht, Wt = height.shape
-                centerline_xy = px_to_mach_xy(path_px, origin_xy, pix_mm, Ht)
-
-            # 9) 偏差（法向投影）
-            if g_xy.size > 1 and centerline_xy.size > 0 and ref_tree is not None and N_ref.size > 0:
-                if use_guided and len(centerline_xy) == len(g_xy):
-                    # 直接索引对齐：更稳定
-                    e_vec = centerline_xy - g_xy
-                    e_n = (e_vec * N_ref).sum(axis=1)
-                    e_idx = np.arange(len(e_n), dtype=int)
-                else:
-                    e_idx, nearest_on_ref, e_n = project_points_to_path(centerline_xy, g_xy, ref_tree, N_ref)
-            else:
-                e_idx = np.array([], int); e_n = np.array([])
+                centerline_xy = px_to_mach_xy(path_px, origin_xy, pix_mm, height.shape[0])
+                e_idx, _, e_n = project_points_to_path(centerline_xy, g_xy, ref_tree, N_ref)
 
             # 10) 可视化叠加
             vis_top = render_topdown(height, mask_top, origin_xy, pix_mm, gcode_xy=g_xy)
@@ -1077,8 +1198,9 @@ def run():
             gmask = cv2.cvtColor(nearest_mask, cv2.COLOR_GRAY2BGR); gmask[:,:,1] = np.maximum(gmask[:,:,1], gmask[:,:,0])
             overlay = cv2.addWeighted(overlay, 1.0, gmask, 0.25, 0)
 
+            # 可视化叠加（箭头显示 e_n 即 δ）
             vis_cmp = draw_deviation_overlay(overlay, origin_xy, pix_mm, g_xy, centerline_xy, e_idx, e_n,
-                                             arrow_stride=int(cfg['arrow_stride']))
+                                             arrow_stride=int(PARAMS['arrow_stride']))
             vis_cmp = draw_machine_axes_overlay(vis_cmp, origin_xy, pix_mm)
 
             # 11) 在线纠偏（EMA）—— FIX：复用 corr 对象
