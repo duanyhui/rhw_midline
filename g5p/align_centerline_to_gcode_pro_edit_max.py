@@ -41,7 +41,7 @@ PARAMS = dict(
     roi_mode='gcode_bounds',
     cam_roi_xywh=(682, 847, 228, 185),
     roi_center_xy=(50.0,50.0),
-    roi_size_mm=250.0,
+    roi_size_mm=550.0,
 
     # 最近表面提取（在“展平后的残差高度图”上进行）
     z_select='max',
@@ -86,6 +86,13 @@ PARAMS = dict(
 
     guide_min_valid_ratio=0.60,               # 最低命中率（法向找到解的比例）
     guide_fallback_to_skeleton=True,          # 仅用于可视化（导出不使用回退）
+
+    # === Debug：法线-交点最小可视化窗口 ===  # NEW
+    debug_normals_window=True,  # 是否开启“法线-交点”调试窗口
+    debug_normals_stride=25,  # 抽样步长：每隔多少个G点画一根法线
+    debug_normals_max=40,  # 最多显示多少根法线（避免太密）
+    debug_normals_len_mm=None,  # 法线长度（mm），None=自动用1.2×guide_halfwidth_mm
+    debug_normals_text=True,  # 是否在交点旁标注 delta_n（mm）
 
     # 偏差可视化
     arrow_stride=12,
@@ -473,6 +480,93 @@ def draw_machine_axes_overlay(img: np.ndarray,
     cv2.putText(vis, '+X', (base[0] + ax + 6, base[1] + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
     cv2.putText(vis, '+Y', (base[0] - 18, base[1] - ax - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,200,255), 2, cv2.LINE_AA)
     return vis
+def render_normals_probe_window(base_img: np.ndarray,
+                                origin_xy: Tuple[float,float],
+                                pix_mm: float,
+                                gcode_xy: np.ndarray,
+                                N_ref: np.ndarray,
+                                delta_n: Optional[np.ndarray],
+                                valid_mask: Optional[np.ndarray],
+                                *,
+                                stride: int = 25,
+                                max_count: int = 40,
+                                len_mm: Optional[float] = None,
+                                draw_text: bool = True) -> np.ndarray:
+    """
+    在一张底图上，稀疏地画出：
+      - 理论中轴线上的少量采样点（白点）
+      - 对应点的法线（浅蓝色线段）
+      - 法线与“实际中轴线（沿法向单点决策得到）”的交点（品红圆点）
+    说明：
+      - 交点位置 = gcode_xy[i] + N_ref[i] * delta_n[i]
+      - 仅在 valid_mask[i] 为 True 且 delta_n[i] 有效时绘制交点
+      - 为保持一致的像素映射，这里与主渲染一致：右手系 +Y 向上
+    """
+    vis = base_img.copy()
+    H, W = vis.shape[:2]
+
+    # 像素变换（与其它可视化函数保持一致）
+    def xy_to_px(xy):
+        x0, y0 = origin_xy
+        y1 = y0 + H * pix_mm
+        xs = np.clip(((xy[:, 0] - x0) / pix_mm).astype(int), 0, W - 1)
+        ys = np.clip(((y1 - xy[:, 1]) / pix_mm).astype(int), 0, H - 1)
+        return np.stack([xs, ys], axis=1)
+
+    if gcode_xy.size == 0:
+        return vis
+
+    n_pts = len(gcode_xy)
+    stride = max(1, int(stride))
+    cand_idx = list(range(0, n_pts, stride))
+    if max_count is not None and len(cand_idx) > int(max_count):
+        # 均匀抽取 max_count 个索引
+        idx_uniform = np.linspace(0, len(cand_idx) - 1, int(max_count)).round().astype(int)
+        cand_idx = [cand_idx[i] for i in idx_uniform]
+
+    # 法线长度（像素）
+    if len_mm is None:
+        len_mm = float(PARAMS.get('guide_halfwidth_mm', 6.0)) * 1.2
+    L_px = int(max(4, round(len_mm / max(1e-9, pix_mm))))
+
+    has_delta = (delta_n is not None and len(delta_n) == n_pts)
+    has_valid = (valid_mask is not None and len(valid_mask) == n_pts)
+
+    for i in cand_idx:
+        base_xy = gcode_xy[i]
+        base_px = xy_to_px(base_xy[None, :])[0]
+
+        # 画理论点（白点）
+        cv2.circle(vis, tuple(base_px), 2, (255, 255, 255), -1, cv2.LINE_AA)
+
+        # 画法线（浅蓝）：以理论点为中心，延伸 ±L_px
+        n = N_ref[min(i, len(N_ref) - 1)]
+        # 注意像素坐标系与右手系的Y方向相反，这里按既有约定转换
+        n_px = np.array([n[0], -n[1]], dtype=np.float32)
+        n_px /= (np.linalg.norm(n_px) + 1e-12)
+        p0 = (base_px - (n_px * L_px)).astype(int)
+        p1 = (base_px + (n_px * L_px)).astype(int)
+        cv2.line(vis, tuple(p0), tuple(p1), (180, 200, 255), 1, cv2.LINE_AA)
+
+        # 画交点（品红）：仅在有效且有 δ 值时
+        if has_delta and has_valid and bool(valid_mask[i]) and np.isfinite(delta_n[i]):
+            q_xy = base_xy + n * float(delta_n[i])
+            q_px = xy_to_px(q_xy[None, :])[0]
+            cv2.circle(vis, tuple(q_px), 3, (255, 0, 255), -1, cv2.LINE_AA)
+            if draw_text:
+                txt = f"{float(delta_n[i]):+.2f}mm"
+                # 文本稍微偏移，避免遮住点
+                tpos = (int(q_px[0] + 6), int(q_px[1] - 6))
+                cv2.putText(vis, txt, tpos, cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 0, 255), 1, cv2.LINE_AA)
+
+    # 角落图例
+    cv2.rectangle(vis, (8, 8), (216, 56), (0, 0, 0), -1)
+    cv2.putText(vis, "white: G-code point", (14, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    cv2.putText(vis, "cyan: normal",        (14, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 200, 255), 1, cv2.LINE_AA)
+    cv2.putText(vis, "magenta: intersection",(14, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
+
+    return vis
+
 
 # ======================= 最近表面（残差域） =======================
 def morph_cleanup(mask_u8: np.ndarray, open_k: int, close_k: int) -> np.ndarray:
@@ -1003,6 +1097,7 @@ def _outer_inner_distance_fields(nearest_mask_u8: np.ndarray):
     d_in  = cv2.distanceTransform(inner_line,  cv2.DIST_L2, 5).astype(np.float32)
     return ring_mask, d_out, d_in
 
+
 def gcode_guided_centerline_strict(
     nearest_mask: np.ndarray,
     origin_xy: Tuple[float,float],
@@ -1429,6 +1524,20 @@ def run():
             cv2.imshow('Top-Down + Nearest Surface + Skeleton', overlay)
             cv2.imshow('NearestSurfaceMask', nearest_mask)
             cv2.imshow('Centerline vs G-code (RHR)', vis_cmp)
+
+            # --- 新增：法线-交点最小可视化窗口（少量抽样） ---  # NEW
+            if PARAMS.get('debug_normals_window', True) and g_xy.size > 1:
+                vis_probe = render_normals_probe_window(
+                    overlay, origin_xy, pix_mm,
+                    g_xy, N_ref,
+                    delta_n=delta_n if 'delta_n' in locals() else None,
+                    valid_mask=valid_mask if 'valid_mask' in locals() else None,
+                    stride=int(PARAMS.get('debug_normals_stride', 25)),
+                    max_count=int(PARAMS.get('debug_normals_max', 40)),
+                    len_mm=PARAMS.get('debug_normals_len_mm', None),
+                    draw_text=bool(PARAMS.get('debug_normals_text', True))
+                )
+                cv2.imshow('Normal-Probes (few)', vis_probe)
 
             # 12) 导出/截图/分辨率调节
             key = cv2.waitKey(1) & 0xFF
