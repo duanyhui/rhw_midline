@@ -72,6 +72,11 @@ PARAMS = dict(
     guide_smooth_win=7,
     guide_max_offset_mm=8.0,
 
+    # === Corner ignoring（拐角点附近忽略取点） ===  # NEW
+    corner_ignore_enable=True,  # 开启/关闭拐角忽略
+    corner_angle_thr_deg=35.0,  # 拐角判定阈值（夹角≥该角度判为拐角）
+    corner_ignore_span_mm=6.0,  # 在拐角两侧各忽略的弧长半径（mm）
+
     # [NEW] 严格一一对应与缺失处理
     strict_one_to_one=True,                   # 强制一一对应（导出仅基于法向单点决策）
     max_gap_pts=5,                            # 仅对 ≤ 该点数的缺口做局部插值
@@ -349,6 +354,38 @@ def curvature_kappa(poly: np.ndarray) -> np.ndarray:
         kappa[i] = float(np.linalg.norm(dT) / ds)
     kappa[0] = kappa[1]; kappa[-1] = kappa[-2]
     return kappa
+
+def compute_corner_ignore_mask(poly: np.ndarray,
+                               angle_thr_deg: float,
+                               span_mm: float,
+                               step_mm: float) -> np.ndarray:
+    """
+    根据折线夹角阈值 + 弧长半径生成忽略取点的掩码。
+    - 角度：对相邻两段 v[i-1], v[i] 计算转角，角度≥阈值视为拐角（索引为顶点 i）。
+    - 半径：在每个拐角左右各扩展 span_mm 的等弧长范围（按 step_mm 转为索引）。
+    - 两端点也视作拐角以保障稳健。
+    返回：bool 掩码，True 表示“忽略取点/不参与统计”。
+    """
+    n = int(poly.shape[0])
+    mask = np.zeros(n, dtype=np.bool_)
+    if n < 3:
+        mask[[0, n-1]] = True
+        return mask
+    v = np.diff(poly, axis=0)
+    ln = np.linalg.norm(v, axis=1) + 1e-12
+    cosang = np.sum(v[:-1] * v[1:], axis=1) / (ln[:-1] * ln[1:])
+    cosang = np.clip(cosang, -1.0, 1.0)
+    ang_deg = np.degrees(np.arccos(cosang))             # 0=直线, 值越大越“拐”
+    thr = float(angle_thr_deg)
+    corner_idx = np.where(ang_deg >= thr)[0] + 1        # 顶点索引落在中间点 i
+    # 端点也算拐角
+    corner_idx = np.unique(np.concatenate([corner_idx, [0, n-1]]))
+    k = max(1, int(round(float(span_mm) / max(1e-9, float(step_mm)))))
+    for c in corner_idx:
+        l = max(0, c - k); r = min(n, c + k + 1)
+        mask[l:r] = True
+    return mask
+
 
 def build_kdtree(pts: np.ndarray):
     """保留（在线 EMA 可视化时仍会用到最近邻查询）"""
@@ -1097,6 +1134,76 @@ def _outer_inner_distance_fields(nearest_mask_u8: np.ndarray):
     d_in  = cv2.distanceTransform(inner_line,  cv2.DIST_L2, 5).astype(np.float32)
     return ring_mask, d_out, d_in
 
+def postprocess_delta_segmentwise_for_export(
+    delta_in: np.ndarray,
+    ignore_mask: Optional[np.ndarray],
+    s: np.ndarray,
+    kappa: np.ndarray,
+    *,
+    base_win: int,
+    curvature_adaptive: bool,
+    curvature_gamma: float,
+    win_min: int,
+    max_abs_mm: float,
+    grad_max_mm_per_mm: float,
+    max_gap_pts: int
+) -> np.ndarray:
+    """
+    目的：在导出前进行“分段”平滑/限幅，禁止跨越拐角传播。
+    规则：
+      - ignore_mask=True 的点：视为“硬边界 + 零偏移”，导出保持原始G代码坐标。
+      - 其它点：在各自连续片段内做   短缺口插补 → 平滑 → 幅值限幅 → 梯度限幅。
+    返回：处理后的 delta（不含 NaN）
+    """
+    x = np.asarray(delta_in, dtype=np.float32).copy()
+    n = len(x)
+    if n == 0:
+        return x
+
+    sep = (ignore_mask.astype(bool) if (ignore_mask is not None and len(ignore_mask)==n)
+           else np.zeros(n, dtype=bool))
+
+    # 被忽略的点固定为 0 偏移（保持顶点不动）
+    x[sep] = 0.0
+
+    out = x.copy()
+    i = 0
+    while i < n:
+        # 跳过分隔点
+        if sep[i]:
+            i += 1
+            continue
+        # 找一个非忽略的连续片段 [l, r]
+        l = i
+        while i+1 < n and (not sep[i+1]):
+            i += 1
+        r = i
+
+        seg = x[l:r+1].copy()
+        s_seg = s[l:r+1]
+        k_seg = kappa[l:r+1] if (kappa is not None and len(kappa)==n) else np.zeros_like(seg)
+
+        # 片段内：仅对“短缺口”插补（保持与测量阶段一致）
+        v = np.isfinite(seg)
+        seg_fill, v2 = local_interpolate_short_gaps(seg, v, max_gap_pts=max_gap_pts)
+        # 平滑
+        if curvature_adaptive:
+            seg_smooth = moving_average_1d_variable(seg_fill, base_win=base_win,
+                                                    kappa=k_seg, gamma=curvature_gamma, win_min=win_min)
+        else:
+            seg_smooth = moving_average_1d(seg_fill, base_win)
+        # 幅值限幅
+        seg_smooth = np.clip(seg_smooth, -max_abs_mm, +max_abs_mm)
+        # 梯度限幅（用片段自身的弧长）
+        seg_final = gradient_clamp(seg_smooth, s_seg, gmax=grad_max_mm_per_mm)
+        # 写回
+        out[l:r+1] = seg_final
+
+        i += 1
+
+    # 保险：任何残存 NaN 置零
+    out = np.nan_to_num(out, nan=0.0, posinf=max_abs_mm, neginf=-max_abs_mm)
+    return out
 
 def gcode_guided_centerline_strict(
     nearest_mask: np.ndarray,
@@ -1111,7 +1218,8 @@ def gcode_guided_centerline_strict(
     max_gap_pts: int,
     curvature_adaptive: bool,
     curvature_gamma: float,
-    min_smooth_win: int
+    min_smooth_win: int,
+    ignore_mask: Optional[np.ndarray] = None              # NEW
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict]:
     """
     返回：
@@ -1135,10 +1243,18 @@ def gcode_guided_centerline_strict(
     delta_n = np.full(g_px.shape[0], np.nan, np.float32)
     valid_mask = np.zeros(g_px.shape[0], np.bool_)
 
+    g_px = mach_xy_to_px_float(gcode_xy, origin_xy, pix_mm, H)
+    delta_n = np.full(g_px.shape[0], np.nan, np.float32)
+    valid_mask = np.zeros(g_px.shape[0], np.bool_)
+    skip = (ignore_mask.astype(bool) if (ignore_mask is not None and len(ignore_mask)==len(g_px))
+            else np.zeros(len(g_px), np.bool_))                                     # NEW
+
     def bil(img, xy):
         return _bilinear_at(img, xy)
 
     for i in range(g_px.shape[0]):
+        if skip[i]:                      # NEW: 拐角附近直接跳过（既不取点也不计入“未命中”）
+            continue
         p  = g_px[i]
         n  = gcode_normals[min(i, len(gcode_normals)-1)]
         # 像素系法向（注意右手系到像素行列方向的转换）
@@ -1198,7 +1314,8 @@ def gcode_guided_centerline_strict(
 
     # 可视化：短缺口已插补；长段缺失保持“未命中”，导出时由 Guard 判定
     centerline_xy = gcode_xy + gcode_normals * np.nan_to_num(delta_final, nan=0.0)[:,None]
-    ratio = float(np.count_nonzero(valid_mask)) / max(1,len(delta_n))
+    denom = int(np.count_nonzero(~skip)) if (ignore_mask is not None) else int(len(delta_n))
+    ratio = float(np.count_nonzero(valid_mask)) / max(1, denom)
     stats = dict(valid=int(np.count_nonzero(valid_mask)), total=int(len(delta_n)),
                  ratio=ratio, use_equidist=bool(use_equidist))
     return centerline_xy.astype(np.float32), delta_final.astype(np.float32), valid_mask, stats
@@ -1345,6 +1462,16 @@ def run():
     T_ref, N_ref = tangent_normal(g_xy) if g_xy.size > 0 else (np.zeros((0,2)), np.zeros((0,2)))
     s_ref = arc_length_s(g_xy)
 
+    # === 拐角忽略掩码（可选） ===                                   # NEW
+    if PARAMS.get('corner_ignore_enable', True) and g_xy.size > 2:
+        ignore_mask = compute_corner_ignore_mask(
+            g_xy,
+            angle_thr_deg=PARAMS.get('corner_angle_thr_deg', 35.0),
+            span_mm=PARAMS.get('corner_ignore_span_mm', 6.0),
+            step_mm=step_mm
+        )
+    else:
+        ignore_mask = None
     # 2) 相机
     stream = PCamMLSStream(); stream.open()
 
@@ -1442,7 +1569,8 @@ def run():
                     max_gap_pts=PARAMS['max_gap_pts'],
                     curvature_adaptive=PARAMS['curvature_adaptive'],
                     curvature_gamma=PARAMS['curvature_gamma'],
-                    min_smooth_win=PARAMS['min_smooth_win']
+                    min_smooth_win=PARAMS['min_smooth_win'],
+                    ignore_mask=ignore_mask  # NEW
                 )
                 e_idx = np.arange(len(delta_n), dtype=int)
                 e_n   = np.nan_to_num(delta_n, nan=0.0)  # 在线可视化采用 0 占位；导出时仍看 valid_mask
@@ -1485,13 +1613,17 @@ def run():
             plane_info = f"inlier={inlier_ratio:.2f}" if np.isfinite(inlier_ratio) else "inlier=nan"
 
             # 长段缺失检测
-            runs = find_missing_runs(valid_mask)
+            # 长段缺失检测（把“忽略点”当作有效）                      # NEW / CHG
+            eff_valid_mask = valid_mask.copy()
+            if ignore_mask is not None and len(ignore_mask) == len(eff_valid_mask):
+                eff_valid_mask = eff_valid_mask | ignore_mask
+            runs = find_missing_runs(eff_valid_mask)
             step_mm_eff = max(1e-9, float(PARAMS['guide_step_mm']))
             long_mm_max = float(PARAMS['long_missing_max_mm'])
             long_ratio_max = float(PARAMS['long_missing_max_ratio'])
             longest_pts = max([r - l + 1 for (l,r) in runs], default=0)
             longest_mm  = longest_pts * step_mm_eff
-            missing_ratio = float(sum((r-l+1) for (l,r) in runs)) / max(1, len(valid_mask))
+            missing_ratio = float(sum((r - l + 1) for (l, r) in runs)) / max(1, len(eff_valid_mask))
 
             guard = cfg['Guard']; guard_enable = guard.get('enable', True)
             guard_ok = True; reasons = []
@@ -1531,7 +1663,7 @@ def run():
                     overlay, origin_xy, pix_mm,
                     g_xy, N_ref,
                     delta_n=delta_n if 'delta_n' in locals() else None,
-                    valid_mask=valid_mask if 'valid_mask' in locals() else None,
+                    valid_mask=( (valid_mask | ignore_mask) if (ignore_mask is not None and len(ignore_mask)==len(valid_mask)) else valid_mask ),  # NEW（可选）
                     stride=int(PARAMS.get('debug_normals_stride', 25)),
                     max_count=int(PARAMS.get('debug_normals_max', 40)),
                     len_mm=PARAMS.get('debug_normals_len_mm', None),
@@ -1572,19 +1704,28 @@ def run():
 
                     # === 3) 将“测得偏移”转换为“应用偏移” ===
                     _mode = str(PARAMS.get('offset_apply_mode', 'invert')).lower()
-                    _apply_sign = -1.0 if _mode in ('invert','opposite','opp','toward_target','correct') else 1.0
-                    delta_n_apply = _apply_sign * delta_n_meas
+                    _apply_sign = -1.0 if _mode in ('invert', 'opposite', 'opp', 'toward_target', 'correct') else 1.0
+                    delta_n_apply_raw = _apply_sign * delta_n_meas
 
-                    # === 4) 平滑 & 幅值限幅 & 梯度限幅（再次加强） ===
-                    if PARAMS.get('curvature_adaptive', True):
-                        kappa = curvature_kappa(g_xy)
-                        delta_n_apply = moving_average_1d_variable(delta_n_apply, PARAMS['guide_smooth_win'],
-                                                                   kappa, PARAMS['curvature_gamma'],
-                                                                   PARAMS['min_smooth_win'])
-                    else:
-                        delta_n_apply = moving_average_1d(delta_n_apply, PARAMS['guide_smooth_win'])
-                    delta_n_apply = np.clip(delta_n_apply, -PARAMS['guide_max_offset_mm'], PARAMS['guide_max_offset_mm'])
-                    delta_n_apply = gradient_clamp(delta_n_apply, s_ref, gmax=PARAMS['guide_max_grad_mm_per_mm'])
+                    # === 4) 分段平滑 & 限幅 & 梯度限幅（拐角为硬边界/零偏移） ===  # NEW
+                    kappa = curvature_kappa(g_xy)
+                    delta_n_apply = postprocess_delta_segmentwise_for_export(
+                        delta_n_apply_raw,
+                        ignore_mask=ignore_mask if ('ignore_mask' in locals() and ignore_mask is not None
+                                                    and len(ignore_mask) == len(delta_n_apply_raw)) else None,
+                        s=s_ref, kappa=kappa,
+                        base_win=PARAMS['guide_smooth_win'],
+                        curvature_adaptive=PARAMS['curvature_adaptive'],
+                        curvature_gamma=PARAMS['curvature_gamma'],
+                        win_min=PARAMS['min_smooth_win'],
+                        max_abs_mm=PARAMS['guide_max_offset_mm'],
+                        grad_max_mm_per_mm=PARAMS['guide_max_grad_mm_per_mm'],
+                        max_gap_pts=PARAMS['max_gap_pts']
+                    )
+
+                    if ignore_mask is not None and len(ignore_mask) == len(delta_n_apply):
+                        n_ign = int(np.count_nonzero(ignore_mask))
+                        print(f"[EXPORT] corner-ignored points: {n_ign}")
 
                     # === 5) 生成纠偏 G 代码（严格按索引一一对应） ===
                     g_xy_corr = g_xy + N_ref * delta_n_apply[:,None]
