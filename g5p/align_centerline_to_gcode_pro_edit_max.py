@@ -123,7 +123,7 @@ PARAMS = dict(
     auto_flip_offset=True,                    # 自动检测符号并翻转
     # === 偏差补偿（可选） ===
     bias_comp=dict(
-        enable=False,  # True 时启用补偿
+        enable=True,  # True 时启用补偿
         path='bias_comp.json'  # 标定文件路径（支持 mode="vector"/"per_index"）
     ),
     preview_corrected=True,                   # 预览叠加 corrected 轨迹
@@ -1477,6 +1477,39 @@ def run():
         )
     else:
         ignore_mask = None
+
+    # --- [ADD] 预加载偏差补偿（用于实时可视化对比，不影响原逻辑/窗口） ---
+    bias_vis = None
+    try:
+        bc_cfg = PARAMS.get('bias_comp', {})
+        if bc_cfg.get('enable', False):
+            with open(bc_cfg.get('path', 'bias_comp.json'), 'r', encoding='utf-8') as f:
+                bc = json.load(f)
+            # 步长一致性校验（向量模式不强制点数一致）
+            step_ok = abs(float(bc.get('guide_step_mm', step_mm)) - float(step_mm)) < 1e-9
+            if step_ok and g_xy.size > 1:
+                mode = str(bc.get('mode', 'vector')).lower()
+                if mode in ('per_index', 'table') and int(bc.get('n_points', len(g_xy))) == len(g_xy):
+                    bias_arr = np.asarray(bc['delta_bias_mm'], dtype=np.float32)
+                else:
+                    # 向量模型：bias_i = dot(v, N_ref[i]) + b
+                    v = np.asarray(bc.get('v', [0.0, 0.0]), dtype=np.float32)
+                    b0 = float(bc.get('b', 0.0))
+                    T_ref, N_ref = tangent_normal(g_xy)  # 确保已得到法向
+                    bias_arr = (N_ref[:, 0] * v[0] + N_ref[:, 1] * v[1] + b0).astype(np.float32)
+
+                # 与拐点忽略策略一致：忽略区间的补偿置零，避免跨段传播
+                if (ignore_mask is not None) and (len(ignore_mask) == len(bias_arr)):
+                    bias_arr = bias_arr.copy()
+                    bias_arr[ignore_mask] = 0.0
+
+                bias_vis = bias_arr
+                print('[BIAS][vis] preload ok')
+            else:
+                print('[BIAS][vis] skipped (guide_step不匹配或g_xy过短)')
+    except Exception as _e:
+        print('[BIAS][vis] preload failed:', _e)
+
     # 2) 相机
     stream = PCamMLSStream(); stream.open()
 
@@ -1675,6 +1708,53 @@ def run():
                     draw_text=bool(PARAMS.get('debug_normals_text', True))
                 )
                 cv2.imshow('Normal-Probes (few)', vis_probe)
+
+                # --- [ADD] 偏差补偿后的可视化窗口（不影响原逻辑/窗口） ---
+                if (bias_vis is not None) and (g_xy.size > 1) and ('delta_n' in locals()) and (
+                        len(delta_n) == len(bias_vis)):
+                    # 1) 计算纠正后的法向偏差（处于“测量域”：auto_flip之前的一致定义）
+                    delta_n_corr = delta_n.copy()
+                    mvis = np.isfinite(delta_n_corr)
+                    delta_n_corr[mvis] = delta_n_corr[mvis] - bias_vis[mvis]
+
+                    # 2) Normal-Probes (few) —— Bias Corrected（你特别要求的窗口）
+                    vis_probe_corr = render_normals_probe_window(
+                        overlay, origin_xy, pix_mm,
+                        g_xy, N_ref,
+                        delta_n=delta_n_corr,
+                        valid_mask=((valid_mask | ignore_mask) if (
+                                    ignore_mask is not None and len(ignore_mask) == len(valid_mask)) else valid_mask),
+                        stride=int(PARAMS.get('debug_normals_stride', 25)),
+                        max_count=int(PARAMS.get('debug_normals_max', 40)),
+                        len_mm=PARAMS.get('debug_normals_len_mm', None),
+                        draw_text=bool(PARAMS.get('debug_normals_text', True))
+                    )
+                    cv2.imshow('Normal-Probes (few) [Bias Corrected]', vis_probe_corr)
+
+                    # 3) 叠加图：Centerline vs G-code（Bias Corrected）
+                    e_idx_corr = np.arange(len(delta_n_corr), dtype=int)
+                    e_n_corr = np.nan_to_num(delta_n_corr, nan=0.0)
+                    centerline_corr = g_xy + N_ref * e_n_corr[:, None]
+                    vis_cmp_corr = draw_deviation_overlay(
+                        overlay, origin_xy, pix_mm,
+                        g_xy, centerline_corr,
+                        e_idx_corr, e_n_corr,
+                        arrow_stride=int(PARAMS['arrow_stride']),
+                        draw_probes=PARAMS.get('draw_normal_probes', True),
+                        N_ref=N_ref, valid_mask=valid_mask
+                    )
+                    vis_cmp_corr = draw_machine_axes_overlay(vis_cmp_corr, origin_xy, pix_mm)
+                    cv2.putText(vis_cmp_corr, 'bias compensated (visualization)', (12, 52),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 2, cv2.LINE_AA)
+                    cv2.putText(vis_cmp_corr, 'bias compensated (visualization)', (12, 52),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 1, cv2.LINE_AA)
+                    cv2.imshow('Centerline vs G-code [Bias Corrected]', vis_cmp_corr)
+
+                    # 4) Δn 直方图对比（raw vs corrected），便于快速观察补偿量级
+                    hist_raw = _render_histogram(np.nan_to_num(delta_n, nan=0.0), title='raw delta_n (mm)')
+                    hist_cor = _render_histogram(np.nan_to_num(delta_n_corr, nan=0.0), title='after bias (mm)')
+                    hist_cmp = _compose_quicklook(hist_raw, None, hist_cor, hud_text='BiasComp: raw vs corrected')
+                    cv2.imshow('BiasComp Δn Hist', hist_cmp)
 
             # 12) 导出/截图/分辨率调节
             key = cv2.waitKey(1) & 0xFF
