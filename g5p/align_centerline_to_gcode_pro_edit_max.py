@@ -65,7 +65,7 @@ PARAMS = dict(
 
     # === G 代码引导中轴线（核心） ===
     guide_enable=True,
-    guide_step_mm=2.0,                        # 等弧长重采样步长（G0/G1/G2/G3）
+    guide_step_mm=1.0,                        # 等弧长重采样步长（G0/G1/G2/G3）
     guide_halfwidth_mm=6.0,                   # 法向扫描半宽（±）
     guide_use_dt=True,
     guide_min_on_count=3,
@@ -73,9 +73,9 @@ PARAMS = dict(
     guide_max_offset_mm=8.0,
 
     # === Corner ignoring（拐角点附近忽略取点） ===  # NEW
-    corner_ignore_enable=True,  # 开启/关闭拐角忽略
+    corner_ignore_enable=False,  # 开启/关闭拐角忽略
     corner_angle_thr_deg=35.0,  # 拐角判定阈值（夹角≥该角度判为拐角）
-    corner_ignore_span_mm=6.0,  # 在拐角两侧各忽略的弧长半径（mm）
+    corner_ignore_span_mm=2.0,  # 在拐角两侧各忽略的弧长半径（mm）
 
     # [NEW] 严格一一对应与缺失处理
     strict_one_to_one=True,                   # 强制一一对应（导出仅基于法向单点决策）
@@ -121,6 +121,11 @@ PARAMS = dict(
     centerline_gcode='out/centerline.gcode',  # 可选：导出“测得中心线”（仅用于对比）
     export_centerline=False,
     auto_flip_offset=True,                    # 自动检测符号并翻转
+    # === 偏差补偿（可选） ===
+    bias_comp=dict(
+        enable=False,  # True 时启用补偿
+        path='bias_comp.json'  # 标定文件路径（支持 mode="vector"/"per_index"）
+    ),
     preview_corrected=True,                   # 预览叠加 corrected 轨迹
     save_corrected_preview=True,
 
@@ -1689,6 +1694,48 @@ def run():
                 else:
                     # === 1) 采用“严格法向单点决策”的 δ(s)（不再 KDTree 聚合） ===
                     delta_n_meas = delta_n.copy()
+                    # === [ADD] 偏差补偿（在 auto_flip 之前，处于“测量域”） ===
+                    try:
+                        bc_cfg = PARAMS.get('bias_comp', {})
+                        if bc_cfg.get('enable', False):
+                            with open(bc_cfg.get('path', 'bias_comp.json'), 'r', encoding='utf-8') as f:
+                                bc = json.load(f)
+
+                            # 步长一致性；vector 模式不强制点数一致
+                            step_ok = abs(float(bc.get('guide_step_mm', PARAMS['guide_step_mm'])) - float(
+                                PARAMS['guide_step_mm'])) < 1e-9
+                            mode = str(bc.get('mode', 'vector')).lower()
+                            if mode in ('per_index', 'table'):
+                                n_ok = int(bc.get('n_points', len(delta_n_meas))) == len(delta_n_meas)
+                            else:
+                                n_ok = True
+
+                            if step_ok and n_ok:
+                                if mode in ('per_index', 'table'):
+                                    bias = np.asarray(bc['delta_bias_mm'], dtype=np.float32)
+                                else:
+                                    # 向量模型：bias_i = dot(v, N_ref[i]) + b
+                                    v = np.asarray(bc.get('v', [0.0, 0.0]), dtype=np.float32)
+                                    b0 = float(bc.get('b', 0.0))
+                                    bias = (N_ref[:, 0] * v[0] + N_ref[:, 1] * v[1] + b0).astype(np.float32)
+
+                                # 拐点忽略区间的补偿置零，避免跨段传播
+                                if ('ignore_mask' in locals()) and (ignore_mask is not None) and (
+                                        len(ignore_mask) == len(bias)):
+                                    bias = bias.copy()
+                                    bias[ignore_mask] = 0.0
+
+                                # 只在有效测量处相减，NaN（长缺口）保持不变
+                                m = np.isfinite(delta_n_meas)
+                                delta_n_meas[m] = delta_n_meas[m] - bias[m]
+                                print("[BIAS] applied: mean={:+.3f} p95={:.3f}".format(
+                                    float(np.nanmean(bias)), float(np.nanpercentile(np.abs(bias), 95))
+                                ))
+                            else:
+                                print("[BIAS] skipped: guide_step或长度不匹配")
+                    except Exception as _e:
+                        print("[BIAS] failed:", _e)
+                    # === [ADD END] ===
 
                     # === 2) 自动符号判定（可选） ===
                     if PARAMS.get('auto_flip_offset', True):
@@ -1785,6 +1832,32 @@ def run():
                         with rp.open('w', encoding='utf-8') as f:
                             json.dump(rep_json, f, ensure_ascii=False, indent=2)
                         print('[SAVE]', rp)
+            elif key == ord('b') and g_xy.size > 1 and use_guided:
+                # === [ADD] 标定导出：把当前帧逐点“固有偏差”写成 bias_comp.json ===
+                try:
+                    bc_cfg = PARAMS.get('bias_comp', {})
+                    outp = Path(bc_cfg.get('path', 'bias_comp.json'))
+                    data = {
+                        "version": "bias_comp/v1",
+                        "mode": "per_index",  # 逐点补偿表
+                        "guide_step_mm": float(PARAMS.get('guide_step_mm', 1.0)),
+                        "n_points": int(len(delta_n)),
+                        "corner_ignore": bool(PARAMS.get('corner_ignore_enable', False)),
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "gcode_path": PARAMS.get('gcode_path', ''),
+                        # JSON 不支持 NaN，这里把缺测点置 0.0；应用时只在有效测量点相减
+                        "delta_bias_mm": np.nan_to_num(np.asarray(delta_n, dtype=float), nan=0.0).tolist()
+                    }
+                    # 可选：保存拐点忽略索引，便于审计
+                    if ('ignore_mask' in locals()) and (ignore_mask is not None) and len(ignore_mask) == len(delta_n):
+                        data["ignored_indices"] = np.where(ignore_mask)[0].astype(int).tolist()
+                    outp.parent.mkdir(parents=True, exist_ok=True)
+                    with open(outp, 'w', encoding='utf-8') as f:
+                        json.dump(data, f, ensure_ascii=False, indent=2)
+                    print(f"[BIAS] saved to {outp} (n={data['n_points']}, step={data['guide_step_mm']})")
+                except Exception as e:
+                    print("[BIAS] save failed:", e)
+
             frame_id += 1
 
     finally:
