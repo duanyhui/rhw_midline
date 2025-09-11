@@ -77,6 +77,19 @@ PARAMS = dict(
     corner_angle_thr_deg=35.0,  # 拐角判定阈值（夹角≥该角度判为拐角）
     corner_ignore_span_mm=2.0,  # 在拐角两侧各忽略的弧长半径（mm）
 
+    # === 遮挡（固定位置设备） ===  # [OCCLUSION]
+    occlusion=dict(
+        enable=True,  # 设为 True 启用
+        # 在机床坐标系 XY(mm) 中给出一个或多个多边形（顺/逆时针均可）
+        # 示例：左下角 62x52mm 矩形（请按现场一次性标定后填写）
+        polys=[
+            [(-50,-50), (30,-30), (30,200), (-50,200)]
+        ],
+        dilate_mm=3.0,  # 安全扩张，确保完全覆盖遮挡
+        synthesize_band=True,  # 是否在遮挡区内按 G 代码合成环带掩码
+        band_halfwidth_mm=None  # None=自动从可见区估计；或手工指定半宽
+    ),
+
     # [NEW] 严格一一对应与缺失处理
     strict_one_to_one=True,                   # 强制一一对应（导出仅基于法向单点决策）
     max_gap_pts=5,                            # 仅对 ≤ 该点数的缺口做局部插值
@@ -1139,6 +1152,98 @@ def _outer_inner_distance_fields(nearest_mask_u8: np.ndarray):
     d_in  = cv2.distanceTransform(inner_line,  cv2.DIST_L2, 5).astype(np.float32)
     return ring_mask, d_out, d_in
 
+# === [OCCLUSION] 顶视遮挡多边形光栅化（机床XY -> 顶视像素） ===
+def _rasterize_polygons_topdown(polys_xy, origin_xy, pix_mm, H, W, dilate_mm=0.0):
+    """
+    输入：多边形列表（机床XY, mm），顶视原点/分辨率，目标图尺寸
+    输出：uint8 遮挡掩码（255=遮挡）
+    """
+    mask = np.zeros((H, W), np.uint8)
+    if not polys_xy:
+        return mask
+    for poly in polys_xy:
+        P = np.asarray(poly, np.float32)
+        px = mach_xy_to_px_float(P, origin_xy, pix_mm, H).astype(np.int32)
+        cv2.fillPoly(mask, [px.reshape(-1,1,2)], 255)
+    if dilate_mm and float(dilate_mm) > 0:
+        r = int(round(float(dilate_mm) / max(1e-9, pix_mm)))
+        if r > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (r*2+1, r*2+1))
+            mask = cv2.dilate(mask, k, 1)
+    return mask
+
+# === [OCCLUSION] 从可见区域估计“轨迹环带半宽”（像素）
+def _estimate_band_halfwidth_px(nearest_mask_u8, exclude_u8=None):
+    ring = (nearest_mask_u8 > 0).astype(np.uint8) * 255
+    if exclude_u8 is not None:
+        ring = cv2.bitwise_and(ring, cv2.bitwise_not((exclude_u8 > 0).astype(np.uint8)))
+    ring_mask, d_out, d_in = _outer_inner_distance_fields(ring)
+    # 首选：外/内距离场的等距带
+    if d_out is not None and d_in is not None:
+        dist_sum = d_out + d_in + 1e-6
+        diff = np.abs(d_out - d_in)
+        tau = np.maximum(1.0, 0.04 * dist_sum)
+        equi = ((diff <= tau) & (ring_mask > 0))
+        vals = dist_sum[equi]
+        if vals.size > 20:
+            return float(0.5 * np.median(vals))
+    # 回退：骨架 + 距离变换
+    dt = cv2.distanceTransform((ring > 0).astype(np.uint8), cv2.DIST_L2, 5).astype(np.float32)
+    sk = _skeletonize_bool(ring > 0)
+    v = dt[sk > 0]
+    if v.size > 0:
+        return float(np.median(v))
+    return 6.0  # 兜底：6px
+
+# === [OCCLUSION] 在遮挡区内按 G 代码合成“环带掩码”，并与真实掩码拼合
+def _synthesize_mask_in_occlusion(nearest_mask_u8, occ_u8, gcode_xy, origin_xy, pix_mm,
+                                  band_halfwidth_mm=None):
+    if occ_u8 is None or np.count_nonzero(occ_u8) == 0 or gcode_xy.size == 0:
+        return nearest_mask_u8
+    H, W = nearest_mask_u8.shape[:2]
+    occ = (occ_u8 > 0)
+    g_px = mach_xy_to_px_float(gcode_xy, origin_xy, pix_mm, H)
+    idx = []
+    for i in range(len(g_px)):
+        x = int(np.clip(round(g_px[i,0]), 0, W-1))
+        y = int(np.clip(round(g_px[i,1]), 0, H-1))
+        if occ[y, x]: idx.append(i)
+    if not idx:
+        return nearest_mask_u8
+
+    # 连续片段
+    segs = []
+    s0 = idx[0]; pre = idx[0]
+    for k in idx[1:]:
+        if k == pre + 1:
+            pre = k
+        else:
+            segs.append((s0, pre)); s0 = k; pre = k
+    segs.append((s0, pre))
+
+    # 半宽（像素）
+    if band_halfwidth_mm is None:
+        half_px = _estimate_band_halfwidth_px(nearest_mask_u8, exclude_u8=occ_u8)
+    else:
+        half_px = float(band_halfwidth_mm) / max(1e-9, pix_mm)
+    thick = max(1, int(round(half_px * 2.0)))
+
+    # 只在遮挡区内画“加粗折线带”
+    synth = np.zeros((H, W), np.uint8)
+    for l, r in segs:
+        pts = g_px[l:r+1].astype(np.int32).reshape(-1,1,2)
+        cv2.polylines(synth, [pts], False, 255, thickness=thick, lineType=cv2.LINE_AA)
+    synth = cv2.bitwise_and(synth, occ_u8)
+
+    out = nearest_mask_u8.copy()
+    out[occ] = 0                 # 清空遮挡区的“伪”测量
+    out = cv2.bitwise_or(out, synth)
+    # 轻微闭运算，避免缝隙
+    out = cv2.morphologyEx(out, cv2.MORPH_CLOSE,
+                           cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3)), 1)
+    return out
+
+
 def postprocess_delta_segmentwise_for_export(
     delta_in: np.ndarray,
     ignore_mask: Optional[np.ndarray],
@@ -1561,6 +1666,19 @@ def run():
             # 5) 顶视投影（取最高 Z）
             height, mask_top, origin_xy = project_topdown_from_grid(P_mach, m_select, pix_mm, (x0,x1,y0,y1))
 
+            # 5.0 [OCCLUSION] 在顶视网格中抠除固定遮挡
+            occ_cfg = PARAMS.get('occlusion', {})
+            occ_enable = bool(occ_cfg.get('enable', False)) and len(occ_cfg.get('polys', [])) > 0
+            occ_top = None
+            if occ_enable:
+                Ht, Wt = height.shape
+                occ_top = _rasterize_polygons_topdown(
+                    occ_cfg.get('polys', []), origin_xy, pix_mm, Ht, Wt,
+                    dilate_mm=float(occ_cfg.get('dilate_mm', 0.0))
+                )
+                height[occ_top > 0] = np.nan  # 遮挡记为缺测
+                mask_top[occ_top > 0] = 0
+
             # 5.1 平面拟合与展平
             plane = None; inlier_ratio = float('nan')
             if cfg.get('plane_enable', True) and np.isfinite(height).any():
@@ -1587,6 +1705,14 @@ def run():
                 morph_close=cfg['morph_close'],
                 min_component_area_px=cfg['min_component_area_px']
             )
+
+            # 6.1 [OCCLUSION] 遮挡区内按 G 代码 + 可见半宽合成“虚拟最近表面掩码”
+            if occ_enable and occ_top is not None and g_xy.size > 0 and bool(occ_cfg.get('synthesize_band', True)):
+                nearest_mask = _synthesize_mask_in_occlusion(
+                    nearest_mask, occ_top, g_xy, origin_xy, pix_mm,
+                    band_halfwidth_mm=occ_cfg.get('band_halfwidth_mm', None)
+                )
+                cv2.imshow('OcclusionTop', occ_top)
 
             # 7) 骨架（仅作可视化；不参与导出）
             skel_bgr = extract_skeleton_universal(nearest_mask, visualize=True)
