@@ -1558,6 +1558,108 @@ def _compose_quicklook(vis_top, phi_vis=None, hist=None, hud_text:str=''):
         cv2.putText(out, hud_text, (12, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 1, cv2.LINE_AA)
     return out
 
+def _render_biascomp_panel(raw_vals: np.ndarray,
+                           corr_vals: np.ndarray,
+                           title: str = 'BiasComp Δn (raw → corrected)',
+                           width: int = 440, height: int = 300, bins: int = 48) -> np.ndarray:
+    import numpy as _np
+    import cv2 as _cv2
+
+    img = _np.full((height, width, 3), 20, _np.uint8)
+
+    # --- 数据清理 ---
+    raw = _np.asarray(raw_vals, _np.float32)
+    cor = _np.asarray(corr_vals, _np.float32)
+    raw = raw[_np.isfinite(raw)]
+    cor = cor[_np.isfinite(cor)]
+    if raw.size == 0 and cor.size == 0:
+        _cv2.putText(img, 'no valid data', (12, height//2), _cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 1, _cv2.LINE_AA)
+        return img
+
+    allv = raw if cor.size == 0 else (cor if raw.size == 0 else _np.concatenate([raw, cor]))
+    # 统一、对称的范围（围绕 0）
+    xmax = float(_np.percentile(_np.abs(allv), 98)) * 1.05
+    xmax = max(0.5, xmax)
+    edges = _np.linspace(-xmax, +xmax, bins+1)
+
+    h_raw, _ = _np.histogram(raw, bins=edges)
+    h_cor, _ = _np.histogram(cor, bins=edges)
+    hmax = float(max(h_raw.max() if h_raw.size else 1, h_cor.max() if h_cor.size else 1, 1))
+
+    # --- 画布布局 ---
+    # --- 画布布局 ---  # 让绘图区更小，避免遮挡左上/左下角文字
+    L, R, T, B = 88, 28, 72, 92
+    Wp, Hp = width - L - R, height - T - B
+    origin = (L, height - B)
+
+    # 坐标轴
+    _cv2.rectangle(img, (L-1, T-1), (L+Wp+1, T+Hp+1), (70,70,70), 1)
+    # 0 参考线（竖线）
+    x0_px = int(L + Wp * (0 - (-xmax)) / (2*xmax))
+    _cv2.line(img, (x0_px, T), (x0_px, T+Hp), (80,80,80), 1, _cv2.LINE_AA)
+
+    # x 轴刻度（-xmax, -xmax/2, 0, xmax/2, xmax）
+    ticks = [-xmax, -0.5*xmax, 0.0, 0.5*xmax, xmax]
+    for t in ticks:
+        tx = int(L + Wp * (t + xmax) / (2*xmax))
+        _cv2.line(img, (tx, T+Hp), (tx, T+Hp+4), (120,120,120), 1)
+        s = f'{t:+.1f}'
+        _cv2.putText(img, s, (tx-14, T+Hp+28), _cv2.FONT_HERSHEY_SIMPLEX, 0.38, (170,170,170), 1, _cv2.LINE_AA)
+
+    # --- 画柱（同一坐标，双柱并排对比） ---
+    w_bin = Wp / bins
+    bar_pad = max(1, int(round(w_bin*0.10)))
+    bw = max(1, int(round((w_bin - 3*bar_pad) / 2)))
+
+    for i in range(bins):
+        x_left = int(L + i*w_bin)
+        # raw 在左、corrected 在右
+        h1 = int(Hp * (h_raw[i] / hmax)) if i < len(h_raw) else 0
+        h2 = int(Hp * (h_cor[i] / hmax)) if i < len(h_cor) else 0
+        # raw 颜色：橙黄；corrected 颜色：青绿
+        _cv2.rectangle(img,
+            (x_left + bar_pad,          T+Hp-h1),
+            (x_left + bar_pad + bw,     T+Hp),
+            (80,200,255), -1)           # raw
+        _cv2.rectangle(img,
+            (x_left + 2*bar_pad + bw,   T+Hp-h2),
+            (x_left + 2*bar_pad + 2*bw, T+Hp),
+            (70,230,120), -1)           # corrected
+
+    # --- 统计信息 ---
+    def _stat(v):
+        if v.size == 0:
+            return dict(n=0, mean=0.0, med=0.0, p95=0.0, std=0.0)
+        return dict(
+            n=int(v.size),
+            mean=float(_np.mean(v)),
+            med=float(_np.median(v)),
+            p95=float(_np.percentile(_np.abs(v), 95)),
+            std=float(_np.std(v))
+        )
+    s_raw = _stat(raw); s_cor = _stat(cor)
+    dp95 = s_cor['p95'] - s_raw['p95']
+    dp95_pct = (dp95 / s_raw['p95'] * 100.0) if s_raw['p95'] > 1e-9 else 0.0
+
+    # 标题与图例
+    _cv2.putText(img, title, (12, 24), _cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255,255,255), 1, _cv2.LINE_AA)
+    _cv2.rectangle(img, (12, 36), (28, 52), (80,200,255), -1);  _cv2.putText(img, 'raw', (34, 49), _cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210,210,210), 1, _cv2.LINE_AA)
+    _cv2.rectangle(img, (74, 36), (90, 52), (70,230,120), -1);  _cv2.putText(img, 'corrected', (96, 49), _cv2.FONT_HERSHEY_SIMPLEX, 0.48, (210,210,210), 1, _cv2.LINE_AA)
+
+    # 数值卡片
+    y0 = height - B + 6
+    _cv2.putText(img, f"raw: n={s_raw['n']}  mean={s_raw['mean']:+.3f}  med={s_raw['med']:+.3f}  p95={s_raw['p95']:.3f}",
+                 (12, y0+56), _cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220,220,220), 1, _cv2.LINE_AA)
+    _cv2.putText(img, f"cor: n={s_cor['n']}  mean={s_cor['mean']:+.3f}  med={s_cor['med']:+.3f}  p95={s_cor['p95']:.3f}  Δp95={dp95:+.3f}mm ({dp95_pct:+.1f}%)",
+                 (12, y0+72), _cv2.FONT_HERSHEY_SIMPLEX, 0.45, (220,220,220), 1, _cv2.LINE_AA)
+
+    # 范围说明
+    _cv2.putText(img, f"range=[{-xmax:.1f},{xmax:.1f}]mm  bins={bins}  zero-line at x=0",
+                 (12, T-8), _cv2.FONT_HERSHEY_SIMPLEX, 0.40, (170,170,170), 1, _cv2.LINE_AA)
+
+    return img
+
+
 # ============================ 主流程（STRICT 集成） ============================
 def run():
     cfg = PARAMS
@@ -1877,10 +1979,13 @@ def run():
                     cv2.imshow('Centerline vs G-code [Bias Corrected]', vis_cmp_corr)
 
                     # 4) Δn 直方图对比（raw vs corrected），便于快速观察补偿量级
-                    hist_raw = _render_histogram(np.nan_to_num(delta_n, nan=0.0), title='raw delta_n (mm)')
-                    hist_cor = _render_histogram(np.nan_to_num(delta_n_corr, nan=0.0), title='after bias (mm)')
-                    hist_cmp = _compose_quicklook(hist_raw, None, hist_cor, hud_text='BiasComp: raw vs corrected')
-                    cv2.imshow('BiasComp Δn Hist', hist_cmp)
+                    panel = _render_biascomp_panel(
+                        np.asarray(delta_n, np.float32),
+                        np.asarray(delta_n_corr, np.float32),
+                        title='BiasComp Δn (raw → corrected)',
+                        width=960, height=840, bins=48
+                    )
+                    cv2.imshow('BiasComp Δn Hist', panel)
 
             # 12) 导出/截图/分辨率调节
             key = cv2.waitKey(1) & 0xFF
