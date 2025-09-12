@@ -119,6 +119,21 @@ class GUIConfig:
     dump_quicklook: bool = True
     dump_report: bool = True
 
+    # ====== 新增：平面展平/拟合 ======
+    plane_enable: bool = True
+    plane_ransac_thresh_mm: float = 0.8
+    plane_ransac_iters: int = 500
+    plane_sample_cap: int = 120000
+
+    # ====== 新增：可视化/调试 ======
+    draw_normal_probes: bool = True
+    arrow_stride: int = 12
+    debug_normals_window: bool = True
+    debug_normals_stride: int = 25
+    debug_normals_max: int = 40
+    debug_normals_len_mm: Optional[float] = None
+    debug_normals_text: bool = True
+
     def to_core_params(self) -> Dict[str, Any]:
         """把 GUIConfig 合并到 core.PARAMS 的深拷贝里，返回新 dict。"""
         cfg = json.loads(json.dumps(core.PARAMS))  # 深复制（避免直接引用）
@@ -186,6 +201,20 @@ class GUIConfig:
                 "enable": bool(self.bias_enable),
                 "path": self.bias_path,
             },
+            # 平面展平/拟合
+            "plane_enable": bool(self.plane_enable),
+            "plane_ransac_thresh_mm": float(self.plane_ransac_thresh_mm),
+            "plane_ransac_iters": int(self.plane_ransac_iters),
+            "plane_sample_cap": int(self.plane_sample_cap),
+
+            # 调试/可视化（与 core.PARAMS 命名一致）
+            "draw_normal_probes": bool(self.draw_normal_probes),
+            "arrow_stride": int(self.arrow_stride),
+            "debug_normals_window": bool(self.debug_normals_window),
+            "debug_normals_stride": int(self.debug_normals_stride),
+            "debug_normals_max": int(self.debug_normals_max),
+            "debug_normals_len_mm": (None if self.debug_normals_len_mm is None else float(self.debug_normals_len_mm)),
+            "debug_normals_text": bool(self.debug_normals_text),
         })
         return cfg
 
@@ -445,6 +474,17 @@ class AlignController:
             except Exception:
                 panel = None
 
+        # 顶视图与最近表面（单独页显示）
+        vis_top_only = core.render_topdown(height, mask_top, origin_xy, pix_mm, gcode_xy=None)
+        nearest_vis = cv2.cvtColor(nearest_mask, cv2.COLOR_GRAY2BGR)
+
+        # 指标卡
+        metrics = dict(
+            valid_ratio=float(np.count_nonzero(valid_mask)) / max(1, g_xy.shape[0]),
+            dev_mean=dev_mean, dev_median=dev_med, dev_p95=dev_p95,
+            plane_inlier_ratio=float(inlier_ratio) if np.isfinite(inlier_ratio) else float('nan'),
+            longest_missing_mm=float(longest_mm)
+        )
         # 缓存导出所需
         self.last = dict(
             cfg=cfg, g_xy=g_xy, N_ref=N_ref, s_ref=s_ref, delta_n=delta_n,
@@ -452,6 +492,10 @@ class AlignController:
             origin_xy=origin_xy, pix_mm=pix_mm,
             vis_cmp=vis_cmp, vis_probe=vis_probe, hist_panel=panel,
             feed=feed,
+            vis_top=vis_top_only,
+            vis_nearest=nearest_vis,
+            metrics=metrics,
+
         )
 
         return self.last

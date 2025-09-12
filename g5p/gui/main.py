@@ -12,13 +12,15 @@ PyQt5 GUI 入口：
 from __future__ import annotations
 import os, sys, json, threading
 from typing import Optional
+# 顶部 import 区域补充
+from PyQt5.QtWidgets import QScrollArea, QSizePolicy, QFrame
 
 # 添加当前目录到路径，确保能找到controller模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
 if current_dir not in sys.path:
     sys.path.insert(0, current_dir)
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QMainWindow, QFileDialog, QMessageBox,
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QLineEdit, QCheckBox,
@@ -75,9 +77,44 @@ class MainWindow(QMainWindow):
         root.setChildrenCollapsible(False)
         self.setCentralWidget(root)
 
-        # 左侧：参数
-        left = QWidget(); lv = QVBoxLayout(left); lv.setContentsMargins(8,8,8,8); lv.setSpacing(8)
-        root.addWidget(left)
+        # 左列真实容器：所有参数组都加到 left_body（原来加到 lv 的代码不变）
+        left_body = QWidget()
+        lv = QVBoxLayout(left_body)
+        lv.setContentsMargins(8, 8, 8, 8)
+        lv.setSpacing(8)
+        # 1) 左栏不要被压扁
+        left_body.setMinimumWidth(320)  # 或者 left_scroll.setMinimumWidth(320)
+
+        # 2) 控制分配策略：右侧更“贪”，但左侧保底
+        root.setCollapsible(0, False)  # 左右都不可被完全折叠
+        root.setCollapsible(1, False)
+        root.setStretchFactor(0, 0)  # 左：权重小一些
+        root.setStretchFactor(1, 1)  # 右：权重大一些
+
+        # 3) 设定一个合适的初始宽度（需要在窗口显示后再设，避免被布局覆盖）
+        self.resize(1360, 860)  # 可按需调整窗口默认大小
+        QTimer.singleShot(0, lambda: root.setSizes([380, max(700, self.width() - 380)]))
+
+        #  滚动区包装
+        left_scroll = QScrollArea()
+        left_scroll.setWidget(left_body)
+        left_scroll.setWidgetResizable(True)  # 关键：随窗口变化自适应
+        left_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)  # 只竖向滚
+        left_scroll.setFrameShape(QFrame.NoFrame)
+
+
+        # 把滚动区挂到分割器
+        # 左栏顶层容器：上=scroll，下=footer
+        left_col = QWidget()
+        left_col_v = QVBoxLayout(left_col)
+        left_col_v.setContentsMargins(0, 0, 0, 0)
+        left_col_v.setSpacing(0)
+
+        # 上：滚动区（占满可用空间）
+        left_col_v.addWidget(left_scroll, 1)
+
+        # 先把左栏放进分割器（页脚稍后再 add）
+        root.addWidget(left_col)
 
         # 文件组
         g_file = QGroupBox("文件 / 连接")
@@ -118,6 +155,132 @@ class MainWindow(QMainWindow):
         self.spn_pix = QDoubleSpinBox(); self.spn_pix.setRange(0.05, 10.0); self.spn_pix.setDecimals(3); self.spn_pix.setValue(self.ctrl.cfg.pixel_size_mm)
         fr.addRow("pixel_size_mm:", self.spn_pix)
         lv.addWidget(g_roi)
+        # ====== 展平 / 最近表面 ======
+        g_flat = QGroupBox("展平 / 最近表面")
+        ff = QFormLayout(g_flat)
+
+        self.chk_plane = QCheckBox("启用平面展平");
+        self.chk_plane.setChecked(self.ctrl.cfg.plane_enable)
+        self.spn_pransac = QDoubleSpinBox();
+        self.spn_pransac.setRange(0.1, 10.0);
+        self.spn_pransac.setValue(self.ctrl.cfg.plane_ransac_thresh_mm)
+        self.spn_piters = QSpinBox();
+        self.spn_piters.setRange(50, 5000);
+        self.spn_piters.setValue(self.ctrl.cfg.plane_ransac_iters)
+        self.spn_pcap = QSpinBox();
+        self.spn_pcap.setRange(1000, 500000);
+        self.spn_pcap.setValue(self.ctrl.cfg.plane_sample_cap)
+        self.cmb_zsel = QComboBox();
+        self.cmb_zsel.addItems(["max", "min"]);
+        self.cmb_zsel.setCurrentText(self.ctrl.cfg.z_select)
+        self.spn_qlo = QDoubleSpinBox();
+        self.spn_qlo.setRange(0.0, 50.0);
+        self.spn_qlo.setDecimals(1);
+        self.spn_qlo.setValue(self.ctrl.cfg.nearest_qlo)
+        self.spn_qhi = QDoubleSpinBox();
+        self.spn_qhi.setRange(50.0, 100.0);
+        self.spn_qhi.setDecimals(1);
+        self.spn_qhi.setValue(self.ctrl.cfg.nearest_qhi)
+        self.spn_dmargin = QDoubleSpinBox();
+        self.spn_dmargin.setRange(0.1, 50.0);
+        self.spn_dmargin.setValue(self.ctrl.cfg.depth_margin_mm)
+        self.spn_openk = QSpinBox();
+        self.spn_openk.setRange(0, 31);
+        self.spn_openk.setValue(self.ctrl.cfg.morph_open)
+        self.spn_closek = QSpinBox();
+        self.spn_closek.setRange(0, 31);
+        self.spn_closek.setValue(self.ctrl.cfg.morph_close)
+        self.spn_minarea = QSpinBox();
+        self.spn_minarea.setRange(1, 100000);
+        self.spn_minarea.setValue(self.ctrl.cfg.min_component_area_px)
+
+        # tooltips（中文说明）
+        self.chk_plane.setToolTip("开启平面拟合并展平高度图，提高最近表面稳定性；若工件平整，建议开启。")
+        self.spn_pransac.setToolTip("RANSAC 内点阈值 mm；值越大越宽松（默认 0.8mm）。")
+        self.spn_piters.setToolTip("RANSAC 迭代次数；越大越稳，越慢（默认 500）。")
+        self.spn_pcap.setToolTip("RANSAC 采样点上限，控制耗时（默认 120k）。")
+        self.cmb_zsel.setToolTip("最近表面选取：max=更靠近相机/更高处；min=更靠近下方。")
+        self.spn_qlo.setToolTip("分位下界（%）；与上界一起限定取层范围。")
+        self.spn_qhi.setToolTip("分位上界（%）；常用 95~99。")
+        self.spn_dmargin.setToolTip("相对参考层的厚度边界（mm），越大越宽。")
+        self.spn_openk.setToolTip("开运算核大小（像素）；去小噪点。0=关闭。")
+        self.spn_closek.setToolTip("闭运算核大小（像素）；补小孔洞。0=关闭。")
+        self.spn_minarea.setToolTip("连通域保留的最小面积；避免误检。")
+
+        ff.addRow(self.chk_plane)
+        ff.addRow("plane_ransac_thresh_mm:", self.spn_pransac)
+        ff.addRow("plane_ransac_iters:", self.spn_piters)
+        ff.addRow("plane_sample_cap:", self.spn_pcap)
+        ff.addRow("z_select:", self.cmb_zsel)
+        ff.addRow("nearest_qlo%:", self.spn_qlo)
+        ff.addRow("nearest_qhi%:", self.spn_qhi)
+        ff.addRow("depth_margin_mm:", self.spn_dmargin)
+        ff.addRow("morph_open(px):", self.spn_openk)
+        ff.addRow("morph_close(px):", self.spn_closek)
+        ff.addRow("min_component_area_px:", self.spn_minarea)
+        lv.addWidget(g_flat)
+
+        # ====== 调试 / 可视化 ======
+        g_dbg = QGroupBox("调试 / 可视化")
+        fd = QFormLayout(g_dbg)
+        self.chk_probe = QCheckBox("显示法向采样线");
+        self.chk_probe.setChecked(self.ctrl.cfg.draw_normal_probes)
+        self.spn_arrow = QSpinBox();
+        self.spn_arrow.setRange(1, 200);
+        self.spn_arrow.setValue(self.ctrl.cfg.arrow_stride)
+        self.chk_dbgwin = QCheckBox("法线-交点小窗");
+        self.chk_dbgwin.setChecked(self.ctrl.cfg.debug_normals_window)
+        self.spn_dbgstr = QSpinBox();
+        self.spn_dbgstr.setRange(1, 200);
+        self.spn_dbgstr.setValue(self.ctrl.cfg.debug_normals_stride)
+        self.spn_dbgmax = QSpinBox();
+        self.spn_dbgmax.setRange(1, 200);
+        self.spn_dbgmax.setValue(self.ctrl.cfg.debug_normals_max)
+        self.spn_dbgl = QDoubleSpinBox();
+        self.spn_dbgl.setRange(0.0, 100.0);
+        self.spn_dbgl.setDecimals(2)
+        self.spn_dbgl.setValue(self.ctrl.cfg.debug_normals_len_mm or 0.0)
+        self.chk_dbgtext = QCheckBox("在交点标注 Δn");
+        self.chk_dbgtext.setChecked(self.ctrl.cfg.debug_normals_text)
+
+        self.chk_probe.setToolTip("在叠加图上显示每个采样点的法向扫描线，用于查错对齐。")
+        self.spn_arrow.setToolTip("偏差箭头抽样步长（点）；数值越大，箭头越稀疏。")
+        self.chk_dbgwin.setToolTip("开启小窗：稀疏显示法线与交点，便于核查。")
+        self.spn_dbgstr.setToolTip("小窗法线抽样步长。")
+        self.spn_dbgmax.setToolTip("小窗最多显示的法线根数。")
+        self.spn_dbgl.setToolTip("小窗法线长度（mm）；0=自动。")
+        self.chk_dbgtext.setToolTip("是否在交点旁标注 Δn 文本。")
+
+        fd.addRow(self.chk_probe)
+        fd.addRow("arrow_stride:", self.spn_arrow)
+        fd.addRow(self.chk_dbgwin)
+        fd.addRow("debug_stride:", self.spn_dbgstr)
+        fd.addRow("debug_max:", self.spn_dbgmax)
+        fd.addRow("debug_len_mm(0=auto):", self.spn_dbgl)
+        fd.addRow(self.chk_dbgtext)
+        lv.addWidget(g_dbg)
+
+        # ====== 参数说明（速查） ======
+        g_help = QGroupBox("参数说明（速查）")
+        vh = QVBoxLayout(g_help)
+        self.txt_help = QTextEdit();
+        self.txt_help.setReadOnly(True)
+        self.txt_help.setHtml("""
+              <h3>核心参数解释</h3>
+              <ul>
+                <li><b>plane_ransac_thresh_mm</b>：平面拟合内点阈值（越大越宽松）。</li>
+                <li><b>z_select / nearest_qlo/qhi / depth_margin_mm</b>：决定“最近表面”所在高度带。</li>
+                <li><b>morph_open/close</b>：形态学净化，去噪与补洞。</li>
+                <li><b>guide_halfwidth_mm</b>：法向扫描半宽；太小易丢；太大易误匹配。</li>
+                <li><b>guide_smooth_win / curvature_adaptive</b>：平滑窗口与曲率自适应，抑制抖动并保护拐角。</li>
+                <li><b>guide_max_grad_mm_per_mm</b>：梯度限幅，限制相邻点 Δn 跳变。</li>
+                <li><b>max_gap_pts</b>：仅对短缺口插值；长缺口由 Guard 拦截。</li>
+                <li><b>occ_*</b>：遮挡区配置；可在遮挡内按 G 代码合成环带掩码。</li>
+                <li><b>Guard</b>：导出安全门槛（命中率、p95、平面内点率、长缺失、梯度）。</li>
+              </ul>
+              """)
+        vh.addWidget(self.txt_help)
+        lv.addWidget(g_help)
 
         # 遮挡组
         g_occ = QGroupBox("遮挡 (固定设备区域)")
@@ -172,15 +335,28 @@ class MainWindow(QMainWindow):
         lv.addWidget(g_out)
 
         # 操作按钮
-        btns = QHBoxLayout()
+        foot = QFrame()
+        foot.setFrameShape(QFrame.StyledPanel)
+        foot.setStyleSheet("QFrame { background: #fafafa; border-top: 1px solid #d9d9d9; }")
+        foot.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        btns = QHBoxLayout(foot)
+        btns.setContentsMargins(8, 6, 8, 6)
+        btns.setSpacing(8)
         self.btn_preview = QPushButton("预览单帧")
-        self.btn_export  = QPushButton("导出纠偏 (CSV + GCode)")
-        self.btn_bias    = QPushButton("保存 BiasComp (当前帧)")
+        self.btn_export = QPushButton("导出纠偏 (CSV + GCode)")
+        self.btn_bias = QPushButton("保存 BiasComp (当前帧)")
+
         self.btn_preview.clicked.connect(self.on_preview)
         self.btn_export.clicked.connect(self.on_export)
         self.btn_bias.clicked.connect(self.on_save_bias)
-        btns.addWidget(self.btn_preview); btns.addWidget(self.btn_export); btns.addWidget(self.btn_bias)
-        lv.addLayout(btns)
+
+        btns.addWidget(self.btn_preview)
+        btns.addWidget(self.btn_export)
+        btns.addWidget(self.btn_bias)
+
+        # 把页脚加到左栏容器的底部（固定，不随滚动）
+        left_col_v.addWidget(foot, 0)
+        # lv.addLayout(btns)
         lv.addStretch(1)
 
         # 右侧：图像
@@ -198,6 +374,27 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(w2, "法线采样")
         self.tabs.addTab(w3, "Bias 直方图")
         rv.addWidget(self.tabs, 1)
+
+        self.lbl_top = QLabel("顶视高度图");
+        self.lbl_top.setAlignment(Qt.AlignCenter);
+        self.lbl_top.setMinimumHeight(240)
+        self.lbl_nearest = QLabel("最近表面掩码");
+        self.lbl_nearest.setAlignment(Qt.AlignCenter);
+        self.lbl_nearest.setMinimumHeight(240)
+        w4 = QWidget();
+        v4 = QVBoxLayout(w4);
+        v4.addWidget(self.lbl_top)
+        w5 = QWidget();
+        v5 = QVBoxLayout(w5);
+        v5.addWidget(self.lbl_nearest)
+        self.tabs.addTab(w4, "顶视高度")
+        self.tabs.addTab(w5, "最近表面")
+
+        # 指标卡
+        self.lbl_metrics = QLabel();
+        self.lbl_metrics.setAlignment(Qt.AlignLeft)
+        self.lbl_metrics.setStyleSheet("QLabel { font-family: Consolas, Menlo, monospace; }")
+        rv.addWidget(self.lbl_metrics)
 
         # 使用提示
         tips = QLabel(
@@ -279,6 +476,29 @@ class MainWindow(QMainWindow):
         c.offset_csv = self.ed_csv.text().strip()
         c.corrected_gcode = self.ed_gc.text().strip()
 
+        # 平面/展平
+        c.plane_enable = self.chk_plane.isChecked()
+        c.plane_ransac_thresh_mm = float(self.spn_pransac.value())
+        c.plane_ransac_iters = int(self.spn_piters.value())
+        c.plane_sample_cap = int(self.spn_pcap.value())
+        c.z_select = self.cmb_zsel.currentText()
+        c.nearest_qlo = float(self.spn_qlo.value())
+        c.nearest_qhi = float(self.spn_qhi.value())
+        c.depth_margin_mm = float(self.spn_dmargin.value())
+        c.morph_open = int(self.spn_openk.value())
+        c.morph_close = int(self.spn_closek.value())
+        c.min_component_area_px = int(self.spn_minarea.value())
+
+        # 调试/可视化
+        c.draw_normal_probes = self.chk_probe.isChecked()
+        c.arrow_stride = int(self.spn_arrow.value())
+        c.debug_normals_window = self.chk_dbgwin.isChecked()
+        c.debug_normals_stride = int(self.spn_dbgstr.value())
+        c.debug_normals_max = int(self.spn_dbgmax.value())
+        val_len = float(self.spn_dbgl.value())
+        c.debug_normals_len_mm = (None if abs(val_len) < 1e-9 else val_len)
+        c.debug_normals_text = self.chk_dbgtext.isChecked()
+
     # ---- 槽：相机状态 ----
     def on_camera_status(self, msg: str):
         if msg == "camera_ready":
@@ -301,17 +521,32 @@ class MainWindow(QMainWindow):
     def on_preview_done(self, out: dict):
         self.btn_preview.setEnabled(True)
         self.statusBar().showMessage("预览完成")
-        # 更新三张图
-        for (key, label) in [("vis_cmp", self.lbl_vis), ("vis_probe", self.lbl_probe), ("hist_panel", self.lbl_hist)]:
-            img = out.get(key)
-            if img is not None:
-                q = np_to_qimage(img)
-                if q is not None:
-                    label.setPixmap(QPixmap.fromImage(q).scaled(label.width(), label.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
-                else:
-                    label.setText("(无法显示图像)")
-            else:
-                label.setText("(无图像)")
+
+        def set_img(label: QLabel, img):
+            if img is None: label.setText("(无图像)"); return
+            q = np_to_qimage(img)
+            if q is None: label.setText("(无法显示图像)"); return
+            label.setPixmap(QPixmap.fromImage(q).scaled(label.width(), label.height(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+
+        set_img(self.lbl_vis, out.get("vis_cmp"))
+        set_img(self.lbl_probe, out.get("vis_probe"))
+        set_img(self.lbl_hist, out.get("hist_panel"))
+        set_img(self.lbl_top, out.get("vis_top"))
+        set_img(self.lbl_nearest, out.get("vis_nearest"))
+
+        m = out.get("metrics", {})
+        if m:
+            self.lbl_metrics.setText(
+                "valid_ratio: {:>5.2f}    p95(mm): {:>6.3f}    plane_inlier: {:>5}\n"
+                "longest_missing(mm): {:>6.2f}".format(
+                    float(m.get("valid_ratio", 0.0)),
+                    float(m.get("dev_p95", 0.0)),
+                    ("{:.2f}".format(m["plane_inlier_ratio"]) if str(m.get("plane_inlier_ratio"))!="nan" else "nan"),
+                    float(m.get("longest_missing_mm", 0.0))
+                )
+            )
+        else:
+            self.lbl_metrics.setText("")
 
     def on_preview_failed(self, err: str):
         self.btn_preview.setEnabled(True)
