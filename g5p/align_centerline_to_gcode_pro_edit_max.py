@@ -615,10 +615,10 @@ def render_normals_probe_window(base_img: np.ndarray,
                 cv2.putText(vis, txt, tpos, cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 0, 255), 1, cv2.LINE_AA)
 
     # 角落图例
-    cv2.rectangle(vis, (8, 8), (216, 56), (0, 0, 0), -1)
-    cv2.putText(vis, "white: G-code point", (14, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
-    cv2.putText(vis, "cyan: normal",        (14, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 200, 255), 1, cv2.LINE_AA)
-    cv2.putText(vis, "magenta: intersection",(14, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
+    # cv2.rectangle(vis, (8, 8), (216, 56), (0, 0, 0), -1)
+    # cv2.putText(vis, "white: G-code point", (14, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+    # cv2.putText(vis, "cyan: normal",        (14, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (180, 200, 255), 1, cv2.LINE_AA)
+    # cv2.putText(vis, "magenta: intersection",(14, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 0, 255), 1, cv2.LINE_AA)
 
     return vis
 
@@ -1438,6 +1438,14 @@ def save_offset_csv(s: np.ndarray, delta_n: np.ndarray, dxy: np.ndarray, out_csv
         for i in range(len(delta_n)):
             f.write(f"{s[i]:.6f},{delta_n[i]:.6f},{dxy[i,0]:.6f},{dxy[i,1]:.6f}\n")
     print('[SAVE]', out_csv)
+def save_ref_and_offsets_csv(s: np.ndarray, ref_xy: np.ndarray, dxy: np.ndarray, out_csv: Union[str, Path]):
+    out_csv = Path(out_csv); out_csv.parent.mkdir(parents=True, exist_ok=True)
+    with out_csv.open('w', encoding='utf-8') as f:
+        f.write('s_mm,x_ref_mm,y_ref_mm,dx_mm,dy_mm,x_corr_mm,y_corr_mm\n')
+        for i in range(len(s)):
+            xr, yr = ref_xy[i]; dx, dy = dxy[i]
+            f.write(f"{s[i]:.6f},{xr:.6f},{yr:.6f},{dx:.6f},{dy:.6f},{xr+dx:.6f},{yr+dy:.6f}\n")
+    print('[SAVE]', out_csv)
 
 def write_linear_gcode(xy: np.ndarray, out_path: Union[str, Path], feed: Optional[float]=None):
     out_path = Path(out_path); out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2090,7 +2098,9 @@ def run():
                     dxy_vec = (N_ref * delta_n_apply[:,None])
 
                     # === 6) 导出 CSV & Gcode ===
+                    dxy_vec = (N_ref * delta_n_apply[:, None])
                     save_offset_csv(s_ref, delta_n_apply, dxy_vec, PARAMS['offset_csv'])
+                    save_ref_and_offsets_csv(s_ref, g_xy, dxy_vec, Path(PARAMS['out_dir']) / 'offset_table_full.csv')
                     write_linear_gcode(g_xy_corr, PARAMS['corrected_gcode'], feed=feed)
                     if PARAMS.get('export_centerline', False):
                         write_linear_gcode((g_xy + N_ref * np.nan_to_num(delta_n)[:,None])[:len(g_xy_corr)],
