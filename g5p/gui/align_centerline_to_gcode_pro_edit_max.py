@@ -83,7 +83,7 @@ PARAMS = dict(
         # 在机床坐标系 XY(mm) 中给出一个或多个多边形（顺/逆时针均可）
         # 示例：左下角 62x52mm 矩形（请按现场一次性标定后填写）
         polys=[
-            [(-50,-50), (30,-30), (30,200), (-50,200)]
+            [(-50,-50), (30,-30), (30,70), (-50,70)]
         ],
         dilate_mm=3.0,  # 安全扩张，确保完全覆盖遮挡
         synthesize_band=True,  # 是否在遮挡区内按 G 代码合成环带掩码
@@ -373,6 +373,85 @@ def curvature_kappa(poly: np.ndarray) -> np.ndarray:
         kappa[i] = float(np.linalg.norm(dT) / ds)
     kappa[0] = kappa[1]; kappa[-1] = kappa[-2]
     return kappa
+
+# === [NEW] per-index 偏差重用：拐角锁定的分段重采样 ===
+def _detect_corner_knots_from_tangent(T_ref, ang_thresh_deg=25.0, min_gap_pts=3):
+    """
+    根据相邻切向夹角检测拐角，返回分段端点索引列表（含首尾）。
+    """
+    import numpy as _np
+    t = _np.asarray(T_ref, _np.float32)
+    n = t.shape[0]
+    if n < 3:
+        return [0, max(0, n-1)]
+    cosang = _np.clip((t[:-1] * t[1:]).sum(axis=1), -1.0, 1.0)
+    ang = _np.degrees(_np.arccos(cosang))
+    idx = _np.where(ang >= float(ang_thresh_deg))[0] + 1  # 顶点落在后一点
+    # 去除过近的拐角
+    keep, last = [], -10**9
+    for i in idx.tolist():
+        if i - last >= int(min_gap_pts):
+            keep.append(int(i)); last = int(i)
+    knots = [0] + keep + [n-1]
+    return sorted(set(knots))
+
+def _resample_per_index_bias_for_length(delta_bias_mm, n_out):
+    """
+    全局归一化弧长的 1D 线性插值（仅作为兜底，不跨段混合）。
+    """
+    import numpy as _np
+    b = _np.asarray(delta_bias_mm, _np.float32).ravel()
+    n_in = int(b.size)
+    if n_in <= 1 or n_out <= 0:
+        return _np.zeros((max(0, n_out),), _np.float32)
+    if n_in == n_out:
+        return b.copy()
+    t_in  = _np.linspace(0.0, 1.0, n_in,  dtype=_np.float32)
+    t_out = _np.linspace(0.0, 1.0, n_out, dtype=_np.float32)
+    return _np.interp(t_out, t_in, b).astype(_np.float32)
+
+def _remap_knots_index(knots_src, n_src, n_dst):
+    """
+    把源端点索引（基于 n_src）按比例映射到目标长度 n_dst 的索引。
+    """
+    import numpy as _np
+    if n_src <= 1 or n_dst <= 0:
+        return [0, max(0, n_dst-1)]
+    out = []
+    for k in knots_src:
+        v = int(round(k * (n_dst - 1) / max(1, n_src - 1)))
+        out.append(int(_np.clip(v, 0, n_dst - 1)))
+    # 保证首尾存在
+    if out[0] != 0:
+        out = [0] + out
+    if out[-1] != (n_dst - 1):
+        out = out + [n_dst - 1]
+    return sorted(set(out))
+
+def _resample_per_index_bias_piecewise(arr_in, n_out, knots_in, knots_out):
+    """
+    在给定输入/输出分段端点（含首尾，等长）约束下逐段线性插值，段间绝不混合。
+    """
+    import numpy as _np
+    b = _np.asarray(arr_in, _np.float32).ravel()
+    n_in = b.size
+    out = _np.zeros((int(n_out),), _np.float32)
+    if n_in <= 1 or n_out <= 0 or len(knots_in) < 2 or len(knots_in) != len(knots_out):
+        return out
+    K = len(knots_in) - 1
+    for j in range(K):
+        a0, a1 = int(knots_in[j]),  int(knots_in[j+1])
+        b0, b1 = int(knots_out[j]), int(knots_out[j+1])
+        seg_in = b[max(0, a0):min(n_in-1, a1)+1]
+        m_in   = seg_in.size
+        m_out  = max(0, b1 - b0 + 1)
+        if m_in <= 1 or m_out <= 0:
+            continue
+        t_in  = _np.linspace(0.0, 1.0, m_in,  dtype=_np.float32)
+        t_out = _np.linspace(0.0, 1.0, m_out, dtype=_np.float32)
+        out[b0:b1+1] = _np.interp(t_out, t_in, seg_in).astype(_np.float32)
+    return out
+
 
 def compute_corner_ignore_mask(poly: np.ndarray,
                                angle_thr_deg: float,
@@ -1705,15 +1784,39 @@ def run():
             step_ok = abs(float(bc.get('guide_step_mm', step_mm)) - float(step_mm)) < 1e-9
             if step_ok and g_xy.size > 1:
                 mode = str(bc.get('mode', 'vector')).lower()
-                if mode in ('per_index', 'table') and int(bc.get('n_points', len(g_xy))) == len(g_xy):
-                    bias_arr = np.asarray(bc['delta_bias_mm'], dtype=np.float32)
+                if mode in ('per_index', 'table'):
+                    arr = np.asarray(bc.get('delta_bias_mm', []), dtype=np.float32)
+                    if arr.size == len(g_xy):
+                        bias_arr = arr
+                    else:
+                        # --- [NEW] per-index → 拐角锁定分段重采样 ---
+                        thr = float(PARAMS.get('corner_angle_thr_deg', 35.0))
+                        T_cur, _ = tangent_normal(g_xy)
+                        k_cur = _detect_corner_knots_from_tangent(T_cur, ang_thresh_deg=thr, min_gap_pts=3)
+
+                        gpath = bc.get('gcode_path', '')
+                        step_cal = float(bc.get('guide_step_mm', step_mm))
+                        bias_arr = None
+                        if gpath:
+                            g_cal_raw, _ = parse_gcode_xy(gpath, step_mm=step_cal)
+                            g_cal = resample_polyline(g_cal_raw,
+                                                      max(0.2, step_cal)) if g_cal_raw.size > 0 else g_cal_raw
+                            if g_cal.size > 0:
+                                T_cal, _ = tangent_normal(g_cal)
+                                k_cal = _detect_corner_knots_from_tangent(T_cal, ang_thresh_deg=thr, min_gap_pts=3)
+                                # 把“标定层拐角索引（基于 g_cal 长度）”映射到“arr.size”
+                                k_in = _remap_knots_index(k_cal, len(g_cal), arr.size)
+                                if len(k_in) == len(k_cur) and arr.size >= 2:
+                                    bias_arr = _resample_per_index_bias_piecewise(arr, len(g_xy), k_in, k_cur)
+                        if bias_arr is None:
+                            bias_arr = _resample_per_index_bias_for_length(arr, len(g_xy))
+                        print(f"[BIAS][vis] per_index resample: {arr.size}->{len(g_xy)} (segments={len(k_cur) - 1})")
                 else:
                     # 向量模型：bias_i = dot(v, N_ref[i]) + b
                     v = np.asarray(bc.get('v', [0.0, 0.0]), dtype=np.float32)
                     b0 = float(bc.get('b', 0.0))
                     T_ref, N_ref = tangent_normal(g_xy)  # 确保已得到法向
                     bias_arr = (N_ref[:, 0] * v[0] + N_ref[:, 1] * v[1] + b0).astype(np.float32)
-
                 # 与拐点忽略策略一致：忽略区间的补偿置零，避免跨段传播
                 if (ignore_mask is not None) and (len(ignore_mask) == len(bias_arr)):
                     bias_arr = bias_arr.copy()
@@ -2021,25 +2124,48 @@ def run():
                             with open(bc_cfg.get('path', 'bias_comp.json'), 'r', encoding='utf-8') as f:
                                 bc = json.load(f)
 
-                            # 步长一致性；vector 模式不强制点数一致
                             step_ok = abs(float(bc.get('guide_step_mm', PARAMS['guide_step_mm'])) - float(
                                 PARAMS['guide_step_mm'])) < 1e-9
                             mode = str(bc.get('mode', 'vector')).lower()
-                            if mode in ('per_index', 'table'):
-                                n_ok = int(bc.get('n_points', len(delta_n_meas))) == len(delta_n_meas)
-                            else:
-                                n_ok = True
 
-                            if step_ok and n_ok:
+                            if step_ok:
                                 if mode in ('per_index', 'table'):
-                                    bias = np.asarray(bc['delta_bias_mm'], dtype=np.float32)
+                                    arr = np.asarray(bc.get('delta_bias_mm', []), dtype=np.float32)
+                                    if arr.size == len(delta_n_meas):
+                                        bias = arr
+                                    else:
+                                        # --- [NEW] per-index → 拐角锁定分段重采样 ---
+                                        thr = float(PARAMS.get('corner_angle_thr_deg', 35.0))
+                                        # T_ref 已在 run() 顶部计算；若不在作用域，安全再算一次
+                                        T_here, _ = tangent_normal(g_xy)
+                                        k_cur = _detect_corner_knots_from_tangent(T_here, ang_thresh_deg=thr,
+                                                                                  min_gap_pts=3)
+
+                                        gpath = bc.get('gcode_path', '')
+                                        step_cal = float(bc.get('guide_step_mm', PARAMS['guide_step_mm']))
+                                        bias = None
+                                        if gpath:
+                                            g_cal_raw, _ = parse_gcode_xy(gpath, step_mm=step_cal)
+                                            g_cal = resample_polyline(g_cal_raw, max(0.2,
+                                                                                     step_cal)) if g_cal_raw.size > 0 else g_cal_raw
+                                            if g_cal.size > 0:
+                                                T_cal, _ = tangent_normal(g_cal)
+                                                k_cal = _detect_corner_knots_from_tangent(T_cal, ang_thresh_deg=thr,
+                                                                                          min_gap_pts=3)
+                                                k_in = _remap_knots_index(k_cal, len(g_cal), arr.size)
+                                                if len(k_in) == len(k_cur) and arr.size >= 2:
+                                                    bias = _resample_per_index_bias_piecewise(arr, len(delta_n_meas),
+                                                                                              k_in, k_cur)
+                                        if bias is None:
+                                            bias = _resample_per_index_bias_for_length(arr, len(delta_n_meas))
+                                        print(f"[BIAS] per_index resample: {arr.size}->{len(delta_n_meas)}")
                                 else:
                                     # 向量模型：bias_i = dot(v, N_ref[i]) + b
                                     v = np.asarray(bc.get('v', [0.0, 0.0]), dtype=np.float32)
                                     b0 = float(bc.get('b', 0.0))
                                     bias = (N_ref[:, 0] * v[0] + N_ref[:, 1] * v[1] + b0).astype(np.float32)
 
-                                # 拐点忽略区间的补偿置零，避免跨段传播
+                                # 拐角忽略区间的补偿置零，避免跨段传播（保持你原逻辑）
                                 if ('ignore_mask' in locals()) and (ignore_mask is not None) and (
                                         len(ignore_mask) == len(bias)):
                                     bias = bias.copy()
@@ -2052,7 +2178,7 @@ def run():
                                     float(np.nanmean(bias)), float(np.nanpercentile(np.abs(bias), 95))
                                 ))
                             else:
-                                print("[BIAS] skipped: guide_step或长度不匹配")
+                                print("[BIAS] skipped: guide_step不匹配")
                     except Exception as _e:
                         print("[BIAS] failed:", _e)
                     # === [ADD END] ===
