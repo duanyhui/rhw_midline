@@ -390,6 +390,14 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(w4, "顶视高度")
         self.tabs.addTab(w5, "最近表面")
 
+        self.lbl_corr = QLabel("纠偏叠加预览");
+        self.lbl_corr.setAlignment(Qt.AlignCenter);
+        self.lbl_corr.setMinimumHeight(360)
+        w6 = QWidget();
+        v6 = QVBoxLayout(w6);
+        v6.addWidget(self.lbl_corr)
+        self.tabs.addTab(w6, "纠偏叠加")
+
         # 指标卡
         self.lbl_metrics = QLabel();
         self.lbl_metrics.setAlignment(Qt.AlignLeft)
@@ -533,6 +541,7 @@ class MainWindow(QMainWindow):
         set_img(self.lbl_hist, out.get("hist_panel"))
         set_img(self.lbl_top, out.get("vis_top"))
         set_img(self.lbl_nearest, out.get("vis_nearest"))
+        set_img(self.lbl_corr, out.get("vis_corr"))
 
         m = out.get("metrics", {})
         if m:

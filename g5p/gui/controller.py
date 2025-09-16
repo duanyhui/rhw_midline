@@ -26,6 +26,59 @@ import cv2
 # === 导入现有算法模块（保持不改动源文件） ===
 import align_centerline_to_gcode_pro_edit_max as core
 
+# ===== Fallbacks: 当 core 缺少私有函数时，使用本地实现 =====
+def _fallback_detect_corner_knots_from_tangent(T, ang_thresh_deg=35.0, min_gap_pts=3):
+    """根据相邻切向量夹角检测拐点；返回索引（含首尾）。"""
+    import numpy as _np
+    n = len(T)
+    if n <= 1:
+        return [0] if n else []
+    ang = _np.arctan2(T[:,1], T[:,0])
+    d = _np.diff(ang)
+    d = (d + _np.pi) % (2*_np.pi) - _np.pi  # wrap to [-pi, pi]
+    jumps = _np.where(_np.abs(_np.degrees(d)) >= float(ang_thresh_deg))[0] + 1
+    keep = []
+    for i in jumps:
+        if not keep or (i - keep[-1]) >= int(max(1, min_gap_pts)):
+            keep.append(int(i))
+    knots = [0] + keep + [n-1]
+    return sorted(set([k for k in knots if 0 <= k < n]))
+
+def _fallback_remap_knots_index(k_cal, n_cal, n_in):
+    """把标定轨迹结点索引映射到 bias 数组索引空间（线性比例）"""
+    if n_cal <= 1 or n_in <= 1:
+        return [0, max(0, n_in-1)]
+    return [int(round(k*(n_in-1)/(n_cal-1))) for k in k_cal]
+
+def _fallback_resample_per_index_bias_piecewise(arr, target_len, k_in, k_cur):
+    """按对应结点分段线性插值，把 per-index bias 重采样到 target_len。"""
+    import numpy as _np
+    arr = _np.asarray(arr, _np.float32).ravel()
+    out = _np.empty(int(target_len), _np.float32)
+    if len(k_cur) < 2 or len(k_in) < 2:
+        return _fallback_resample_per_index_bias_for_length(arr, int(target_len))
+    out[:k_cur[0]+1] = arr[k_in[0]]
+    out[k_cur[-1]:] = arr[k_in[-1]]
+    for (a,b,aa,bb) in zip(k_in[:-1], k_in[1:], k_cur[:-1], k_cur[1:]):
+        if bb <= aa:
+            continue
+        x = _np.linspace(0.0, 1.0, bb-aa+1, dtype=_np.float32)
+        out[aa:bb+1] = (1-x)*arr[a] + x*arr[b]
+    return out
+
+def _fallback_resample_per_index_bias_for_length(arr, target_len):
+    """全长等比例 1D 插值兜底。"""
+    import numpy as _np
+    arr = _np.asarray(arr, _np.float32).ravel()
+    target_len = int(target_len)
+    if arr.size == 0:
+        return _np.zeros(target_len, _np.float32)
+    if arr.size == 1 or target_len <= 1:
+        return _np.full(target_len, float(arr[0]), _np.float32)
+    x_src = _np.linspace(0.0, 1.0, arr.size, dtype=_np.float32)
+    x_dst = _np.linspace(0.0, 1.0, target_len, dtype=_np.float32)
+    return _np.interp(x_dst, x_src, arr).astype(_np.float32)
+
 # ---------- 工具：Qt 图像转换（BGR/灰度 → QImage） ----------
 try:
     from PyQt5.QtGui import QImage
@@ -457,18 +510,13 @@ class AlignController:
             try:
                 with open(self.cfg.bias_path, 'r', encoding='utf-8') as f:
                     bc = json.load(f)
-                mode = str(bc.get('mode', 'vector')).lower()
-                if mode in ('per_index','table') and int(bc.get('n_points', len(g_xy))) == len(g_xy):
-                    bias = np.asarray(bc['delta_bias_mm'], np.float32)
-                else:
-                    v = np.asarray(bc.get('v', [0.0,0.0]), np.float32)
-                    b0 = float(bc.get('b', 0.0))
-                    bias = (N_ref[:,0]*v[0] + N_ref[:,1]*v[1] + b0).astype(np.float32)
-                if ignore_mask is not None and len(ignore_mask) == len(bias):
-                    bias = bias.copy(); bias[ignore_mask] = 0.0
+                bias = self._build_bias_vector(
+                    bc, target_len=len(delta_n),
+                    g_xy=g_xy, N_ref=N_ref, T_ref=T_ref,
+                    ignore_mask=ignore_mask
+                )
                 delta_corr = delta_n.copy()
-                m = np.isfinite(delta_corr)
-                delta_corr[m] = delta_corr[m] - bias[m]
+                delta_corr[np.isfinite(delta_corr)] -= bias[np.isfinite(delta_corr)]
                 panel = core._render_biascomp_panel(np.asarray(delta_n, np.float32), np.asarray(delta_corr, np.float32),
                                                      title='BiasComp Δn (raw → corrected)', width=960, height=480, bins=48)
             except Exception:
@@ -485,6 +533,46 @@ class AlignController:
             plane_inlier_ratio=float(inlier_ratio) if np.isfinite(inlier_ratio) else float('nan'),
             longest_missing_mm=float(longest_mm)
         )
+
+        # --- 用“Bias Corrected”的 Δn 重绘 Centerline vs G-code（无黄线） ---
+        vis_corr = None
+        try:
+            # 1) 计算经过 bias_comp.json 修正后的 delta（Δn_corrected）
+            delta_corr = delta_n.copy()
+            if cfg.get('bias_comp', {}).get('enable', False):
+                with open(cfg['bias_comp']['path'], 'r', encoding='utf-8') as f:
+                    bc = json.load(f)
+                bias = self._build_bias_vector(
+                    bc, target_len=len(delta_corr),
+                    g_xy=g_xy, N_ref=N_ref, T_ref=T_ref,  # T_ref 此前已算过
+                    ignore_mask=ignore_mask
+                )
+                m = np.isfinite(delta_corr)
+                delta_corr[m] = delta_corr[m] - bias[m]
+
+            # 2) 用修正后的 Δn 得到“修正后的实测中轴线”（不做导出那套平滑/限幅）
+            e_n_corr = np.nan_to_num(delta_corr, nan=0.0)
+            centerline_xy_corr = g_xy + N_ref * e_n_corr[:, None]
+
+            # 3) 重画“Centerline vs G-code”叠加（与 vis_cmp 的画法一致，但用修正后的中心线与 Δn）
+            vis_corr = core.draw_deviation_overlay(
+                overlay, origin_xy, pix_mm,
+                g_xy, centerline_xy_corr,
+                e_idx, e_n_corr,
+                arrow_stride=int(cfg['arrow_stride']),
+                draw_probes=cfg.get('draw_normal_probes', True),
+                N_ref=N_ref, valid_mask=valid_mask,
+            )
+            vis_corr = core.draw_machine_axes_overlay(vis_corr, origin_xy, pix_mm)
+
+            # 可选：加一行小标题，便于区分（不需要黄线）
+            cv2.putText(vis_corr, 'Centerline vs G-code (Bias Corrected)',
+                        (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(vis_corr, 'Centerline vs G-code (Bias Corrected)',
+                        (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 1, cv2.LINE_AA)
+        except Exception as _e:
+            print('[WARN] build vis_corr (bias-corrected overlay) failed:', _e)
+
         # 缓存导出所需
         self.last = dict(
             cfg=cfg, g_xy=g_xy, N_ref=N_ref, s_ref=s_ref, delta_n=delta_n,
@@ -495,10 +583,58 @@ class AlignController:
             vis_top=vis_top_only,
             vis_nearest=nearest_vis,
             metrics=metrics,
+            vis_corr=vis_corr,
 
         )
 
         return self.last
+
+    def _build_bias_vector(self, bc: dict, target_len: int,
+                           g_xy: np.ndarray, N_ref: np.ndarray, T_ref: Optional[np.ndarray],
+                           ignore_mask: Optional[np.ndarray]) -> np.ndarray:
+        mode = str(bc.get('mode', 'vector')).lower()
+        if mode in ('per_index', 'table'):
+            arr = np.asarray(bc.get('delta_bias_mm', []), np.float32).ravel()
+            if arr.size == target_len:
+                bias = arr
+            else:
+                # --- 分段重采样（优先） ---
+                thr = float(self.cfg.corner_angle_thr_deg)
+                if T_ref is None:
+                    T_ref, _ = core.tangent_normal(g_xy)
+                detect_knots = getattr(core, '_detect_corner_knots_from_tangent',
+                                       _fallback_detect_corner_knots_from_tangent)
+                k_cur = detect_knots(T_ref, ang_thresh_deg=thr, min_gap_pts=3)
+
+                bias = None
+                gpath = bc.get('gcode_path', '')
+                step_cal = float(bc.get('guide_step_mm', self.cfg.guide_step_mm))
+                if gpath:
+                    g_cal_raw, _ = core.parse_gcode_xy(gpath, step_mm=step_cal)
+                    g_cal = core.resample_polyline(g_cal_raw, max(0.2, step_cal)) if g_cal_raw.size > 0 else g_cal_raw
+                    if g_cal.size > 0:
+                        T_cal, _ = core.tangent_normal(g_cal)
+                        k_cal = detect_knots(T_cal, ang_thresh_deg=thr, min_gap_pts=3)
+                        remap_knots = getattr(core, '_remap_knots_index', _fallback_remap_knots_index)
+                        k_in = remap_knots(k_cal, len(g_cal), arr.size)
+                        if len(k_in) == len(k_cur) and arr.size >= 2:
+                            resample_piece = getattr(core, '_resample_per_index_bias_piecewise',
+                                                     _fallback_resample_per_index_bias_piecewise)
+                            bias = resample_piece(arr, target_len, k_in, k_cur)
+
+                # 兜底：全长等比例重采样
+                if bias is None:
+                    bias = core._resample_per_index_bias_for_length(arr, target_len)
+        else:
+            v = np.asarray(bc.get('v', [0.0, 0.0]), np.float32)
+            b0 = float(bc.get('b', 0.0))
+            bias = (N_ref[:, 0] * v[0] + N_ref[:, 1] * v[1] + b0).astype(np.float32)
+
+        # 与你的忽略策略一致：忽略区间置零
+        if ignore_mask is not None and len(ignore_mask) == len(bias):
+            bias = bias.copy();
+            bias[ignore_mask] = 0.0
+        return bias
 
     # ---- 导出纠偏 ----
     def export_corrected(self) -> Dict[str, Any]:
@@ -516,17 +652,15 @@ class AlignController:
             try:
                 with open(cfg['bias_comp']['path'], 'r', encoding='utf-8') as f:
                     bc = json.load(f)
-                mode = str(bc.get('mode', 'vector')).lower()
-                if mode in ('per_index','table') and int(bc.get('n_points', len(delta_n_meas))) == len(delta_n_meas):
-                    bias = np.asarray(bc['delta_bias_mm'], np.float32)
-                else:
-                    v = np.asarray(bc.get('v', [0.0,0.0]), np.float32)
-                    b0 = float(bc.get('b', 0.0))
-                    bias = (N_ref[:,0]*v[0] + N_ref[:,1]*v[1] + b0).astype(np.float32)
-                if ignore_mask is not None and len(ignore_mask) == len(bias):
-                    bias = bias.copy(); bias[ignore_mask] = 0.0
+
+                bias = self._build_bias_vector(
+                    bc, target_len=len(delta_n_meas),
+                    g_xy=g_xy, N_ref=N_ref, T_ref=None,  # T_ref 导出时可现算
+                    ignore_mask=ignore_mask
+                )
                 m = np.isfinite(delta_n_meas)
                 delta_n_meas[m] = delta_n_meas[m] - bias[m]
+                # ↑ 不要重复减 bias
             except Exception as e:
                 print("[BIAS] skip:", e)
 
