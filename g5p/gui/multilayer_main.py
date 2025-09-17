@@ -1,0 +1,627 @@
+# -*- coding: utf-8 -*-
+"""
+多层加工纠偏系统 - 主程序
+支持逐层加工、偏差补偿累积、PLC通信、3D可视化
+"""
+import sys
+import os
+import json
+import time
+import threading
+import queue
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass, field
+import traceback
+
+# PyQt5 imports
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
+    QTabWidget, QLabel, QPushButton, QLineEdit, QSpinBox, QDoubleSpinBox,
+    QComboBox, QCheckBox, QTextEdit, QTableWidget, QTableWidgetItem,
+    QGroupBox, QFormLayout, QSplitter, QProgressBar, QFileDialog,
+    QMessageBox, QScrollArea, QFrame, QListWidget, QListWidgetItem
+)
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
+from PyQt5.QtGui import QPixmap, QFont
+
+# 本地模块
+current_dir = os.path.dirname(os.path.abspath(__file__))
+if current_dir not in sys.path:
+    sys.path.insert(0, current_dir)
+
+from controller import AlignController, GUIConfig, np_to_qimage
+import align_centerline_to_gcode_pro_edit_max as core
+import numpy as np
+import cv2
+
+# 导入其他模块
+from multilayer_data import LayerInfo, ProjectConfig
+from multilayer_plc import PLCCommunicator, TCPPLCCommunicator, S7PLCCommunicator, PLCMonitorThread, MockPLCCommunicator
+from multilayer_processor import LayerProcessingThread
+from multilayer_visualizer import LayerVisualizationWidget
+
+# ==================== 主窗口 ====================
+
+class MultilayerMainWindow(QMainWindow):
+    """多层加工纠偏系统主窗口"""
+    
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("多层加工纠偏系统 v1.0")
+        self.resize(1600, 1000)
+        
+        # 核心组件
+        self.controller = AlignController(GUIConfig())
+        self.project_config = ProjectConfig()
+        self.layers: Dict[int, LayerInfo] = {}
+        self.current_layer = 0
+        
+        # PLC通信
+        self.plc_communicator = None
+        self.plc_monitor = None
+        
+        # 处理状态
+        self.processing_queue = queue.Queue()
+        self.processing_thread = None
+        
+        self.setup_ui()
+        self.setup_connections()
+        
+        # 启动相机
+        self.start_camera()
+        
+    def setup_ui(self):
+        """初始化UI"""
+        central_widget = QWidget()
+        self.setCentralWidget(central_widget)
+        
+        # 主布局：水平分割
+        main_layout = QHBoxLayout(central_widget)
+        splitter = QSplitter(Qt.Horizontal)
+        main_layout.addWidget(splitter)
+        
+        # 左侧控制面板
+        left_panel = self.create_control_panel()
+        splitter.addWidget(left_panel)
+        
+        # 右侧可视化面板
+        right_panel = self.create_visualization_panel()
+        splitter.addWidget(right_panel)
+        
+        # 设置分割比例
+        splitter.setStretchFactor(0, 0)  # 左侧固定
+        splitter.setStretchFactor(1, 1)  # 右侧扩展
+        splitter.setSizes([400, 1200])
+        
+    def create_control_panel(self):
+        """创建左侧控制面板"""
+        panel = QWidget()
+        panel.setMaximumWidth(400)
+        layout = QVBoxLayout(panel)
+        
+        # 项目配置组
+        project_group = QGroupBox("项目配置")
+        project_layout = QFormLayout(project_group)
+        
+        self.project_name_edit = QLineEdit(self.project_config.project_name)
+        project_layout.addRow("项目名称:", self.project_name_edit)
+        
+        self.total_layers_spin = QSpinBox()
+        self.total_layers_spin.setRange(1, 100)
+        self.total_layers_spin.setValue(self.project_config.total_layers)
+        project_layout.addRow("总层数:", self.total_layers_spin)
+        
+        self.layer_thickness_spin = QDoubleSpinBox()
+        self.layer_thickness_spin.setRange(0.1, 10.0)
+        self.layer_thickness_spin.setDecimals(2)
+        self.layer_thickness_spin.setValue(self.project_config.layer_thickness_mm)
+        project_layout.addRow("层厚(mm):", self.layer_thickness_spin)
+        
+        self.auto_next_check = QCheckBox("自动处理下一层")
+        self.auto_next_check.setChecked(self.project_config.auto_next_layer)
+        project_layout.addRow(self.auto_next_check)
+        
+        layout.addWidget(project_group)
+        
+        # PLC通信组
+        plc_group = QGroupBox("PLC通信")
+        plc_layout = QFormLayout(plc_group)
+        
+        self.use_plc_check = QCheckBox("启用PLC通信")
+        self.use_plc_check.setChecked(self.project_config.use_plc)
+        plc_layout.addRow(self.use_plc_check)
+        
+        self.plc_type_combo = QComboBox()
+        self.plc_type_combo.addItems(["tcp", "s7", "mock"])
+        self.plc_type_combo.setCurrentText(self.project_config.plc_type)
+        plc_layout.addRow("通信类型:", self.plc_type_combo)
+        
+        self.plc_ip_edit = QLineEdit(self.project_config.plc_ip)
+        plc_layout.addRow("PLC IP:", self.plc_ip_edit)
+        
+        self.plc_port_spin = QSpinBox()
+        self.plc_port_spin.setRange(1, 65535)
+        self.plc_port_spin.setValue(self.project_config.plc_port)
+        plc_layout.addRow("端口:", self.plc_port_spin)
+        
+        self.layer_address_edit = QLineEdit(self.project_config.current_layer_address)
+        plc_layout.addRow("层号地址:", self.layer_address_edit)
+        
+        layout.addWidget(plc_group)
+        
+        # G代码加载组
+        gcode_group = QGroupBox("G代码管理")
+        gcode_layout = QVBoxLayout(gcode_group)
+        
+        load_layout = QHBoxLayout()
+        self.gcode_dir_edit = QLineEdit()
+        load_btn = QPushButton("选择G代码目录")
+        load_btn.clicked.connect(self.load_gcode_directory)
+        load_layout.addWidget(self.gcode_dir_edit)
+        load_layout.addWidget(load_btn)
+        gcode_layout.addLayout(load_layout)
+        
+        self.gcode_list = QListWidget()
+        gcode_layout.addWidget(self.gcode_list)
+        
+        layout.addWidget(gcode_group)
+        
+        # 处理控制组
+        control_group = QGroupBox("处理控制")
+        control_layout = QVBoxLayout(control_group)
+        
+        self.connect_plc_btn = QPushButton("连接PLC")
+        self.connect_plc_btn.clicked.connect(self.toggle_plc_connection)
+        control_layout.addWidget(self.connect_plc_btn)
+        
+        self.process_current_btn = QPushButton("处理当前层")
+        self.process_current_btn.clicked.connect(self.process_current_layer)
+        control_layout.addWidget(self.process_current_btn)
+        
+        self.next_layer_btn = QPushButton("下一层")
+        self.next_layer_btn.clicked.connect(self.go_next_layer)
+        control_layout.addWidget(self.next_layer_btn)
+        
+        layout.addWidget(control_group)
+        
+        # 状态显示
+        status_group = QGroupBox("状态信息")
+        status_layout = QVBoxLayout(status_group)
+        
+        self.status_label = QLabel("系统就绪")
+        status_layout.addWidget(self.status_label)
+        
+        self.progress_bar = QProgressBar()
+        status_layout.addWidget(self.progress_bar)
+        
+        self.plc_status_label = QLabel("PLC: 未连接")
+        status_layout.addWidget(self.plc_status_label)
+        
+        self.camera_status_label = QLabel("相机: 启动中...")
+        status_layout.addWidget(self.camera_status_label)
+        
+        layout.addWidget(status_group)
+        
+        # 保存/导出
+        save_group = QGroupBox("保存导出")
+        save_layout = QVBoxLayout(save_group)
+        
+        self.save_project_btn = QPushButton("保存项目")
+        self.save_project_btn.clicked.connect(self.save_project)
+        save_layout.addWidget(self.save_project_btn)
+        
+        self.export_results_btn = QPushButton("导出结果")
+        self.export_results_btn.clicked.connect(self.export_results)
+        save_layout.addWidget(self.export_results_btn)
+        
+        layout.addWidget(save_group)
+        
+        layout.addStretch()
+        return panel
+        
+    def create_visualization_panel(self):
+        """创建右侧可视化面板"""
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        
+        # 选项卡
+        self.tab_widget = QTabWidget()
+        
+        # 当前层可视化
+        self.current_layer_viz = LayerVisualizationWidget()
+        self.tab_widget.addTab(self.current_layer_viz, "当前层分析")
+        
+        # 层管理表格
+        self.create_layer_table()
+        self.tab_widget.addTab(self.layer_table_widget, "层管理")
+        
+        # 整体统计
+        self.create_overall_stats()
+        self.tab_widget.addTab(self.overall_stats_widget, "整体统计")
+        
+        layout.addWidget(self.tab_widget)
+        return panel
+        
+    def create_layer_table(self):
+        """创建层管理表格"""
+        self.layer_table_widget = QWidget()
+        layout = QVBoxLayout(self.layer_table_widget)
+        
+        self.layer_table = QTableWidget()
+        self.layer_table.setColumnCount(6)
+        self.layer_table.setHorizontalHeaderLabels([
+            "层号", "状态", "有效率", "偏差P95", "处理时间", "操作"
+        ])
+        layout.addWidget(self.layer_table)
+        
+    def create_overall_stats(self):
+        """创建整体统计面板"""
+        self.overall_stats_widget = QWidget()
+        layout = QVBoxLayout(self.overall_stats_widget)
+        
+        self.overall_stats_text = QTextEdit()
+        self.overall_stats_text.setReadOnly(True)
+        layout.addWidget(self.overall_stats_text)
+        
+    def setup_connections(self):
+        """设置信号连接"""
+        self.use_plc_check.toggled.connect(self.on_plc_config_changed)
+        self.project_name_edit.textChanged.connect(self.on_project_config_changed)
+        self.total_layers_spin.valueChanged.connect(self.on_project_config_changed)
+        
+    def start_camera(self):
+        """启动相机"""
+        def camera_thread():
+            msg = self.controller.start_camera()
+            self.camera_status_label.setText(f"相机: {msg}")
+            
+        threading.Thread(target=camera_thread, daemon=True).start()
+        
+    def load_gcode_directory(self):
+        """加载G代码目录"""
+        directory = QFileDialog.getExistingDirectory(self, "选择G代码目录")
+        if directory:
+            self.gcode_dir_edit.setText(directory)
+            self.scan_gcode_files(directory)
+            
+    def scan_gcode_files(self, directory: str):
+        """扫描G代码文件"""
+        self.gcode_list.clear()
+        self.layers.clear()
+        
+        try:
+            gcode_path = Path(directory)
+            gcode_files = list(gcode_path.glob("*.gcode")) + \
+                         list(gcode_path.glob("*.nc")) + \
+                         list(gcode_path.glob("*.txt"))
+            
+            # 按文件名排序
+            gcode_files.sort(key=lambda x: x.name)
+            
+            for i, file_path in enumerate(gcode_files, 1):
+                layer_info = LayerInfo(
+                    layer_id=i,
+                    gcode_path=str(file_path),
+                    status="pending"
+                )
+                self.layers[i] = layer_info
+                
+                item = QListWidgetItem(f"第{i}层: {file_path.name}")
+                self.gcode_list.addItem(item)
+                
+            # 更新总层数
+            self.total_layers_spin.setValue(len(gcode_files))
+            self.update_layer_table()
+            
+            self.status_label.setText(f"已加载 {len(gcode_files)} 层G代码")
+            
+        except Exception as e:
+            QMessageBox.warning(self, "错误", f"加载G代码失败: {e}")
+            
+    def toggle_plc_connection(self):
+        """切换PLC连接"""
+        if self.plc_communicator is None or not self.plc_communicator.connected:
+            self.connect_plc()
+        else:
+            self.disconnect_plc()
+            
+    def connect_plc(self):
+        """连接PLC"""
+        if not self.use_plc_check.isChecked():
+            QMessageBox.information(self, "提示", "请先启用PLC通信")
+            return
+            
+        # 更新配置
+        self.update_project_config()
+        
+        # 创建通信器
+        if self.project_config.plc_type == "tcp":
+            self.plc_communicator = TCPPLCCommunicator(self.project_config)
+        elif self.project_config.plc_type == "s7":
+            self.plc_communicator = S7PLCCommunicator(self.project_config)
+        elif self.project_config.plc_type == "mock":
+            self.plc_communicator = MockPLCCommunicator(self.project_config)
+        else:
+            # 默认使用模拟通信器
+            self.plc_communicator = MockPLCCommunicator(self.project_config)
+            
+        # 连接信号
+        self.plc_communicator.connection_status.connect(self.on_plc_status_changed)
+        self.plc_communicator.layer_changed.connect(self.on_layer_changed_from_plc)
+        
+        # 尝试连接
+        if self.plc_communicator.connect():
+            self.connect_plc_btn.setText("断开PLC")
+            
+            # 启动监控线程
+            self.plc_monitor = PLCMonitorThread(self.plc_communicator)
+            self.plc_monitor.start()
+        else:
+            self.plc_communicator = None
+            
+    def disconnect_plc(self):
+        """断开PLC连接"""
+        if self.plc_monitor:
+            self.plc_monitor.stop()
+            self.plc_monitor = None
+            
+        if self.plc_communicator:
+            self.plc_communicator.disconnect()
+            self.plc_communicator = None
+            
+        self.connect_plc_btn.setText("连接PLC")
+        self.plc_status_label.setText("PLC: 未连接")
+        
+    def process_current_layer(self):
+        """处理当前层"""
+        if self.current_layer == 0:
+            if self.layers:
+                self.current_layer = 1
+            else:
+                QMessageBox.warning(self, "错误", "请先加载G代码")
+                return
+                
+        if self.current_layer not in self.layers:
+            QMessageBox.warning(self, "错误", f"第{self.current_layer}层不存在")
+            return
+            
+        if self.processing_thread and self.processing_thread.isRunning():
+            QMessageBox.information(self, "提示", "正在处理中，请稍候...")
+            return
+            
+        # 获取前一层的偏差补偿
+        previous_bias = None
+        if self.current_layer > 1:
+            prev_layer_info = self.layers.get(self.current_layer - 1)
+            if prev_layer_info and prev_layer_info.bias_comp:
+                previous_bias = prev_layer_info.bias_comp
+                
+        # 启动处理线程
+        layer_info = self.layers[self.current_layer]
+        self.processing_thread = LayerProcessingThread(
+            layer_info, self.controller, previous_bias
+        )
+        
+        # 连接信号
+        self.processing_thread.processing_finished.connect(self.on_processing_finished)
+        self.processing_thread.processing_failed.connect(self.on_processing_failed)
+        self.processing_thread.progress_updated.connect(self.on_progress_updated)
+        
+        self.processing_thread.start()
+        self.progress_bar.setValue(0)
+        
+    def go_next_layer(self):
+        """下一层"""
+        if self.current_layer < len(self.layers):
+            self.current_layer += 1
+            if self.auto_next_check.isChecked():
+                self.process_current_layer()
+        else:
+            QMessageBox.information(self, "完成", "所有层处理完成！")
+            
+    def on_plc_status_changed(self, connected: bool, message: str):
+        """PLC状态变化"""
+        status = "已连接" if connected else "未连接"
+        self.plc_status_label.setText(f"PLC: {status}")
+        if message:
+            self.status_label.setText(message)
+            
+    def on_layer_changed_from_plc(self, layer_id: int):
+        """PLC层号变化"""
+        if layer_id in self.layers:
+            self.current_layer = layer_id
+            self.status_label.setText(f"PLC通知: 切换到第{layer_id}层")
+            
+            if self.auto_next_check.isChecked():
+                self.process_current_layer()
+                
+    def on_processing_finished(self, layer_id: int, result: Dict):
+        """处理完成"""
+        if layer_id in self.layers:
+            layer_info = self.layers[layer_id]
+            layer_info.processing_result = result
+            layer_info.status = "completed"
+            layer_info.timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            
+            # 保存偏差补偿数据
+            if 'bias_comp_path' in result:
+                try:
+                    with open(result['bias_comp_path'], 'r', encoding='utf-8') as f:
+                        layer_info.bias_comp = json.load(f)
+                except Exception as e:
+                    print(f"读取偏差补偿失败: {e}")
+                    
+            # 更新可视化
+            self.current_layer_viz.add_layer_data(layer_id, result)
+            self.update_layer_table()
+            
+            self.progress_bar.setValue(100)
+            self.status_label.setText(f"第{layer_id}层处理完成")
+            
+            # 自动下一层
+            if self.auto_next_check.isChecked() and layer_id < len(self.layers):
+                QTimer.singleShot(2000, self.go_next_layer)  # 2秒后自动下一层
+                
+    def on_processing_failed(self, layer_id: int, error: str):
+        """处理失败"""
+        if layer_id in self.layers:
+            self.layers[layer_id].status = "error"
+            
+        self.progress_bar.setValue(0)
+        self.status_label.setText(f"第{layer_id}层处理失败")
+        QMessageBox.critical(self, "处理错误", error)
+        
+    def on_progress_updated(self, layer_id: int, status: str):
+        """进度更新"""
+        self.status_label.setText(f"第{layer_id}层: {status}")
+        
+    def update_layer_table(self):
+        """更新层管理表格"""
+        self.layer_table.setRowCount(len(self.layers))
+        
+        for i, (layer_id, layer_info) in enumerate(self.layers.items()):
+            self.layer_table.setItem(i, 0, QTableWidgetItem(str(layer_id)))
+            self.layer_table.setItem(i, 1, QTableWidgetItem(layer_info.status))
+            
+            # 统计信息
+            if layer_info.processing_result:
+                metrics = layer_info.processing_result.get('metrics', {})
+                valid_ratio = metrics.get('valid_ratio', 0)
+                dev_p95 = metrics.get('dev_p95', 0)
+                
+                self.layer_table.setItem(i, 2, QTableWidgetItem(f"{valid_ratio:.1%}"))
+                self.layer_table.setItem(i, 3, QTableWidgetItem(f"{dev_p95:.3f}"))
+            else:
+                self.layer_table.setItem(i, 2, QTableWidgetItem("-"))
+                self.layer_table.setItem(i, 3, QTableWidgetItem("-"))
+                
+            # 时间戳
+            timestamp = layer_info.timestamp or "-"
+            self.layer_table.setItem(i, 4, QTableWidgetItem(timestamp))
+            
+            # 操作按钮（后续可添加）
+            self.layer_table.setItem(i, 5, QTableWidgetItem("查看"))
+            
+    def on_plc_config_changed(self):
+        """PLC配置变化"""
+        self.update_project_config()
+        
+    def on_project_config_changed(self):
+        """项目配置变化"""
+        self.update_project_config()
+        
+    def update_project_config(self):
+        """更新项目配置"""
+        self.project_config.project_name = self.project_name_edit.text()
+        self.project_config.total_layers = self.total_layers_spin.value()
+        self.project_config.layer_thickness_mm = self.layer_thickness_spin.value()
+        self.project_config.auto_next_layer = self.auto_next_check.isChecked()
+        
+        self.project_config.use_plc = self.use_plc_check.isChecked()
+        self.project_config.plc_type = self.plc_type_combo.currentText()
+        self.project_config.plc_ip = self.plc_ip_edit.text()
+        self.project_config.plc_port = self.plc_port_spin.value()
+        self.project_config.current_layer_address = self.layer_address_edit.text()
+        
+    def save_project(self):
+        """保存项目"""
+        try:
+            # 选择保存位置
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "保存项目", f"{self.project_config.project_name}.json",
+                "JSON文件 (*.json)"
+            )
+            
+            if file_path:
+                project_data = {
+                    "config": {
+                        "project_name": self.project_config.project_name,
+                        "total_layers": self.project_config.total_layers,
+                        "layer_thickness_mm": self.project_config.layer_thickness_mm,
+                        "auto_next_layer": self.project_config.auto_next_layer,
+                        "use_plc": self.project_config.use_plc,
+                        "plc_type": self.project_config.plc_type,
+                        "plc_ip": self.project_config.plc_ip,
+                        "plc_port": self.project_config.plc_port,
+                        "current_layer_address": self.project_config.current_layer_address,
+                    },
+                    "layers": {
+                        str(layer_id): {
+                            "layer_id": layer_info.layer_id,
+                            "gcode_path": layer_info.gcode_path,
+                            "status": layer_info.status,
+                            "timestamp": layer_info.timestamp,
+                            "has_result": layer_info.processing_result is not None
+                        }
+                        for layer_id, layer_info in self.layers.items()
+                    },
+                    "current_layer": self.current_layer,
+                    "save_time": time.strftime("%Y-%m-%d %H:%M:%S")
+                }
+                
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(project_data, f, ensure_ascii=False, indent=2)
+                    
+                QMessageBox.information(self, "成功", "项目保存成功")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"保存项目失败: {e}")
+            
+    def export_results(self):
+        """导出结果"""
+        try:
+            export_dir = QFileDialog.getExistingDirectory(self, "选择导出目录")
+            if export_dir:
+                export_path = Path(export_dir) / f"{self.project_config.project_name}_export"
+                export_path.mkdir(exist_ok=True)
+                
+                # 导出各层结果
+                for layer_id, layer_info in self.layers.items():
+                    if layer_info.processing_result:
+                        layer_dir = export_path / f"layer_{layer_id:02d}"
+                        layer_dir.mkdir(exist_ok=True)
+                        
+                        # 保存可视化图像
+                        result = layer_info.processing_result
+                        for img_name in ['vis_cmp', 'vis_corr', 'hist_panel']:
+                            if img_name in result and result[img_name] is not None:
+                                img_path = layer_dir / f"{img_name}.png"
+                                cv2.imwrite(str(img_path), result[img_name])
+                                
+                        # 保存统计数据
+                        if 'metrics' in result:
+                            metrics_path = layer_dir / "metrics.json"
+                            with open(metrics_path, 'w', encoding='utf-8') as f:
+                                json.dump(result['metrics'], f, ensure_ascii=False, indent=2)
+                                
+                QMessageBox.information(self, "成功", f"结果导出至: {export_path}")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"导出失败: {e}")
+            
+    def closeEvent(self, event):
+        """关闭事件"""
+        self.disconnect_plc()
+        if self.controller:
+            self.controller.close()
+        event.accept()
+
+# ==================== 主函数 ====================
+
+def main():
+    app = QApplication(sys.argv)
+    
+    # 设置应用程序信息
+    app.setApplicationName("多层加工纠偏系统")
+    app.setApplicationVersion("1.0")
+    app.setOrganizationName("智能制造")
+    
+    # 创建主窗口
+    window = MultilayerMainWindow()
+    window.show()
+    
+    sys.exit(app.exec_())
+
+if __name__ == "__main__":
+    main()
