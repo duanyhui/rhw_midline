@@ -1,3 +1,9 @@
 /g5p/backup/
 /g5p/out/
 /g5p/gui/temp
+/g5p/gui/out
+/g5p/gui/args
+/g5p/gui/test_arg
+/g5p/gui/test_gcodes
+/cam2machine_method
+/g5p/args

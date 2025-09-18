@@ -250,6 +250,11 @@ def main() -> None:
                 cv2.imwrite(str(outp), hud)
                 print('[SAVE] {}'.format(outp))
                 frame_id += 1
+                # 保存点云为npy
+                outp_pcam = out_dir / 'P_cam_{:06d}.npy'.format(frame_id)
+                np.save(str(outp_pcam), P_cam)
+                print('[SAVE] {}'.format(outp_pcam))
+
     finally:
         try:
             stream.close()

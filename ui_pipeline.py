@@ -272,7 +272,7 @@ class Pipeline:
             deviation_results=deviation_results,
             avg_pixel_offset=avg_px,
             avg_mm_offset=avg_mm,
-            msg=f"提取点数: {len(actual_points)} | method={used_method} | depth_margin={dm}, pixel_size_mm={pmm}{ransac_info}"
+            msg=f"提取点数: {len(actual_points)} | method={used_method} | depth_margin={dm}, pixel_size_mm={pmm}{ransac_info}",
             # --- 新增：用于导出 ---
             theoretical_centerline=self.theoretical_centerline if self.theoretical_centerline is not None else None,
             actual_centerline_points=[(float(p[0]), float(p[1])) for p in actual_points] if actual_points is not None else None

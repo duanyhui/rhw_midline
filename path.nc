@@ -1,0 +1,8 @@
+( Simple lathe X/Z path demo )
+G90
+G0 X20 Z0
+G1 X20 Z-60 F200
+G1 X18 Z-80
+G2 X16 Z-90 I-2 K0
+G1 X16 Z-120
+G0 X30 Z0

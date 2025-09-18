@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-guided_fit_pipeline.py  (enhanced)
+1_guided_fit_pipeline.py  (enhanced)
 ----------------------------------
 相对上一版，新增：
 - compute_arclength()
@@ -189,7 +189,7 @@ class GuidedFitEngine:
         seg = np.linalg.norm(np.diff(g_xy[:M], axis=0), axis=1)
         s = np.concatenate([[0.0], np.cumsum(seg)])
 
-        out_dir = Path(out_dir or cfg.get('out_dir', 'out'))
+        out_dir = Path(out_dir or cfg.get('out_dir', '../out'))
         out_dir.mkdir(parents=True, exist_ok=True)
         csv_path = Path(cfg.get('offset_csv', out_dir / 'offset_table.csv'))
         gcode_path = Path(cfg.get('corrected_gcode', out_dir / 'corrected.gcode'))
