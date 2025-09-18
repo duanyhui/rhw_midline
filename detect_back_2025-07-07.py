@@ -23,114 +23,6 @@ class PythonPercipioDeviceEvent(pcammls.DeviceEvent):
     def IsOffline(self):
         return self.Offline
 
-### --- 新增辅助函数：用于保持纵横比的缩放 --- ###
-def resize_with_padding(img, target_shape):
-    """
-    通过添加黑边（Letterboxing）来缩放图像，同时保持其原始纵横比。
-    这可以防止在缩放过程中发生不希望的拉伸或压缩，从而解决叠加时的位置偏移问题。
-
-    :param img: 需要缩放的源图像。
-    :param target_shape: (height, width) 格式的目标尺寸。
-    :return: 经过缩放和填充后，尺寸与 target_shape 完全一致的新图像。
-    """
-    target_h, target_w = target_shape
-    img_h, img_w = img.shape[:2]
-
-    # 计算目标和源图像的纵横比
-    target_aspect = target_w / target_h
-    img_aspect = img_w / img_h
-
-    if img_aspect > target_aspect:
-        # 源图像比目标“更宽”，因此以宽度为基准进行缩放
-        new_w = target_w
-        new_h = int(new_w / img_aspect)
-    else:
-        # 源图像比目标“更高”，因此以高度为基准进行缩放
-        new_h = target_h
-        new_w = int(new_h * img_aspect)
-
-    # 使用计算出的新尺寸进行缩放，这会保持原始比例
-    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_NEAREST)
-
-    # 创建一个符合目标尺寸的黑色背景画布
-    padded_img = np.zeros(target_shape, dtype=img.dtype)
-
-    # 计算将缩放后图像放置在画布中心所需的偏移量（即黑边的尺寸）
-    pad_top = (target_h - new_h) // 2
-    pad_left = (target_w - new_w) // 2
-
-    # 将缩放后的图像粘贴到画布中心
-    padded_img[pad_top:pad_top + new_h, pad_left:pad_left + new_w] = resized
-
-    return padded_img
-
-
-### --- 新增函数：用于生成无畸变掩码的核心 --- ###
-def create_corrected_mask(roi_p3d_rotated, depth_margin, pixel_size_mm=0.5):
-    """
-    (新方案) 通过正交投影和形态学闭运算，从旋转后的点云创建无畸变且密实的表面掩码。
-    这个函数将替代旧的 extract_nearest_surface_mask 来处理校正后的点云。
-
-    :param roi_p3d_rotated: (H, W, 3) 的 NumPy 数组，代表已经过旋转校正的点云ROI。
-    :param depth_margin: 从最近表面提取点云层的厚度容差 (mm)。
-    :param pixel_size_mm: 正交投影后，每个像素代表的真实世界尺寸 (mm)。
-    :return: (final_mask, z_min_val)
-             - final_mask: (H', W') 的 uint8 数组，最终生成的无畸变、密实的二值掩码。
-             - z_min_val: 校正后点云中的最小Z值。
-    """
-    # 1. 将点云ROI重塑为点列表，并过滤无效点
-    points = roi_p3d_rotated.reshape(-1, 3)
-    valid_points = points[points[:, 2] > 0]
-    if valid_points.shape[0] < 3:
-        print("正交投影错误: 有效点数量过少。")
-        return None, None
-
-    # 2. 在校正后的Z轴上找到最近的表面
-    z_min_val = np.min(valid_points[:, 2])
-    print(f"\t最近表面Z值 (校正后): {z_min_val:.2f}mm")
-    surface_points = valid_points[(valid_points[:, 2] >= z_min_val) & (valid_points[:, 2] <= z_min_val + depth_margin)]
-    if surface_points.shape[0] < 3:
-        print("正交投影错误: 表面点数量过少。")
-        return None, None
-
-    # 3. --- 正交投影 ---
-    # 计算点云在真实世界XY平面上的边界
-    x_min, y_min, _ = np.min(surface_points, axis=0)
-    x_max, y_max, _ = np.max(surface_points, axis=0)
-
-    # 根据真实世界尺寸和设定的像素分辨率，计算新掩码图像的像素尺寸
-    width_px = int(np.ceil((x_max - x_min) / pixel_size_mm)) + 1
-    height_px = int(np.ceil((y_max - y_min) / pixel_size_mm)) + 1
-    if width_px <= 1 or height_px <= 1:
-        return None, None
-
-    # 4. 将3D表面点“画”到一个新的2D画布（稀疏的点集）上
-    point_img = np.zeros((height_px, width_px), dtype=np.uint8)
-    px_coords = np.floor((surface_points[:, 0] - x_min) / pixel_size_mm).astype(int)
-    py_coords = np.floor((surface_points[:, 1] - y_min) / pixel_size_mm).astype(int)
-    point_img[py_coords, px_coords] = 255
-    cv2.imshow("Orthographic Projection (Sparse Points)", point_img)  # 用于调试，显示稀疏的点
-
-    # 5. --- 形态学闭运算 ---
-    # 这是连接稀疏点，形成完整轮廓的关键步骤
-    # 内核大小需要根据点的稀疏程度进行调整，一个较大的内核可以连接更远的点
-    kernel_size = 3  # 可以从 5, 7, 9, 11 开始尝试
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, kernel_size))
-    # 迭代次数越多，填充效果越强
-    closed_img = cv2.morphologyEx(point_img, cv2.MORPH_CLOSE, kernel, iterations=4)
-
-    print(f"\t已创建无畸变掩码，尺寸: {closed_img.shape}")
-    ### 将校正后的掩码resize回原始ROI的尺寸 ###
-    # 这解决了后续步骤中因尺寸不匹配导致的ValueError
-    # 注意：这可能会引入轻微的纵横比失真，但保留了正确的拓扑结构（如孔洞）
-    ### --- 关键修复：使用带padding的resize来保持纵横比，解决偏移问题 --- ###
-    original_roi_shape = (roi_p3d_rotated.shape[0], roi_p3d_rotated.shape[1]) # (height, width)
-    resized_mask = resize_with_padding(closed_img, original_roi_shape)
-
-
-    print(f"\t已创建无畸变掩码，并从 {closed_img.shape} resize到 {resized_mask.shape} 以匹配ROI")
-    return resized_mask, z_min_val
-
 
 def extract_nearest_surface_mask(roi_p3d_aligned, depth_margin):
     """
@@ -156,6 +48,8 @@ def extract_nearest_surface_mask(roi_p3d_aligned, depth_margin):
 
     z_min_val = np.min(z_img[valid_mask])
     print("\t最小深度值:{}mm".format(z_min_val))
+
+    # 2. 创建 mask，提取 z_min 附近的一层
     lower = z_min_val
     upper = z_min_val + depth_margin
     surface_mask = ((z_img >= lower) & (z_img <= upper)).astype(np.uint8) * 255  # 二值掩码
@@ -942,13 +836,6 @@ def main():
         rotation_matrix = None
         print("警告: 未找到 'tilt_correction_matrix.npy'。")
         print("程序将不进行倾斜校正。请先运行 my_calibrate.py 进行校准。")
-    try:
-        hand_eye_matrix = np.load('hand_eye_transform.npy')
-        print("成功加载手眼标定矩阵 'hand_eye_transform.npy'。")
-    except FileNotFoundError:
-        print("警告: 未找到手眼标定矩阵 'hand_eye_transform.npy'。")
-        print("将无法计算物理偏移量。请先运行 calibrate_hand_eye.py。")
-        hand_eye_matrix = None
 
     handle = cl.Open(sn)
     if not cl.isValidHandle(handle):
@@ -1163,12 +1050,22 @@ def main():
                 # ROI_X2, ROI_Y2 = 1200, 1050  # 右下角坐标
                 # 这里使用的是深度图分辨率的 ROI
                 # 正方形的
-                ROI_X1, ROI_Y1 = 993, 614  # 左上角坐标
-                ROI_X2, ROI_Y2 = 1186, 790  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 745, 591  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 1009, 813  # 右下角坐标
+                # 长条的
+                # ROI_X1, ROI_Y1 = 668, 607  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 749, 813  # 右下角坐标
                 #backup
-                # ROI_X1, ROI_Y1 = 915, 709  # 左上角坐标
-                # ROI_X2, ROI_Y2 = 980, 790  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 634, 717  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 767, 800  # 右下角坐标
+                ROI_X1, ROI_Y1 = 603, 731  # 左上角坐标
+                ROI_X2, ROI_Y2 = 736, 798  # 右下角坐标
 
+
+                # ROI_X1, ROI_Y1 = 876, 665  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 928, 810  # 右下角坐标
+                # ROI_X1, ROI_Y1 = 865, 482  # 左上角坐标
+                # ROI_X2, ROI_Y2 = 941, 669  # 右下角坐标
 
                 # 点云转换
                 cl.DeviceStreamMapDepthImageToPoint3D(frame, depth_calib_data, scale_unit, pointcloud_data_arr)
@@ -1203,15 +1100,8 @@ def main():
                 roi_cloud = p3d_nparray[ROI_Y1:ROI_Y2, ROI_X1:ROI_X2]
                 cv2.imshow("roi_p3d_nparray", roi_cloud)
 
-                ### --- 核心修改：根据是否校正来选择不同的掩码提取方法 --- ###
-                if rotation_matrix is None:
-                    print("未进行倾斜校正，使用原始方法提取掩码。")
-                    surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=3.5)
-                else:
-                    # 如果已校正，则使用正交投影生成无畸变掩码
-                    print("已进行倾斜校正，使用正交投影生成无畸变掩码。")
-                    # surface_mask, z_min = create_corrected_mask(roi_cloud, depth_margin=6.5, pixel_size_mm= 0.5)
-                    surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=6.8)
+
+                surface_mask, z_min = extract_nearest_surface_mask(roi_cloud, depth_margin=2.5)
                 if surface_mask is None:
                     print("无法提取表面掩码，跳过此帧。")
                     continue
@@ -1268,7 +1158,7 @@ def main():
                         print(skeleton_points[:5])
 
 
-                    # --- 比较中轴线并计算和显示偏移向量 ---
+                    # --- 修改：比较中轴线并计算和显示偏移向量 ---
                     if theoretical_centerline is not None:
                         # 步骤 1: 生成基础的对比图
                         comparison_vis, match_score = compare_centerlines(
@@ -1289,25 +1179,6 @@ def main():
                         print("--- 关键点偏移向量 (理论点 -> 实际点) ---")
                         for i, (key_pt, vec) in enumerate(deviation_vectors):
                             print(f"  关键点 {i}: 理论位置 {key_pt.astype(int)}, 偏移 (dx, dy) = {vec.astype(int)}")
-
-                        # 计算并输出平均偏移量
-                        if deviation_vectors:
-                            # 提取所有的偏移向量 (dx, dy)
-                            all_vectors = np.array([vec for _, vec in deviation_vectors])
-                            # 计算平均偏移量
-                            average_offset = np.mean(all_vectors, axis=0)
-                            print("--- 平均偏移量 (dx, dy) ---")
-                            print(f"  ({average_offset[0]:.2f}, {average_offset[1]:.2f})")
-
-                            if hand_eye_matrix is not None:
-                                # 提取矩阵的线性部分 (旋转和缩放)
-                                linear_transform = hand_eye_matrix[:, :2]
-
-                                # 计算物理世界中的偏移量 (dX, dY)
-                                physical_offset = linear_transform @ average_offset
-
-                                print("--- 纠正后的平均物理偏移量 (dX, dY) ---")
-                                print(f"  ({physical_offset[0]:.3f}, {physical_offset[1]:.3f}) mm")
 
                         # 步骤 3: 在对比图上可视化偏移向量
                         final_vis = visualize_deviation_vectors(comparison_vis, deviation_vectors)
@@ -1358,7 +1229,6 @@ def main():
 
     cl.DeviceStreamOff(handle)
     cl.Close(handle)
-    cv2.destroyAllWindows()
 
 
 if __name__ == '__main__':

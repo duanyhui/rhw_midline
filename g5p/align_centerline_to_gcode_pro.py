@@ -35,7 +35,7 @@ PARAMS = dict(
     max_grid_pixels=1_200_000,                # 顶视网格最大像素数
 
     # ROI 选择：'none' / 'camera_rect' / 'machine' / 'gcode_bounds'    # NEW
-    roi_mode='gcode_bounds',                  # 默认按 G 代码包围盒
+    roi_mode='machine',                  # 默认按 G 代码包围盒
     cam_roi_xywh=(682, 847, 228, 185),        # 相机像素系矩形 ROI (x,y,w,h)
     roi_center_xy=(50.0,50.0),                # 机床系 ROI 中心 (mm)（用于 roi_mode='machine'）
     roi_size_mm=250.0,                        # ROI 边长 (mm)
@@ -87,6 +87,11 @@ PARAMS = dict(
     out_dir='out',
     offset_csv='out/offset_table.csv',
     corrected_gcode='out/corrected.gcode',
+    centerline_gcode='out/centerline.gcode',          # 可选：直接导出中心线轨迹
+    export_centerline=True,                          # True 则同时导出中心线
+    auto_flip_offset=True,                            # 自动检测符号并翻转 (根据 Y 位移 vs 法向位移符号不一致)
+    preview_corrected=True,                           # 导出时在窗口中叠加预览 corrected 轨迹
+    save_corrected_preview=True,                      # 另存一张预览图
 
     # 质量门槛（Guard） NEW
     Guard=dict(
@@ -1500,6 +1505,19 @@ def run():
                     # 计算沿轨迹的有符号法向偏移
                     delta_n_off, dxy_vec = compute_offsets_along_gcode(centerline_xy, g_xy, N_ref)
                     if delta_n_off.size > 0:
+                        # === 1) 自动符号判定（可选） ===
+                        if PARAMS.get('auto_flip_offset', True):
+                            # 使用中心线与原轨迹的 Y 中位差与法向偏移中位数符号比对
+                            Mchk = min(len(delta_n_off), len(centerline_xy), len(g_xy))
+                            if Mchk > 5:
+                                raw_dy = float(np.median(centerline_xy[:Mchk,1] - g_xy[:Mchk,1]))
+                                med_dn = float(np.median(delta_n_off[:Mchk])) if np.isfinite(delta_n_off).any() else 0.0
+                                if abs(raw_dy) > 0.01 and abs(med_dn) > 0.01 and raw_dy * med_dn < 0:
+                                    delta_n_off = -delta_n_off
+                                    print('[AUTO] offset sign flipped raw_dy={:.3f} med_dn(before_flip)={:.3f}'
+                                          .format(raw_dy, med_dn))
+
+                        # === 2) 平滑 & 限幅 ===
                         delta_n_off = np.clip(moving_average_1d(delta_n_off, PARAMS['guide_smooth_win']),
                                               -PARAMS['guide_max_offset_mm'], PARAMS['guide_max_offset_mm'])
                         g_xy_corr = g_xy[:len(delta_n_off)] + N_ref[:len(delta_n_off)] * delta_n_off[:,None]
@@ -1507,6 +1525,36 @@ def run():
                         s = np.concatenate([[0.0], np.cumsum(seg)])
                         save_offset_csv(s, delta_n_off, N_ref[:len(delta_n_off)]*delta_n_off[:,None], PARAMS['offset_csv'])
                         write_linear_gcode(g_xy_corr, PARAMS['corrected_gcode'], feed=feed)
+
+                        # === 3) 可选导出中心线原样 ===
+                        if PARAMS.get('export_centerline', False):
+                            write_linear_gcode(centerline_xy[:len(g_xy_corr)], PARAMS['centerline_gcode'], feed=feed)
+
+                        # === 4) 预览叠加 ===
+                        if PARAMS.get('preview_corrected', True):
+                            try:
+                                vis_prev = vis_cmp_dbg.copy()
+                                Hprev, Wprev = vis_prev.shape[:2]
+                                def xy_to_px(xy_arr):
+                                    if xy_arr.size == 0: return np.empty((0,2), int)
+                                    x0,y0 = origin_xy; y1 = y0 + Hprev * pix_mm
+                                    xs = np.clip(((xy_arr[:,0]-x0)/pix_mm).astype(int), 0, Wprev-1)
+                                    ys = np.clip(((y1 - xy_arr[:,1])/pix_mm).astype(int), 0, Hprev-1)
+                                    return np.stack([xs,ys], axis=1)
+                                pts_corr = xy_to_px(g_xy_corr)
+                                for ii in range(len(pts_corr)-1):
+                                    cv2.line(vis_prev, tuple(pts_corr[ii]), tuple(pts_corr[ii+1]), (0,255,255), 2, cv2.LINE_AA)
+                                cv2.putText(vis_prev, 'corrected preview', (12, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                            (0,0,0), 2, cv2.LINE_AA)
+                                cv2.putText(vis_prev, 'corrected preview', (12, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                                            (0,255,255), 1, cv2.LINE_AA)
+                                cv2.imshow('CorrectedPreview', vis_prev)
+                                if PARAMS.get('save_corrected_preview', True):
+                                    prev_path = out_dir / 'corrected_preview.png'
+                                    cv2.imwrite(str(prev_path), vis_prev)
+                                    print('[SAVE]', prev_path)
+                            except Exception as _e:
+                                print('[WARN] preview failed:', _e)
 
                         # quicklook & report
                         if PARAMS.get('dump_quicklook', True):

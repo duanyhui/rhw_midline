@@ -742,26 +742,142 @@ class EmaCorrector:
         self.step = float(max_step_mm)
         self._ema = 0.0
         self._out_prev = np.zeros(2, float)
+        # debug
+        self.last_idx = -1
+        self.last_nvec = np.zeros(2, float)
+        self.last_med = 0.0
+        self.last_target = np.zeros(2, float)
+
     def update(self, e_idx: np.ndarray, e_n: np.ndarray, N_ref: np.ndarray):
         if e_n.size == 0 or N_ref.size == 0:
             return np.zeros(2, float), dict(mean=0.0, median=0.0, p95=0.0, n=0)
         stats = dict(mean=float(np.mean(e_n)), median=float(np.median(e_n)),
                      p95=float(np.percentile(np.abs(e_n), 95)), n=int(len(e_n)))
+        # 选中位数位置的法向
         k = int(np.argsort(e_n)[len(e_n)//2])
         i = int(np.clip(e_idx[k], 0, len(N_ref)-1))
         nvec = N_ref[i]
         med = stats['median']
-        if abs(med) < self.dead: med = 0.0
+        if abs(med) < self.dead:
+            med = 0.0
         med = float(np.clip(med, -self.clip, self.clip))
+        # EMA 标量
         self._ema = self.a * med + (1.0 - self.a) * self._ema
         target = nvec * self._ema
         delta = target - self._out_prev
         mag = float(np.linalg.norm(delta))
-        if mag > self.step:
-            delta *= (self.step / (mag + 1e-9))
+        if mag > self.step and mag > 0:
+            delta *= (self.step / mag)
         out = self._out_prev + delta
         self._out_prev = out
+        # debug 存储
+        self.last_idx = i
+        self.last_nvec = nvec.copy()
+        self.last_med = med
+        self.last_target = out.copy()
         return out, stats
+
+class VectorEmaCorrector:
+    """改进版：利用全部点的向量法向偏差，避免单一中位法向导致 dx=0 的情况。
+
+    策略：
+    1. 计算每个点的向量偏差 v_i = N_i * e_n_i。
+    2. 去掉极端离群：|e_n_i| > clip*2 的点忽略（保留主体）。
+    3. 取分量中位数形成 v_med（也可换成均值，可通过参数选择）。
+    4. deadband 针对模长；之后对每个分量做 clip。
+    5. EMA 在向量空间；再做最大单步限制。
+    """
+    def __init__(self, alpha=0.35, deadband=0.05, clip_mm=2.0, max_step_mm=0.15, use_mean: bool=False):
+        self.a = float(alpha)
+        self.dead = float(deadband)
+        self.clip = float(clip_mm)
+        self.step = float(max_step_mm)
+        self.use_mean = bool(use_mean)
+        self._ema_vec = np.zeros(2, float)
+        self._out_prev = np.zeros(2, float)
+        # debug
+        self.last_v_med = np.zeros(2, float)
+        self.last_target = np.zeros(2, float)
+        self.last_after_clip = np.zeros(2, float)
+    def update(self, e_idx: np.ndarray, e_n: np.ndarray, N_ref: np.ndarray):
+        if e_n.size == 0 or N_ref.size == 0:
+            return np.zeros(2, float), dict(mean=0.0, median=0.0, p95=0.0, n=0)
+        stats = dict(mean=float(np.mean(e_n)), median=float(np.median(e_n)),
+                     p95=float(np.percentile(np.abs(e_n), 95)), n=int(len(e_n)))
+        # 对应法向集合
+        idx_clipped = np.clip(e_idx, 0, len(N_ref)-1)
+        Ni = N_ref[idx_clipped]
+        Vi = Ni * e_n[:, None]
+        # 过滤离群
+        mask_core = np.abs(e_n) <= (self.clip * 2.0)
+        if mask_core.any():
+            Vi_core = Vi[mask_core]
+        else:
+            Vi_core = Vi
+        if Vi_core.size == 0:
+            return np.zeros(2, float), stats
+        if self.use_mean:
+            v_med = Vi_core.mean(axis=0)
+        else:
+            v_med = np.median(Vi_core, axis=0)
+        # deadband 基于模长
+        mag = float(np.linalg.norm(v_med))
+        if mag < self.dead:
+            v_med[:] = 0.0
+        # 分量 clip（保持方向不失真）
+        v_med = np.clip(v_med, -self.clip, self.clip)
+        # EMA
+        self._ema_vec = self.a * v_med + (1.0 - self.a) * self._ema_vec
+        target = self._ema_vec
+        delta = target - self._out_prev
+        dmag = float(np.linalg.norm(delta))
+        if dmag > self.step and dmag > 0:
+            delta *= (self.step / dmag)
+        out = self._out_prev + delta
+        self._out_prev = out
+        # debug store
+        self.last_v_med = v_med.copy()
+        self.last_after_clip = v_med.copy()
+        self.last_target = out.copy()
+        return out, stats
+
+def draw_correction_debug(img: np.ndarray,
+                          origin_xy: Tuple[float,float], pix_mm: float,
+                          gcode_xy: np.ndarray,
+                          corr_obj,
+                          mode: str) -> np.ndarray:
+    if gcode_xy is None or gcode_xy.size == 0: return img
+    vis = img.copy()
+    H, W = vis.shape[:2]
+    def xy_to_px(xy):
+        x0, y0 = origin_xy; y1 = y0 + H * pix_mm
+        xs = np.clip(((xy[:,0]-x0)/pix_mm).astype(int), 0, W-1)
+        ys = np.clip(((y1 - xy[:,1])/pix_mm).astype(int), 0, H-1)
+        return np.stack([xs,ys], axis=1)
+    if isinstance(corr_obj, EmaCorrector) and hasattr(corr_obj, 'last_idx') and corr_obj.last_idx >= 0:
+        idx = min(corr_obj.last_idx, gcode_xy.shape[0]-1)
+        p = gcode_xy[idx:idx+1]
+        pp = xy_to_px(p)[0]
+        cv2.circle(vis, tuple(pp), 5, (0,255,255), 2, cv2.LINE_AA)
+        # arrow for target
+        tgt = corr_obj.last_target
+        base = p[0]
+        arrow_end = base + tgt
+        bpx = xy_to_px(base[None,:])[0]; epx = xy_to_px(arrow_end[None,:])[0]
+        cv2.arrowedLine(vis, tuple(bpx), tuple(epx), (255,0,255), 2, cv2.LINE_AA, tipLength=0.35)
+        txt = f"MED={corr_obj.last_med:+.3f}  EMA={corr_obj._ema:+.3f}"
+        cv2.putText(vis, txt, (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0,0,0), 2, cv2.LINE_AA)
+        cv2.putText(vis, txt, (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255,255,0), 1, cv2.LINE_AA)
+    elif isinstance(corr_obj, VectorEmaCorrector):
+        # draw global vector at left-bottom corner
+        base = np.array([gcode_xy[:,0].mean(), gcode_xy[:,1].mean()])
+        tgt = corr_obj.last_target
+        bpx = xy_to_px(base[None,:])[0]; epx = xy_to_px((base + tgt)[None,:])[0]
+        cv2.arrowedLine(vis, tuple(bpx), tuple(epx), (255,0,128), 3, cv2.LINE_AA, tipLength=0.35)
+        txt = f"Vmed=({corr_obj.last_v_med[0]:+.3f},{corr_obj.last_v_med[1]:+.3f})  EMA=({corr_obj._ema_vec[0]:+.3f},{corr_obj._ema_vec[1]:+.3f})"
+        cv2.putText(vis, txt, (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 2, cv2.LINE_AA)
+        cv2.putText(vis, txt, (12, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,128,255), 1, cv2.LINE_AA)
+    return vis
 
 def draw_deviation_overlay(vis_top: np.ndarray,
                            origin_xy: Tuple[float,float], pix_mm: float,
@@ -1116,7 +1232,14 @@ def run():
     stream = PCamMLSStream(); stream.open()
 
     roi_mode = str(cfg.get('roi_mode', 'none')).lower()
-    corr = EmaCorrector(cfg['ema_alpha'], cfg['deadband_mm'], cfg['clip_mm'], cfg['max_step_mm'])  # FIX: 复用
+    corr_mode = str(cfg.get('corr_mode', 'median_scalar')).lower()
+    if corr_mode in ('vector','vector_mean','vector_median'):
+        corr = VectorEmaCorrector(cfg['ema_alpha'], cfg['deadband_mm'], cfg['clip_mm'], cfg['max_step_mm'],
+                                  use_mean=('mean' in corr_mode))
+        print('[INFO] 使用 VectorEmaCorrector 模式 =', corr_mode)
+    else:
+        corr = EmaCorrector(cfg['ema_alpha'], cfg['deadband_mm'], cfg['clip_mm'], cfg['max_step_mm'])
+        print('[INFO] 使用 EmaCorrector (median_scalar)')
 
     print('[INFO] 拉流中… (q 退出, s 截图, {} 导出纠偏)  mode={}'.format(cfg['export_on_key'], roi_mode))
     frame_id = 0
@@ -1228,7 +1351,12 @@ def run():
 
             cv2.imshow('Top-Down + Nearest Surface + Skeleton', overlay)
             cv2.imshow('NearestSurfaceMask', nearest_mask)
-            cv2.imshow('Centerline vs G-code (RHR)', vis_cmp)
+            # 调试纠偏矢量可视化
+            if cfg.get('debug_vis', True):
+                vis_cmp_dbg = draw_correction_debug(vis_cmp, origin_xy, pix_mm, g_xy, corr, corr_mode)
+            else:
+                vis_cmp_dbg = vis_cmp
+            cv2.imshow('Centerline vs G-code (RHR)', vis_cmp_dbg)
 
             # 12) 离线纠偏导出（沿轨迹的偏移场）
             key = cv2.waitKey(1) & 0xFF
