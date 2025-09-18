@@ -138,6 +138,27 @@ class MainWindow(QMainWindow):
         f.addRow("bias_comp:", row3)
         lv.addWidget(g_file)
 
+        # === Corner ignoring（拐角点附近忽略取点） ===
+        self.chk_corner = QCheckBox("拐角忽略 (corner_ignore_enable)")
+        self.chk_corner.setChecked(self.ctrl.cfg.corner_ignore_enable)
+        self.chk_corner.setToolTip("开启后，在拐角点两侧按弧长范围忽略取点，避免拐角对平滑/限幅产生拖尾影响。")
+
+        self.spn_cang = QDoubleSpinBox()
+        self.spn_cang.setRange(1.0, 180.0)
+        self.spn_cang.setDecimals(1)
+        self.spn_cang.setValue(self.ctrl.cfg.corner_angle_thr_deg)
+        self.spn_cang.setToolTip("拐角判定阈值（度）。相邻两段的转角≥该值视为拐角。")
+
+        self.spn_cspan = QDoubleSpinBox()
+        self.spn_cspan.setRange(0.0, 50.0)
+        self.spn_cspan.setDecimals(2)
+        self.spn_cspan.setValue(self.ctrl.cfg.corner_ignore_span_mm)
+        self.spn_cspan.setToolTip("在每个拐角两侧各忽略的弧长半径（mm），按 guide_step_mm 转为点数。")
+
+        f.addRow(self.chk_corner)
+        f.addRow("corner_angle_thr_deg:", self.spn_cang)
+        f.addRow("corner_ignore_span_mm:", self.spn_cspan)
+
         # ROI 组
         g_roi = QGroupBox("ROI / 投影")
         fr = QFormLayout(g_roi)
@@ -317,6 +338,9 @@ class MainWindow(QMainWindow):
         fg.addRow("guide_max_grad (mm/mm):", self.spn_grad)
         self.spn_gap = QSpinBox(); self.spn_gap.setRange(1, 100); self.spn_gap.setValue(self.ctrl.cfg.max_gap_pts)
         fg.addRow("max_gap_pts:", self.spn_gap)
+
+
+
         lv.addWidget(g_guide)
 
         # Guard & 输出
@@ -345,14 +369,18 @@ class MainWindow(QMainWindow):
         self.btn_preview = QPushButton("预览单帧")
         self.btn_export = QPushButton("导出纠偏 (CSV + GCode)")
         self.btn_bias = QPushButton("保存 BiasComp (当前帧)")
+        self.btn_advanced_params = QPushButton("高级参数调节")
+        self.btn_advanced_params.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
 
         self.btn_preview.clicked.connect(self.on_preview)
         self.btn_export.clicked.connect(self.on_export)
         self.btn_bias.clicked.connect(self.on_save_bias)
+        self.btn_advanced_params.clicked.connect(self.open_advanced_params)
 
         btns.addWidget(self.btn_preview)
         btns.addWidget(self.btn_export)
         btns.addWidget(self.btn_bias)
+        btns.addWidget(self.btn_advanced_params)  # 添加高级参数按钮
 
         # 把页脚加到左栏容器的底部（固定，不随滚动）
         left_col_v.addWidget(foot, 0)
@@ -477,6 +505,15 @@ class MainWindow(QMainWindow):
         c.guide_max_offset_mm = float(self.spn_maxoff.value())
         c.guide_max_grad_mm_per_mm = float(self.spn_grad.value())
         c.max_gap_pts = int(self.spn_gap.value())
+
+
+        # corner ignoring
+        try:
+            c.corner_ignore_enable = self.chk_corner.isChecked()
+            c.corner_angle_thr_deg = float(self.spn_cang.value())
+            c.corner_ignore_span_mm = float(self.spn_cspan.value())
+        except Exception:
+            pass
         # guard
         c.guard_min_valid_ratio = float(self.spn_vr.value())
         c.guard_max_abs_p95_mm = float(self.spn_p95.value())
@@ -581,6 +618,44 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "已保存", f"bias_comp 已写入:\n{p}")
         except Exception as e:
             QMessageBox.warning(self, "保存失败", str(e))
+    
+    # ---- 槽：打开高级参数调节窗口 ----
+    def open_advanced_params(self):
+        """打开高级参数调节窗口"""
+        try:
+            # 先更新当前配置
+            self.flush_cfg()
+            
+            # 导入高级参数对话框
+            from simple_advanced_params import SimpleAdvancedParametersDialog
+            
+            # 创建对话框
+            dialog = SimpleAdvancedParametersDialog(self.ctrl, self)
+            
+            # 连接参数应用信号
+            dialog.parameters_applied.connect(self.on_advanced_params_applied)
+            
+            # 显示对话框
+            dialog.exec_()
+            
+        except ImportError:
+            QMessageBox.warning(self, "错误", "无法加载高级参数对话框模块")
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开高级参数窗口失败: {e}")
+    
+    def on_advanced_params_applied(self, params):
+        """高级参数应用后的回调"""
+        try:
+            # 参数已经在对话框中应用到控制器，这里可以做一些后续处理
+            
+            # 自动触发一次预览以显示参数效果
+            if hasattr(self, 'btn_preview') and self.btn_preview.isEnabled():
+                QTimer.singleShot(500, self.on_preview)  # 0.5秒后自动预览
+                
+            self.statusBar().showMessage("高级参数已应用")
+            
+        except Exception as e:
+            print(f"高级参数应用回调错误: {e}")
 
 # ---- 入口 ----
 if __name__ == "__main__":
