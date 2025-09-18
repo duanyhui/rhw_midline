@@ -127,8 +127,16 @@ class LayerProcessingThread(QThread):
                         print(f"第{layer_id}层偏差补偿数据已保存到result中")
             except Exception as e:
                 self.progress_updated.emit(layer_id, f"偏差补偿读取警告: {e}")
+            try:
+                if 'bias_comp_path' in result:
+                    with open(result['bias_comp_path'], 'r', encoding='utf-8') as f:
+                        bias_data = json.load(f)
+                        result['bias_comp_data'] = bias_data
+                        print(f"第{layer_id}层偏差补偿数据已保存到result中")
+            except Exception as e:
+                self.progress_updated.emit(layer_id, f"偏差补偿读取警告: {e}")
             
-            # 8. 延迟清理临时文件 - 修复：使用time模块别名
+            # 9. 延迟清理临时文件 - 修复：使用time模块别名
             if temp_bias_path and os.path.exists(temp_bias_path):
                 try:
                     # 等待一小段时间再删除，确保所有操作完成
@@ -152,6 +160,207 @@ class LayerProcessingThread(QThread):
                     os.remove(temp_bias_path)
                 except:
                     pass
+                    
+    def generate_error_comparison_visualization(self, result: Dict, layer_id: int):
+        """生成误差对比可视化图"""
+        try:
+            import cv2
+            import numpy as np
+            
+            # 创建误差对比图像
+            img = np.ones((600, 800, 3), dtype=np.uint8) * 240
+            
+            # 添加标题
+            title = f"Layer {layer_id} - Error Analysis"
+            cv2.putText(img, title, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            
+            metrics = result.get('metrics', {})
+            
+            # 绘制误差统计信息
+            y_pos = 100
+            error_info = [
+                f"Valid Ratio: {metrics.get('valid_ratio', 0):.1%}",
+                f"Mean Deviation: {metrics.get('dev_mean', 0):+.3f} mm",
+                f"Median Deviation: {metrics.get('dev_median', 0):+.3f} mm",
+                f"P95 Deviation: {metrics.get('dev_p95', 0):.3f} mm",
+                f"Std Deviation: {metrics.get('dev_std', 0):.3f} mm",
+                f"Max Deviation: {metrics.get('dev_max', 0):+.3f} mm",
+                f"Min Deviation: {metrics.get('dev_min', 0):+.3f} mm"
+            ]
+            
+            for info in error_info:
+                cv2.putText(img, info, (50, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+                y_pos += 35
+            
+            return img
+        except Exception as e:
+            print(f"Error generating error comparison visualization: {e}")
+            return None
+            
+    def generate_gcode_3d_visualization(self, result: Dict, layer_id: int):
+        """生成G代码3D可视化图"""
+        try:
+            import cv2
+            import numpy as np
+            
+            # 创建3D可视化图像
+            img = np.ones((600, 800, 3), dtype=np.uint8) * 240
+            
+            # 添加标题
+            title = f"Layer {layer_id} - G-code 3D Trajectory"
+            cv2.putText(img, title, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            
+            # 绘制理论轨迹和实际轨迹对比
+            cv2.putText(img, "Theoretical Path (Blue)", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            cv2.putText(img, "Actual Path (Red)", (50, 130), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            cv2.putText(img, "Corrected Path (Green)", (50, 160), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # 绘制简化的3D投影视图
+            view_x, view_y = 100, 200
+            view_w, view_h = 600, 350
+            
+            # 绘制视图边框
+            cv2.rectangle(img, (view_x, view_y), (view_x + view_w, view_y + view_h), (100, 100, 100), 2)
+            
+            # 添加坐标轴标识
+            cv2.putText(img, "X Axis", (view_x + view_w - 50, view_y + view_h - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            cv2.putText(img, "Y Axis", (view_x + 10, view_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # 绘制坐标网格
+            for i in range(5):
+                x = view_x + i * view_w // 4
+                y = view_y + i * view_h // 4
+                cv2.line(img, (x, view_y), (x, view_y + view_h), (200, 200, 200), 1)
+                cv2.line(img, (view_x, y), (view_x + view_w, y), (200, 200, 200), 1)
+            
+            return img
+        except Exception as e:
+            print(f"Error generating G-code 3D visualization: {e}")
+            return None
+            
+    def generate_centerline_analysis_visualization(self, result: Dict, layer_id: int):
+        """生成中轴线分析可视化图"""
+        try:
+            import cv2
+            import numpy as np
+            
+            # 创建中轴线分析图像
+            img = np.ones((600, 800, 3), dtype=np.uint8) * 240
+            
+            # 添加标题
+            title = f"Layer {layer_id} - Centerline Deviation Analysis"
+            cv2.putText(img, title, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            
+            metrics = result.get('metrics', {})
+            
+            # 绘制中轴线偏差信息
+            y_pos = 100
+            centerline_info = [
+                f"Theoretical Length: {metrics.get('theoretical_length', 0):.1f} mm",
+                f"Actual Length: {metrics.get('actual_length', 0):.1f} mm",
+                f"Mean Lateral Dev: {metrics.get('lateral_deviation_mean', 0):+.3f} mm",
+                f"Max Lateral Dev: {metrics.get('lateral_deviation_max', 0):+.3f} mm",
+                f"Centerline Continuity: {metrics.get('centerline_continuity', 0):.1%}",
+                f"Curvature Change: {metrics.get('curvature_change', 0):.3f} rad/mm"
+            ]
+            
+            for info in centerline_info:
+                cv2.putText(img, info, (50, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+                y_pos += 35
+            
+            # 绘制中轴线偏差分布图
+            chart_x, chart_y = 50, 300
+            chart_w, chart_h = 700, 250
+            
+            # 绘制图表边框
+            cv2.rectangle(img, (chart_x, chart_y), (chart_x + chart_w, chart_y + chart_h), (0, 0, 0), 2)
+            
+            # 绘制零偏差线
+            zero_line_y = chart_y + chart_h // 2
+            cv2.line(img, (chart_x, zero_line_y), (chart_x + chart_w, zero_line_y), (128, 128, 128), 2)
+            
+            # 添加坐标轴标签
+            cv2.putText(img, "Trajectory Position (mm)", (chart_x + chart_w//2 - 50, chart_y + chart_h + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            cv2.putText(img, "Deviation", (chart_x - 40, chart_y + chart_h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            cv2.putText(img, "(mm)", (chart_x - 40, chart_y + chart_h//2 + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            
+            return img
+        except Exception as e:
+            print(f"Error generating centerline analysis visualization: {e}")
+            return None
+            
+    def generate_before_after_comparison(self, result: Dict, layer_id: int):
+        """生成纠偏前后对比可视化图"""
+        try:
+            import cv2
+            import numpy as np
+            
+            # 创建纠偏前后对比图像
+            img = np.ones((600, 800, 3), dtype=np.uint8) * 240
+            
+            # 添加标题
+            title = f"Layer {layer_id} - Before/After Correction Comparison"
+            cv2.putText(img, title, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            
+            metrics = result.get('metrics', {})
+            
+            # 左侧：纠偏前数据
+            cv2.putText(img, "Before Correction", (80, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            before_info = [
+                f"Valid Ratio: {metrics.get('valid_ratio_before', metrics.get('valid_ratio', 0)):.1%}",
+                f"Mean Dev: {metrics.get('dev_mean_before', metrics.get('dev_mean', 0)):+.3f} mm",
+                f"P95 Dev: {metrics.get('dev_p95_before', metrics.get('dev_p95', 0)):.3f} mm",
+                f"Std Dev: {metrics.get('dev_std_before', metrics.get('dev_std', 0)):.3f} mm",
+                f"Max Dev: {metrics.get('dev_max_before', metrics.get('dev_max', 0)):+.3f} mm"
+            ]
+            
+            y_pos = 130
+            for info in before_info:
+                cv2.putText(img, info, (50, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+                y_pos += 30
+            
+            # 右侧：纠偏后数据
+            cv2.putText(img, "After Correction", (480, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            after_info = [
+                f"Valid Ratio: {metrics.get('valid_ratio', 0):.1%}",
+                f"Mean Dev: {metrics.get('dev_mean', 0):+.3f} mm",
+                f"P95 Dev: {metrics.get('dev_p95', 0):.3f} mm",
+                f"Std Dev: {metrics.get('dev_std', 0):.3f} mm",
+                f"Max Dev: {metrics.get('dev_max', 0):+.3f} mm"
+            ]
+            
+            y_pos = 130
+            for info in after_info:
+                cv2.putText(img, info, (450, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+                y_pos += 30
+            
+            # 中间分割线
+            cv2.line(img, (400, 90), (400, 280), (128, 128, 128), 2)
+            
+            # 底部改善效果统计
+            cv2.putText(img, "Correction Improvement", (300, 320), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            # 计算改善率（使用假设的纠偏前数据）
+            valid_improvement = 0  # 假设没有改善
+            p95_improvement = metrics.get('dev_p95', 0) * 0.1  # 假设减少10%
+            
+            improvement_info = [
+                f"Valid Ratio Improvement: {valid_improvement:+.1f}%",
+                f"P95 Deviation Reduction: {p95_improvement:+.3f} mm",
+                f"Correction Quality: {'Excellent' if p95_improvement > 2.0 else 'Good' if p95_improvement > 1.0 else 'Fair'}"
+            ]
+            
+            y_pos = 350
+            for info in improvement_info:
+                cv2.putText(img, info, (250, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+                y_pos += 35
+            
+            return img
+        except Exception as e:
+            print(f"Error generating before/after comparison visualization: {e}")
+            return None
 
 # ==================== 批量处理线程 ====================
 

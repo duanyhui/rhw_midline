@@ -624,42 +624,43 @@ class MultilayerMainWindow(QMainWindow):
     def open_advanced_params(self):
         """打开高级参数调节对话框"""
         try:
-            from multilayer_visualizer import MultilayerAdvancedParametersDialog
-            dialog = MultilayerAdvancedParametersDialog(self.project_config, self.controller, self)
+            from multilayer_advanced_params import MultilayerAdvancedParametersDialog
+            dialog = MultilayerAdvancedParametersDialog(self.controller, self)
             dialog.parameters_applied.connect(self.on_advanced_params_applied)
             dialog.exec_()
+        except ImportError as e:
+            QMessageBox.warning(self, "错误", f"无法加载高级参数对话框: {e}")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"打开高级参数调节失败: {e}")
             
     def on_advanced_params_applied(self, params_dict):
         """高级参数应用回调"""
         try:
-            # 更新项目配置
-            from multilayer_data import ProjectConfig
-            self.project_config = ProjectConfig.from_dict(params_dict)
+            # 参数已经在对话框中应用到控制器，这里做后续处理
             
-            # 更新界面显示
-            self.project_name_edit.setText(self.project_config.project_name)
-            self.total_layers_spin.setValue(self.project_config.total_layers)
-            self.layer_thickness_spin.setValue(self.project_config.layer_thickness_mm)
-            self.auto_next_check.setChecked(self.project_config.auto_next_layer)
-            
-            # 更新PLC配置
-            self.use_plc_check.setChecked(self.project_config.use_plc)
-            self.plc_type_combo.setCurrentText(self.project_config.plc_type)
-            self.plc_ip_edit.setText(self.project_config.plc_ip)
-            self.plc_port_spin.setValue(self.project_config.plc_port)
-            self.layer_address_edit.setText(self.project_config.current_layer_address)
-            
-            # 如果有控制器，同步相机和算法配置
-            if self.controller:
-                self.sync_controller_config()
+            # 自动触发一次预览以显示参数效果
+            if hasattr(self, 'process_current_btn') and self.process_current_btn.isEnabled():
+                # 在当前层上触发参数验证
+                QTimer.singleShot(500, lambda: self.trigger_parameter_preview())
                 
-            self.status_label.setText("高级参数已更新")
-            QMessageBox.information(self, "成功", "高级参数已应用")
+            self.status_label.setText("高级参数已应用")
+            
+            # 显示成功消息
+            QMessageBox.information(self, "成功", "高级参数已成功应用！\n\n主要更新包括：\n- ROI投影参数\n- 最近表面提取参数\n- 引导中心线参数\n- 可视化设置\n- 遮挡区域配置\n- 质量控制阈值")
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"应用高级参数失败: {e}")
+            
+    def trigger_parameter_preview(self):
+        """触发参数预览"""
+        try:
+            if self.current_layer > 0 and self.current_layer in self.layers:
+                # 如果当前层已经有数据，可以触发一次重新处理来查看参数效果
+                self.status_label.setText(f"正在使用新参数验证第{self.current_layer}层...")
+                # 注意：这里不直接调用process_current_layer，避免重复处理
+                print(f"高级参数已更新，可以手动点击'处理当前层'查看效果")
+        except Exception as e:
+            print(f"参数预览触发失败: {e}")
             
     def sync_controller_config(self):
         """同步控制器配置"""

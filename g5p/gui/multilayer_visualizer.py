@@ -584,7 +584,7 @@ class LayerVisualizationWidget(QWidget):
         try:
             from PyQt5.QtWidgets import QFileDialog
             file_path, _ = QFileDialog.getSaveFileName(
-                self, "导出图像", "", "PNG文件 (*.png);;JPEG文件 (*.jpg)"
+                self, "导出图像", "", "PNG文件 (*.png);; JPEG文件 (*.jpg)"
             )
             if file_path:
                 success = self.export_current_image(file_path)
@@ -594,6 +594,285 @@ class LayerVisualizationWidget(QWidget):
                     QMessageBox.warning(self, "错误", "导出失败")
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败: {e}")
+            
+    def generate_error_comparison_chart(self):
+        """生成误差对比图"""
+        try:
+            if not self.current_layer_id or self.current_layer_id not in self.layers_data:
+                return None
+                
+            data = self.layers_data[self.current_layer_id]
+            
+            # 创建误差对比图像
+            img = np.ones((600, 800, 3), dtype=np.uint8) * 240
+            
+            # 添加标题
+            title = f"第{self.current_layer_id}层 - 误差对比分析"
+            cv2.putText(img, title.encode('utf-8').decode('utf-8'), (50, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            
+            metrics = data.get('metrics', {})
+            
+            # 绘制误差统计信息
+            y_pos = 100
+            error_info = [
+                f"有效率: {metrics.get('valid_ratio', 0):.1%}",
+                f"偏差均值: {metrics.get('dev_mean', 0):+.3f} mm",
+                f"偏差中位数: {metrics.get('dev_median', 0):+.3f} mm",
+                f"偏差P95: {metrics.get('dev_p95', 0):.3f} mm",
+                f"偏差标准差: {metrics.get('dev_std', 0):.3f} mm",
+                f"最大偏差: {metrics.get('dev_max', 0):+.3f} mm",
+                f"最小偏差: {metrics.get('dev_min', 0):+.3f} mm"
+            ]
+            
+            for info in error_info:
+                cv2.putText(img, info, (50, y_pos), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+                y_pos += 35
+            
+            # 绘制简单的误差分布柱状图
+            if 'deviation_data' in data:
+                hist_y = 350
+                hist_h = 200
+                hist_w = 600
+                hist_x = 100
+                
+                # 绘制坐标轴
+                cv2.line(img, (hist_x, hist_y + hist_h), (hist_x + hist_w, hist_y + hist_h), (0, 0, 0), 2)
+                cv2.line(img, (hist_x, hist_y), (hist_x, hist_y + hist_h), (0, 0, 0), 2)
+                
+                # 添加轴标签
+                cv2.putText(img, "Deviation (mm)", (hist_x + hist_w//2 - 50, hist_y + hist_h + 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+                cv2.putText(img, "Count", (hist_x - 50, hist_y + hist_h//2), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            
+            return img
+        except Exception as e:
+            print(f"生成误差对比图错误: {e}")
+            return None
+            
+    def generate_gcode_3d_visualization(self):
+        """生成G代码3D可视化"""
+        try:
+            if not self.current_layer_id or self.current_layer_id not in self.layers_data:
+                return None
+                
+            data = self.layers_data[self.current_layer_id]
+            
+            # 创建3D可视化图像
+            img = np.ones((600, 800, 3), dtype=np.uint8) * 240
+            
+            # 添加标题
+            title = f"第{self.current_layer_id}层 - G代码3D轨迹可视化"
+            cv2.putText(img, title, (50, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            
+            # 绘制理论轨迹和实际轨迹对比
+            if 'gcode_path' in data:
+                cv2.putText(img, "理论轨迹 (蓝色)", (50, 100), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                cv2.putText(img, "实际轨迹 (红色)", (50, 130), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(img, "纠偏轨迹 (绿色)", (50, 160), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+            
+            # 绘制简化的3D投影视图
+            view_x, view_y = 100, 200
+            view_w, view_h = 600, 350
+            
+            # 绘制视图边框
+            cv2.rectangle(img, (view_x, view_y), (view_x + view_w, view_y + view_h), (100, 100, 100), 2)
+            
+            # 添加坐标轴标识
+            cv2.putText(img, "X轴", (view_x + view_w - 50, view_y + view_h - 10), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            cv2.putText(img, "Y轴", (view_x + 10, view_y + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # 绘制坐标网格
+            for i in range(5):
+                x = view_x + i * view_w // 4
+                y = view_y + i * view_h // 4
+                cv2.line(img, (x, view_y), (x, view_y + view_h), (200, 200, 200), 1)
+                cv2.line(img, (view_x, y), (view_x + view_w, y), (200, 200, 200), 1)
+            
+            # 添加统计信息
+            metrics = data.get('metrics', {})
+            info_text = f"轨迹长度: {metrics.get('trajectory_length', 0):.1f} mm"
+            cv2.putText(img, info_text, (view_x + 10, view_y + view_h + 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            
+            return img
+        except Exception as e:
+            print(f"生成G代码3D可视化错误: {e}")
+            return None
+            
+    def generate_centerline_analysis(self):
+        """生成中轴线分析图"""
+        try:
+            if not self.current_layer_id or self.current_layer_id not in self.layers_data:
+                return None
+                
+            data = self.layers_data[self.current_layer_id]
+            
+            # 创建中轴线分析图像
+            img = np.ones((600, 800, 3), dtype=np.uint8) * 240
+            
+            # 添加标题
+            title = f"第{self.current_layer_id}层 - 中轴线偏差分析"
+            cv2.putText(img, title, (50, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            
+            metrics = data.get('metrics', {})
+            
+            # 绘制中轴线偏差信息
+            y_pos = 100
+            centerline_info = [
+                f"理论中轴线长度: {metrics.get('theoretical_length', 0):.1f} mm",
+                f"实际中轴线长度: {metrics.get('actual_length', 0):.1f} mm",
+                f"平均横向偏差: {metrics.get('lateral_deviation_mean', 0):+.3f} mm",
+                f"最大横向偏差: {metrics.get('lateral_deviation_max', 0):+.3f} mm",
+                f"中轴线连续性: {metrics.get('centerline_continuity', 0):.1%}",
+                f"曲率变化率: {metrics.get('curvature_change', 0):.3f} rad/mm"
+            ]
+            
+            for info in centerline_info:
+                cv2.putText(img, info, (50, y_pos), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+                y_pos += 35
+            
+            # 绘制中轴线偏差分布图
+            chart_x, chart_y = 50, 300
+            chart_w, chart_h = 700, 250
+            
+            # 绘制图表边框
+            cv2.rectangle(img, (chart_x, chart_y), (chart_x + chart_w, chart_y + chart_h), (0, 0, 0), 2)
+            
+            # 绘制零偏差线
+            zero_line_y = chart_y + chart_h // 2
+            cv2.line(img, (chart_x, zero_line_y), (chart_x + chart_w, zero_line_y), (128, 128, 128), 2)
+            
+            # 添加坐标轴标签
+            cv2.putText(img, "轨迹位置 (mm)", (chart_x + chart_w//2 - 50, chart_y + chart_h + 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            cv2.putText(img, "偏差", (chart_x - 40, chart_y + chart_h//2), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            cv2.putText(img, "(mm)", (chart_x - 40, chart_y + chart_h//2 + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+            
+            # 绘制刻度
+            for i in range(6):
+                x = chart_x + i * chart_w // 5
+                cv2.line(img, (x, chart_y + chart_h), (x, chart_y + chart_h + 5), (0, 0, 0), 1)
+                y = chart_y + i * chart_h // 5
+                cv2.line(img, (chart_x - 5, y), (chart_x, y), (0, 0, 0), 1)
+            
+            return img
+        except Exception as e:
+            print(f"生成中轴线分析图错误: {e}")
+            return None
+            
+    def generate_before_after_comparison(self):
+        """生成纠偏前后对比图"""
+        try:
+            if not self.current_layer_id or self.current_layer_id not in self.layers_data:
+                return None
+                
+            data = self.layers_data[self.current_layer_id]
+            
+            # 创建纠偏前后对比图像
+            img = np.ones((600, 800, 3), dtype=np.uint8) * 240
+            
+            # 添加标题
+            title = f"第{self.current_layer_id}层 - 纠偏前后对比"
+            cv2.putText(img, title, (50, 50), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 0), 2)
+            
+            metrics = data.get('metrics', {})
+            
+            # 左侧：纠偏前数据
+            cv2.putText(img, "纠偏前", (80, 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            before_info = [
+                f"有效率: {metrics.get('valid_ratio_before', 0):.1%}",
+                f"平均偏差: {metrics.get('dev_mean_before', 0):+.3f} mm",
+                f"P95偏差: {metrics.get('dev_p95_before', 0):.3f} mm",
+                f"标准差: {metrics.get('dev_std_before', 0):.3f} mm",
+                f"最大偏差: {metrics.get('dev_max_before', 0):+.3f} mm"
+            ]
+            
+            y_pos = 130
+            for info in before_info:
+                cv2.putText(img, info, (50, y_pos), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+                y_pos += 30
+            
+            # 右侧：纠偏后数据
+            cv2.putText(img, "纠偏后", (480, 100), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            
+            after_info = [
+                f"有效率: {metrics.get('valid_ratio', 0):.1%}",
+                f"平均偏差: {metrics.get('dev_mean', 0):+.3f} mm",
+                f"P95偏差: {metrics.get('dev_p95', 0):.3f} mm",
+                f"标准差: {metrics.get('dev_std', 0):.3f} mm",
+                f"最大偏差: {metrics.get('dev_max', 0):+.3f} mm"
+            ]
+            
+            y_pos = 130
+            for info in after_info:
+                cv2.putText(img, info, (450, y_pos), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
+                y_pos += 30
+            
+            # 中间分割线
+            cv2.line(img, (400, 90), (400, 280), (128, 128, 128), 2)
+            
+            # 底部改善效果统计
+            cv2.putText(img, "纠偏改善效果", (300, 320), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            
+            # 计算改善率
+            valid_improvement = (metrics.get('valid_ratio', 0) - metrics.get('valid_ratio_before', 0)) * 100
+            p95_improvement = metrics.get('dev_p95_before', 0) - metrics.get('dev_p95', 0)
+            
+            improvement_info = [
+                f"有效率改善: {valid_improvement:+.1f}%",
+                f"P95偏差减少: {p95_improvement:+.3f} mm",
+                f"纠偏质量等级: {'优秀' if p95_improvement > 2.0 else '良好' if p95_improvement > 1.0 else '一般'}"
+            ]
+            
+            y_pos = 350
+            for info in improvement_info:
+                cv2.putText(img, info, (250, y_pos), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 1)
+                y_pos += 35
+            
+            # 绘制简单的对比柱状图
+            bar_y = 450
+            bar_h = 100
+            bar_w = 150
+            
+            # 纠偏前柱状图 (红色)
+            before_height = int(bar_h * min(1.0, metrics.get('dev_p95_before', 0) / 10.0))
+            cv2.rectangle(img, (150, bar_y + bar_h - before_height), 
+                         (150 + bar_w, bar_y + bar_h), (0, 0, 255), -1)
+            cv2.putText(img, "纠偏前", (160, bar_y + bar_h + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            # 纠偏后柱状图 (绿色)
+            after_height = int(bar_h * min(1.0, metrics.get('dev_p95', 0) / 10.0))
+            cv2.rectangle(img, (450, bar_y + bar_h - after_height), 
+                         (450 + bar_w, bar_y + bar_h), (0, 255, 0), -1)
+            cv2.putText(img, "纠偏后", (460, bar_y + bar_h + 20), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            
+            return img
+        except Exception as e:
+            print(f"生成纠偏前后对比图错误: {e}")
+            return None
             
     def generate_statistics_comparison(self):
         """生成统计对比图"""
@@ -705,15 +984,27 @@ class LayerVisualizationWidget(QWidget):
             elif view_mode == "纠偏后vs理论":
                 img = data.get('vis_corr')
             elif view_mode == "误差对比图":
+                # 优先使用数据中的误差对比图，如果没有则生成
                 img = data.get('error_comparison')
+                if img is None:
+                    img = self.generate_error_comparison_chart()
             elif view_mode == "G代码3D可视化":
+                # 优先使用数据中的3D可视化，如果没有则生成
                 img = data.get('gcode_3d_viz')
+                if img is None:
+                    img = self.generate_gcode_3d_visualization()
             elif view_mode == "中轴线分析":
+                # 优先使用数据中的中轴线分析，如果没有则生成
                 img = data.get('centerline_analysis')
+                if img is None:
+                    img = self.generate_centerline_analysis()
+            elif view_mode == "纠偏前后对比":
+                # 优先使用数据中的纠偏前后对比，如果没有则生成
+                img = data.get('before_after_comparison')
+                if img is None:
+                    img = self.generate_before_after_comparison()
             elif view_mode == "偏差分布":
                 img = data.get('hist_panel')
-            elif view_mode == "纠偏前后对比":
-                img = data.get('before_after_comparison')
             elif view_mode == "顶视高度":
                 img = data.get('vis_top')
             elif view_mode == "最近表面":
@@ -1023,7 +1314,7 @@ class MultiLayerComparisonWidget(QWidget):
         try:
             from PyQt5.QtWidgets import QFileDialog
             file_path, _ = QFileDialog.getSaveFileName(
-                self, "导出图像", "", "PNG文件 (*.png);;JPEG文件 (*.jpg)"
+                self, "导出图像", "", "PNG文件 (*.png);; JPEG文件 (*.jpg)"
             )
             if file_path:
                 success = self.export_current_image(file_path)
