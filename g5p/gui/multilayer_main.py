@@ -207,6 +207,12 @@ class MultilayerMainWindow(QMainWindow):
         save_group = QGroupBox("保存导出")
         save_layout = QVBoxLayout(save_group)
         
+        # 高级参数调节按钮
+        self.btn_advanced_params = QPushButton("高级参数调节")
+        self.btn_advanced_params.setStyleSheet("QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }")
+        self.btn_advanced_params.clicked.connect(self.open_advanced_params)
+        save_layout.addWidget(self.btn_advanced_params)
+        
         self.save_project_btn = QPushButton("保存项目")
         self.save_project_btn.clicked.connect(self.save_project)
         save_layout.addWidget(self.save_project_btn)
@@ -393,9 +399,16 @@ class MultilayerMainWindow(QMainWindow):
         # 获取前一层的偏差补偿
         previous_bias = None
         if self.current_layer > 1:
-            prev_layer_info = self.layers.get(self.current_layer - 1)
-            if prev_layer_info and prev_layer_info.bias_comp:
-                previous_bias = prev_layer_info.bias_comp
+            # 查找最近一层有偏差补偿数据的层
+            for prev_layer_id in range(self.current_layer - 1, 0, -1):
+                prev_layer_info = self.layers.get(prev_layer_id)
+                if prev_layer_info and prev_layer_info.bias_comp:
+                    previous_bias = prev_layer_info.bias_comp
+                    print(f"第{self.current_layer}层应用第{prev_layer_id}层的偏差补偿")
+                    break
+            
+            if previous_bias is None:
+                print(f"警告：第{self.current_layer}层未找到可用的偏差补偿数据")
                 
         # 启动处理线程
         layer_info = self.layers[self.current_layer]
@@ -444,13 +457,21 @@ class MultilayerMainWindow(QMainWindow):
             layer_info.status = "completed"
             layer_info.timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
             
-            # 保存偏差补偿数据
-            if 'bias_comp_path' in result:
+            # 保存偏差补偿数据 - 修复：使用bias_comp_data而不是文件路径
+            if 'bias_comp_data' in result:
+                layer_info.bias_comp = result['bias_comp_data']
+                print(f"第{layer_id}层偏差补偿数据已保存到内存")
+            elif 'bias_comp_path' in result:
                 try:
                     with open(result['bias_comp_path'], 'r', encoding='utf-8') as f:
                         layer_info.bias_comp = json.load(f)
+                        print(f"第{layer_id}层偏差补偿数据已从文件加载")
                 except Exception as e:
                     print(f"读取偏差补偿失败: {e}")
+                    # 如果文件读取失败，尝试从result中获取
+                    if 'bias_comp_data' in result:
+                        layer_info.bias_comp = result['bias_comp_data']
+                        print(f"第{layer_id}层偏差补偿数据已从result获取")
                     
             # 更新可视化
             self.current_layer_viz.add_layer_data(layer_id, result)
@@ -599,6 +620,80 @@ class MultilayerMainWindow(QMainWindow):
                 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败: {e}")
+            
+    def open_advanced_params(self):
+        """打开高级参数调节对话框"""
+        try:
+            from multilayer_visualizer import MultilayerAdvancedParametersDialog
+            dialog = MultilayerAdvancedParametersDialog(self.project_config, self.controller, self)
+            dialog.parameters_applied.connect(self.on_advanced_params_applied)
+            dialog.exec_()
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"打开高级参数调节失败: {e}")
+            
+    def on_advanced_params_applied(self, params_dict):
+        """高级参数应用回调"""
+        try:
+            # 更新项目配置
+            from multilayer_data import ProjectConfig
+            self.project_config = ProjectConfig.from_dict(params_dict)
+            
+            # 更新界面显示
+            self.project_name_edit.setText(self.project_config.project_name)
+            self.total_layers_spin.setValue(self.project_config.total_layers)
+            self.layer_thickness_spin.setValue(self.project_config.layer_thickness_mm)
+            self.auto_next_check.setChecked(self.project_config.auto_next_layer)
+            
+            # 更新PLC配置
+            self.use_plc_check.setChecked(self.project_config.use_plc)
+            self.plc_type_combo.setCurrentText(self.project_config.plc_type)
+            self.plc_ip_edit.setText(self.project_config.plc_ip)
+            self.plc_port_spin.setValue(self.project_config.plc_port)
+            self.layer_address_edit.setText(self.project_config.current_layer_address)
+            
+            # 如果有控制器，同步相机和算法配置
+            if self.controller:
+                self.sync_controller_config()
+                
+            self.status_label.setText("高级参数已更新")
+            QMessageBox.information(self, "成功", "高级参数已应用")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "错误", f"应用高级参数失败: {e}")
+            
+    def sync_controller_config(self):
+        """同步控制器配置"""
+        try:
+            if not self.controller:
+                return
+                
+            cfg = self.controller.cfg
+            camera_config = self.project_config.camera_config
+            algo_config = self.project_config.algorithm_config
+            
+            # 更新相机配置
+            cfg.pixel_size_mm = camera_config.get("pixel_size_mm", 0.8)
+            cfg.bounds_margin_mm = camera_config.get("bounds_margin_mm", 20.0)
+            cfg.roi_mode = camera_config.get("roi_mode", "gcode_bounds")
+            
+            # 更新算法配置
+            cfg.guide_step_mm = algo_config.get("guide_step_mm", 1.0)
+            cfg.guide_halfwidth_mm = algo_config.get("guide_halfwidth_mm", 6.0)
+            cfg.guide_smooth_win = algo_config.get("guide_smooth_win", 7)
+            cfg.guide_max_offset_mm = algo_config.get("guide_max_offset_mm", 8.0)
+            cfg.guide_max_grad_mm_per_mm = algo_config.get("guide_max_grad_mm_per_mm", 0.08)
+            cfg.plane_enable = algo_config.get("plane_enable", True)
+            cfg.plane_ransac_thresh_mm = algo_config.get("plane_ransac_thresh_mm", 0.8)
+            cfg.nearest_qlo = algo_config.get("nearest_qlo", 1.0)
+            cfg.nearest_qhi = algo_config.get("nearest_qhi", 99.0)
+            cfg.depth_margin_mm = algo_config.get("depth_margin_mm", 3.0)
+            
+        except Exception as e:
+            print(f"同步控制器配置错误: {e}")
+            
+    def on_advanced_params_updated(self, params_dict):
+        """供子组件调用的参数更新回调"""
+        self.on_advanced_params_applied(params_dict)
             
     def closeEvent(self, event):
         """关闭事件"""

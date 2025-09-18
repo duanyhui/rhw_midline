@@ -40,19 +40,25 @@ class LayerProcessingThread(QThread):
             self.controller.cfg.gcode_path = self.layer_info.gcode_path
             self.progress_updated.emit(layer_id, f"加载G代码: {os.path.basename(self.layer_info.gcode_path)}")
             
-            # 2. 如果有前层偏差补偿，则应用
+            # 2. 应用偏差补偿逻辑（严格按照项目规范）
             temp_bias_path = None
-            if self.previous_bias and layer_id > 1:
+            if layer_id == 1:
+                # 第一层：仅用于标定，不应用任何补偿
+                self.controller.cfg.bias_enable = False
+                self.progress_updated.emit(layer_id, "第一层标定模式，不应用偏差补偿")
+            elif layer_id > 1 and self.previous_bias:
+                # 第2+层：应用前一层的偏差补偿
                 self.controller.cfg.bias_enable = True
                 # 临时保存bias文件
                 temp_bias_path = f"temp_bias_layer_{layer_id}_{int(time.time())}.json"
                 with open(temp_bias_path, 'w', encoding='utf-8') as f:
                     json.dump(self.previous_bias, f, ensure_ascii=False, indent=2)
                 self.controller.cfg.bias_path = temp_bias_path
-                self.progress_updated.emit(layer_id, "应用前层偏差补偿...")
+                self.progress_updated.emit(layer_id, f"第{layer_id}层应用前层偏差补偿")
             else:
+                # 第2+层但没有可用的偏差补偿
                 self.controller.cfg.bias_enable = False
-                self.progress_updated.emit(layer_id, "无前层偏差补偿")
+                self.progress_updated.emit(layer_id, f"警告：第{layer_id}层未找到可用的偏差补偿")
                 
             # 3. 相机采图和处理
             self.progress_updated.emit(layer_id, "相机采图中...")
@@ -112,19 +118,24 @@ class LayerProcessingThread(QThread):
             result['layer_id'] = layer_id
             result['timestamp'] = time.strftime("%Y-%m-%d %H:%M:%S")
             
-            # 7. 读取并缓存生成的偏差补偿数据
+            # 7. 读取并缓存生成的偏差补偿数据 - 修复：直接保存到result中
             try:
                 if 'bias_comp_path' in result:
                     with open(result['bias_comp_path'], 'r', encoding='utf-8') as f:
                         bias_data = json.load(f)
                         result['bias_comp_data'] = bias_data
+                        print(f"第{layer_id}层偏差补偿数据已保存到result中")
             except Exception as e:
                 self.progress_updated.emit(layer_id, f"偏差补偿读取警告: {e}")
             
-            # 8. 清理临时文件
+            # 8. 延迟清理临时文件 - 修复：使用time模块别名
             if temp_bias_path and os.path.exists(temp_bias_path):
                 try:
+                    # 等待一小段时间再删除，确保所有操作完成
+                    import time as time_module
+                    time_module.sleep(0.1)
                     os.remove(temp_bias_path)
+                    print(f"已清理临时文件: {temp_bias_path}")
                 except Exception as e:
                     print(f"清理临时文件失败: {e}")
                     
@@ -183,7 +194,16 @@ class BatchProcessingThread(QThread):
                 
                 # 处理单层
                 layer_info = self.layers[layer_id]
-                single_processor = LayerProcessingThread(layer_info, self.controller, previous_bias)
+                            
+                # 根据多层纠偏逻辑：第一层不应用补偿，第2+层应用前层补偿
+                bias_to_apply = None
+                if layer_id > 1 and previous_bias is not None:
+                    bias_to_apply = previous_bias
+                    print(f"批量处理：第{layer_id}层应用偏差补偿")
+                else:
+                    print(f"批量处理：第{layer_id}层不应用偏差补偿")
+                                
+                single_processor = LayerProcessingThread(layer_info, self.controller, bias_to_apply)
                 
                 # 连接信号（同步处理）
                 result_received = False
@@ -214,6 +234,9 @@ class BatchProcessingThread(QThread):
                     # 提取偏差补偿用于下一层
                     if 'bias_comp_data' in processing_result:
                         previous_bias = processing_result['bias_comp_data']
+                        print(f"批量处理：从第{layer_id}层提取偏差补偿数据，将用于第{layer_id+1}层")
+                    else:
+                        print(f"批量处理警告：第{layer_id}层未生成偏差补偿数据")
                         
                 elif processing_error:
                     self.layer_failed.emit(layer_id, processing_error)
