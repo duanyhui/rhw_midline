@@ -257,7 +257,7 @@ class MultilayerMainWindow(QMainWindow):
         self.layer_table = QTableWidget()
         self.layer_table.setColumnCount(6)
         self.layer_table.setHorizontalHeaderLabels([
-            "层号", "状态", "有效率", "偏差P95", "处理时间", "操作"
+            "层号", "状态", "覆盖率", "轨迹精度", "处理时间", "操作"
         ])
         layout.addWidget(self.layer_table)
         
@@ -505,14 +505,24 @@ class MultilayerMainWindow(QMainWindow):
             self.layer_table.setItem(i, 0, QTableWidgetItem(str(layer_id)))
             self.layer_table.setItem(i, 1, QTableWidgetItem(layer_info.status))
             
-            # 统计信息
+            # 统计信息 - 使用新的轨迹精度指标
             if layer_info.processing_result:
                 metrics = layer_info.processing_result.get('metrics', {})
                 valid_ratio = metrics.get('valid_ratio', 0)
-                dev_p95 = metrics.get('dev_p95', 0)
+                
+                # 优先使用新的轨迹精度指标
+                if 'trajectory_p95_distance' in metrics:
+                    trajectory_precision = metrics.get('trajectory_p95_distance', 0)
+                    precision_label = f"{trajectory_precision:.3f}mm"
+                elif 'dev_p95' in metrics:
+                    # 向后兼容：使用原有的法向偏移数据
+                    trajectory_precision = metrics.get('dev_p95', 0)
+                    precision_label = f"{trajectory_precision:.3f}mm(法向)"
+                else:
+                    precision_label = "-"
                 
                 self.layer_table.setItem(i, 2, QTableWidgetItem(f"{valid_ratio:.1%}"))
-                self.layer_table.setItem(i, 3, QTableWidgetItem(f"{dev_p95:.3f}"))
+                self.layer_table.setItem(i, 3, QTableWidgetItem(precision_label))
             else:
                 self.layer_table.setItem(i, 2, QTableWidgetItem("-"))
                 self.layer_table.setItem(i, 3, QTableWidgetItem("-"))

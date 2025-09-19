@@ -64,17 +64,44 @@ class LayerProcessingThread(QThread):
             self.progress_updated.emit(layer_id, "相机采图中...")
             result = self.controller.process_single_frame(for_export=False)
             
-            # 4. 检查处理结果质量
+            # 4. 重要修正：计算纠偏后的统计指标（用于统计信息面板）
+            self.progress_updated.emit(layer_id, "计算纠偏后指标...")
+            
+            # 获取原始指标作为备用
+            original_metrics = result.get('metrics', {})
+            
+            # 计算纠偏后的指标
+            corrected_metrics = self.calculate_corrected_metrics(result, layer_id)
+            
+            # 更新result中的metrics为纠偏后的指标
+            if corrected_metrics:
+                # 保留原始指标作为参考
+                result['metrics_original'] = original_metrics.copy()
+                # 使用纠偏后的指标作为主要指标
+                result['metrics'] = corrected_metrics
+                self.progress_updated.emit(layer_id, "已更新为纠偏后指标")
+            else:
+                # 如果纠偏后指标计算失败，使用原始指标
+                result['metrics'] = original_metrics
+                self.progress_updated.emit(layer_id, "使用原始指标（纠偏后计算失败）")
+            
+            # 5. 检查处理结果质量（基于更新后的指标）
             metrics = result.get('metrics', {})
             valid_ratio = metrics.get('valid_ratio', 0.0)
-            dev_p95 = metrics.get('dev_p95', 0.0)
+            # 优先使用新的轨迹精度指标
+            if 'trajectory_p95_distance' in metrics:
+                quality_indicator = metrics.get('trajectory_p95_distance', 0.0)
+                quality_label = "轨迹精度"
+            else:
+                quality_indicator = metrics.get('dev_p95', 0.0)
+                quality_label = "偏差P95"
             
             # 基础质量检查
             quality_issues = []
             if valid_ratio < 0.3:
                 quality_issues.append(f"有效率过低: {valid_ratio:.1%}")
-            if dev_p95 > 15.0:
-                quality_issues.append(f"偏差过大: {dev_p95:.2f}mm")
+            if quality_indicator > 15.0:
+                quality_issues.append(f"{quality_label}过大: {quality_indicator:.2f}mm")
                 
             if quality_issues:
                 self.progress_updated.emit(layer_id, f"质量警告: {'; '.join(quality_issues)}")
@@ -163,6 +190,124 @@ class LayerProcessingThread(QThread):
                     os.remove(temp_bias_path)
                 except:
                     pass
+                    
+    def calculate_corrected_metrics(self, result: Dict, layer_id: int) -> Optional[Dict]:
+        """计算纠偏后的统计指标"""
+        try:
+            import numpy as np
+            
+            # 检查是否有纠偏数据
+            if not hasattr(self.controller, 'last') or not self.controller.last:
+                return None
+                
+            controller_data = self.controller.last
+            vis_corr = controller_data.get('vis_corr')
+            
+            # 如果没有纠偏数据，返回原始指标
+            if vis_corr is None:
+                print(f"[第{layer_id}层] 无纠偏数据，使用原始指标")
+                return None
+                
+            # 获取基础数据
+            g_xy = controller_data.get('g_xy')
+            N_ref = controller_data.get('N_ref')
+            valid_mask = controller_data.get('valid_mask')
+            delta_n = controller_data.get('delta_n')
+            
+            if g_xy is None or N_ref is None or delta_n is None:
+                print(f"[第{layer_id}层] 缺少必要的计算数据")
+                return None
+            
+            # 计算纠偏后的delta_n
+            delta_n_corrected = delta_n.copy()
+            cfg = controller_data.get('cfg', {})
+            
+            # 如果启用了bias补偿，计算纠偏后的偏移
+            if cfg.get('bias_comp', {}).get('enable', False):
+                try:
+                    import json
+                    with open(cfg['bias_comp']['path'], 'r', encoding='utf-8') as f:
+                        bc = json.load(f)
+                    
+                    # 使用controller的bias计算方法
+                    ignore_mask = controller_data.get('ignore_mask')
+                    T_ref = None  # 将由_build_bias_vector自行计算
+                    
+                    bias = self.controller._build_bias_vector(
+                        bc, target_len=len(delta_n_corrected),
+                        g_xy=g_xy, N_ref=N_ref, T_ref=T_ref,
+                        ignore_mask=ignore_mask
+                    )
+                    
+                    # 应用bias补偿
+                    m = np.isfinite(delta_n_corrected)
+                    delta_n_corrected[m] = delta_n_corrected[m] - bias[m]
+                    
+                    print(f"[第{layer_id}层] 已应用bias补偿计算纠偏后指标")
+                    
+                except Exception as e:
+                    print(f"[第{layer_id}层] bias补偿失败，使用原始数据: {e}")
+            
+            # 计算纠偏后的中轴线
+            e_n_corrected = np.nan_to_num(delta_n_corrected, nan=0.0)
+            centerline_xy_corrected = g_xy + N_ref * e_n_corrected[:, None]
+            
+            # 计算纠偏后的轨迹精度指标
+            if len(centerline_xy_corrected) == len(g_xy):
+                # 计算纠偏后中轴线与理论轨迹的直线距离
+                trajectory_distances = np.linalg.norm(centerline_xy_corrected - g_xy, axis=1)
+                
+                if valid_mask is not None and valid_mask.any():
+                    trajectory_distances_valid = trajectory_distances[valid_mask]
+                else:
+                    trajectory_distances_valid = trajectory_distances
+                
+                if len(trajectory_distances_valid) > 0:
+                    # 计算纠偏后的轨迹精度指标
+                    traj_mean_dist = float(np.mean(trajectory_distances_valid))
+                    traj_median_dist = float(np.median(trajectory_distances_valid))
+                    traj_p95_dist = float(np.percentile(trajectory_distances_valid, 95))
+                    traj_max_dist = float(np.max(trajectory_distances_valid))
+                    traj_consistency = float(np.std(trajectory_distances_valid)) if len(trajectory_distances_valid) > 1 else 0.0
+                    
+                    # 计算有效率
+                    valid_ratio = float(np.count_nonzero(valid_mask)) / max(1, len(g_xy)) if valid_mask is not None else 1.0
+                    
+                    # 获取其他指标
+                    original_metrics = result.get('metrics', {})
+                    plane_inlier_ratio = original_metrics.get('plane_inlier_ratio', float('nan'))
+                    longest_missing_mm = original_metrics.get('longest_missing_mm', 0.0)
+                    
+                    # 构建纠偏后的指标字典
+                    corrected_metrics = {
+                        'valid_ratio': valid_ratio,
+                        # 新的轨迹精度指标（基于纠偏后数据）
+                        'trajectory_mean_distance': traj_mean_dist,
+                        'trajectory_median_distance': traj_median_dist,
+                        'trajectory_p95_distance': traj_p95_dist,
+                        'trajectory_max_distance': traj_max_dist,
+                        'trajectory_consistency': traj_consistency,
+                        # 保留原有指标作为参考
+                        'dev_mean_raw': float(np.mean(e_n_corrected[valid_mask])) if valid_mask is not None and valid_mask.any() else 0.0,
+                        'dev_median_raw': float(np.median(e_n_corrected[valid_mask])) if valid_mask is not None and valid_mask.any() else 0.0,
+                        'dev_p95_raw': float(np.percentile(np.abs(e_n_corrected[valid_mask]), 95)) if valid_mask is not None and valid_mask.any() else 0.0,
+                        'plane_inlier_ratio': plane_inlier_ratio,
+                        'longest_missing_mm': longest_missing_mm,
+                        # 标记这是纠偏后的指标
+                        '_corrected_metrics': True
+                    }
+                    
+                    print(f"[第{layer_id}层] 纠偏后指标: 平均距离={traj_mean_dist:.3f}mm, P95={traj_p95_dist:.3f}mm")
+                    return corrected_metrics
+                    
+            print(f"[第{layer_id}层] 纠偏后指标计算失败")
+            return None
+            
+        except Exception as e:
+            print(f"[第{layer_id}层] 纠偏后指标计算异常: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
                     
     def create_layer_out_directory(self, layer_id: int, correction_result: Dict):
         """为指定层创建独立的out文件夹并复制纠偏文件（保存到output总文件夹内）"""

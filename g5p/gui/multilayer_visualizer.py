@@ -613,17 +613,29 @@ class LayerVisualizationWidget(QWidget):
             
             metrics = data.get('metrics', {})
             
-            # 绘制误差统计信息
+            # 绘制统计信息
             y_pos = 100
-            error_info = [
-                f"有效率: {metrics.get('valid_ratio', 0):.1%}",
-                f"偏差均值: {metrics.get('dev_mean', 0):+.3f} mm",
-                f"偏差中位数: {metrics.get('dev_median', 0):+.3f} mm",
-                f"偏差P95: {metrics.get('dev_p95', 0):.3f} mm",
-                f"偏差标准差: {metrics.get('dev_std', 0):.3f} mm",
-                f"最大偏差: {metrics.get('dev_max', 0):+.3f} mm",
-                f"最小偏差: {metrics.get('dev_min', 0):+.3f} mm"
-            ]
+            # 优先显示新的轨迹精度指标
+            if 'trajectory_mean_distance' in metrics:
+                error_info = [
+                    f"轨迹覆盖率: {metrics.get('valid_ratio', 0):.1%}",
+                    f"平均距离: {metrics.get('trajectory_mean_distance', 0):.3f} mm",
+                    f"中位距离: {metrics.get('trajectory_median_distance', 0):.3f} mm",
+                    f"P95精度: {metrics.get('trajectory_p95_distance', 0):.3f} mm",
+                    f"最大偏离: {metrics.get('trajectory_max_distance', 0):.3f} mm",
+                    f"轨迹一致性: {metrics.get('trajectory_consistency', 0):.3f} mm"
+                ]
+            else:
+                # 兼容旧的法向偏移指标
+                error_info = [
+                    f"有效率: {metrics.get('valid_ratio', 0):.1%}",
+                    f"偏差均值: {metrics.get('dev_mean', 0):+.3f} mm",
+                    f"偏差中位数: {metrics.get('dev_median', 0):+.3f} mm",
+                    f"偏差P95: {metrics.get('dev_p95', 0):.3f} mm",
+                    f"偏差标准差: {metrics.get('dev_std', 0):.3f} mm",
+                    f"最大偏差: {metrics.get('dev_max', 0):+.3f} mm",
+                    f"最小偏差: {metrics.get('dev_min', 0):+.3f} mm"
+                ]
             
             for info in error_info:
                 cv2.putText(img, info, (50, y_pos), 
@@ -1047,7 +1059,7 @@ class LayerVisualizationWidget(QWidget):
             self.image_label.setText(f"图像显示错误: {e}")
             
     def update_statistics(self):
-        """更新统计信息"""
+        """更新统计信息（重要：优先使用纠偏后数据）"""
         if not self.current_layer_id or self.current_layer_id not in self.layers_data:
             return
             
@@ -1055,8 +1067,18 @@ class LayerVisualizationWidget(QWidget):
             data = self.layers_data[self.current_layer_id]
             metrics = data.get('metrics', {})
             
+            # 检查是否是纠偏后的指标
+            is_corrected_metrics = metrics.get('_corrected_metrics', False)
+            
             # 当前层统计
             stats_text = self.format_layer_statistics(self.current_layer_id, metrics, data)
+            
+            # 添加数据类型标识
+            if is_corrected_metrics:
+                stats_text += "\n\n🔄 显示纠偏后数据"
+            else:
+                stats_text += "\n\n⚠️ 显示原始数据（非纠偏后）"
+                
             self.current_stats.setPlainText(stats_text)
             
             # 对比模式
@@ -1077,15 +1099,37 @@ class LayerVisualizationWidget(QWidget):
         
         # 基础指标
         valid_ratio = metrics.get('valid_ratio', 0)
-        stats_lines.append(f"有效率: {valid_ratio:.1%}")
+        stats_lines.append(f"轨迹覆盖率: {valid_ratio:.1%}")
         
-        dev_p95 = metrics.get('dev_p95', 0)
-        stats_lines.append(f"偏差P95: {dev_p95:.3f} mm")
-        
-        dev_mean = metrics.get('dev_mean', 0)
-        dev_median = metrics.get('dev_median', 0)
-        stats_lines.append(f"偏差均值: {dev_mean:+.3f} mm")
-        stats_lines.append(f"偏差中位数: {dev_median:+.3f} mm")
+        # 优先显示新的轨迹精度指标
+        if 'trajectory_mean_distance' in metrics:
+            # 新的轨迹精度指标 (更准确)
+            stats_lines.append("\n=== 轨迹精度指标 ===")
+            
+            traj_mean = metrics.get('trajectory_mean_distance', 0)
+            stats_lines.append(f"平均距离: {traj_mean:.3f} mm")
+            
+            traj_median = metrics.get('trajectory_median_distance', 0)
+            stats_lines.append(f"中位距离: {traj_median:.3f} mm")
+            
+            traj_p95 = metrics.get('trajectory_p95_distance', 0)
+            stats_lines.append(f"P95精度: {traj_p95:.3f} mm")
+            
+            traj_max = metrics.get('trajectory_max_distance', 0)
+            stats_lines.append(f"最大偏离: {traj_max:.3f} mm")
+            
+            traj_consistency = metrics.get('trajectory_consistency', 0)
+            if traj_consistency > 0:
+                stats_lines.append(f"轨迹一致性: {traj_consistency:.3f} mm")
+        else:
+            # 兼容旧的法向偏移指标
+            dev_p95 = metrics.get('dev_p95', 0)
+            stats_lines.append(f"偏差P95: {dev_p95:.3f} mm")
+            
+            dev_mean = metrics.get('dev_mean', 0)
+            dev_median = metrics.get('dev_median', 0)
+            stats_lines.append(f"偏差均值: {dev_mean:+.3f} mm")
+            stats_lines.append(f"偏差中位数: {dev_median:+.3f} mm")
         
         # 平面拟合信息
         plane_inlier_ratio = metrics.get('plane_inlier_ratio', 0)
@@ -1124,17 +1168,24 @@ class LayerVisualizationWidget(QWidget):
             prev_metrics = prev_data.get('metrics', {})
             curr_metrics = self.layers_data[self.current_layer_id].get('metrics', {})
             
-            # 有效率变化
+            # 覆盖率变化
             prev_valid = prev_metrics.get('valid_ratio', 0)
             curr_valid = curr_metrics.get('valid_ratio', 0)
             valid_change = curr_valid - prev_valid
-            compare_lines.append(f"有效率变化: {valid_change:+.1%}")
+            compare_lines.append(f"覆盖率变化: {valid_change:+.1%}")
             
-            # 偏差变化
-            prev_p95 = prev_metrics.get('dev_p95', 0)
-            curr_p95 = curr_metrics.get('dev_p95', 0)
-            p95_change = curr_p95 - prev_p95
-            compare_lines.append(f"P95偏差变化: {p95_change:+.3f} mm")
+            # 优先使用新的轨迹精度指标
+            if 'trajectory_p95_distance' in curr_metrics and 'trajectory_p95_distance' in prev_metrics:
+                prev_p95 = prev_metrics.get('trajectory_p95_distance', 0)
+                curr_p95 = curr_metrics.get('trajectory_p95_distance', 0)
+                p95_change = curr_p95 - prev_p95
+                compare_lines.append(f"P95精度变化: {p95_change:+.3f} mm")
+            else:
+                # 兼容旧指标
+                prev_p95 = prev_metrics.get('dev_p95', 0)
+                curr_p95 = curr_metrics.get('dev_p95', 0)
+                p95_change = curr_p95 - prev_p95
+                compare_lines.append(f"P95偏差变化: {p95_change:+.3f} mm")
             
         # 整体趋势
         if len(self.layers_data) >= 3:

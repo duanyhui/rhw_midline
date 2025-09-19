@@ -526,10 +526,50 @@ class AlignController:
         vis_top_only = core.render_topdown(height, mask_top, origin_xy, pix_mm, gcode_xy=None)
         nearest_vis = cv2.cvtColor(nearest_mask, cv2.COLOR_GRAY2BGR)
 
-        # 指标卡
+        # 指标卡 - 改进：使用更有意义的轨迹偏离指标
+        
+        # 计算实际轨迹与理论轨迹的直线距离偏差
+        if centerline_xy is not None and g_xy is not None and len(centerline_xy) == len(g_xy):
+            # 计算实际中轴线与理论轨迹的欧几里得距离
+            trajectory_distances = np.linalg.norm(centerline_xy - g_xy, axis=1)
+            trajectory_distances_valid = trajectory_distances[valid_mask] if valid_mask.any() else trajectory_distances
+            
+            # 计算轨迹跟踪精度指标
+            traj_mean_dist = float(np.mean(trajectory_distances_valid)) if len(trajectory_distances_valid) > 0 else 0.0
+            traj_median_dist = float(np.median(trajectory_distances_valid)) if len(trajectory_distances_valid) > 0 else 0.0
+            traj_p95_dist = float(np.percentile(trajectory_distances_valid, 95)) if len(trajectory_distances_valid) > 0 else 0.0
+            traj_max_dist = float(np.max(trajectory_distances_valid)) if len(trajectory_distances_valid) > 0 else 0.0
+            
+            # 计算轨迹一致性（相邻点距离的标准差，反映轨迹平滑度）
+            if len(trajectory_distances_valid) > 1:
+                traj_consistency = float(np.std(trajectory_distances_valid))
+            else:
+                traj_consistency = 0.0
+                
+            # 计算轨迹覆盖率（有效测量点占总轨迹长度的比例）
+            valid_ratio = float(np.count_nonzero(valid_mask)) / max(1, g_xy.shape[0])
+            
+        else:
+            # 如果没有有效的轨迹数据，使用原有的法向偏移作为备用
+            traj_mean_dist = abs(float(dev_mean)) if 'dev_mean' in locals() else 0.0
+            traj_median_dist = abs(float(dev_med)) if 'dev_med' in locals() else 0.0
+            traj_p95_dist = float(dev_p95) if 'dev_p95' in locals() else 0.0
+            traj_max_dist = float(dev_p95) if 'dev_p95' in locals() else 0.0
+            traj_consistency = 0.0
+            valid_ratio = float(np.count_nonzero(valid_mask)) / max(1, len(g_xy)) if 'valid_mask' in locals() and g_xy is not None else 0.0
+        
         metrics = dict(
-            valid_ratio=float(np.count_nonzero(valid_mask)) / max(1, g_xy.shape[0]),
-            dev_mean=dev_mean, dev_median=dev_med, dev_p95=dev_p95,
+            valid_ratio=valid_ratio,
+            # 新的轨迹跟踪精度指标
+            trajectory_mean_distance=traj_mean_dist,
+            trajectory_median_distance=traj_median_dist, 
+            trajectory_p95_distance=traj_p95_dist,
+            trajectory_max_distance=traj_max_dist,
+            trajectory_consistency=traj_consistency,
+            # 保留原有指标作为详细信息（但不在主界面显示）
+            dev_mean_raw=dev_mean if 'dev_mean' in locals() else 0.0,
+            dev_median_raw=dev_med if 'dev_med' in locals() else 0.0,
+            dev_p95_raw=dev_p95 if 'dev_p95' in locals() else 0.0,
             plane_inlier_ratio=float(inlier_ratio) if np.isfinite(inlier_ratio) else float('nan'),
             longest_missing_mm=float(longest_mm)
         )
