@@ -36,7 +36,7 @@ if 'bias_comp_path' in result:
 ```
 
 **修复后**:
-```python
+```
 # 优先从result中的bias_comp_data获取，文件作为备用
 if 'bias_comp_data' in result:
     layer_info.bias_comp = result['bias_comp_data']
@@ -58,14 +58,14 @@ elif 'bias_comp_path' in result:
 **文件**: `multilayer_processor.py` (行 119-135)
 
 **修复前**:
-```python
+```
 # 立即删除临时文件
 if temp_bias_path and os.path.exists(temp_bias_path):
     os.remove(temp_bias_path)
 ```
 
 **修复后**:
-```python
+```
 # 先保存数据到result，再延迟删除文件
 if 'bias_comp_path' in result:
     with open(result['bias_comp_path'], 'r', encoding='utf-8') as f:
@@ -140,3 +140,90 @@ if temp_bias_path and os.path.exists(temp_bias_path):
 4. ✅ **符合项目规范**: 严格按照多层纠偏逻辑执行
 
 **现在重新运行系统，奇数层应该能正确应用前层的偏差补偿，中轴线偏差问题将彻底解决！** 🚀
+
+
+# Bias补偿预览修复报告
+
+## 问题描述
+
+用户发现CorrectedPreview窗口使用的是"Centerline vs G-code (RHR)"的数据生成预览，而实际导出的corrected.gcode和offset_table.csv是基于"Centerline vs G-code [Bias Corrected]"的数据生成的，导致预览效果与实际导出数据不一致。
+
+## 问题分析
+
+### 原始流程
+1. **原始测量**: 相机获取点云 → 计算原始偏移量 `delta_n`
+2. **可视化显示**: 
+   - "Centerline vs G-code (RHR)" 显示原始 `delta_n`
+   - "Centerline vs G-code [Bias Corrected]" 显示 `delta_n - bias`
+3. **导出处理**: 在按'c'键导出时应用bias补偿 `delta_n_meas = delta_n - bias`
+4. **预览生成**: **问题所在** - CorrectedPreview使用 `vis_cmp.copy()` (原始可视化)作为底图
+
+### Bias补偿应用时机
+从代码L2122-2157可以看到，bias补偿是在导出阶段应用的：
+```
+# 只在有效测量处相减，NaN保持不变
+m = np.isfinite(delta_n_meas)
+delta_n_meas[m] = delta_n_meas[m] - bias[m]
+```
+
+## 解决方案
+
+### 修改内容
+1. **CorrectedPreview底图选择逻辑** (L2239-2250):
+   ```python
+   # 检查是否启用bias补偿，如果启用则使用bias补偿后的可视化作为底图
+   bc_cfg = PARAMS.get('bias_comp', {})
+   if bc_cfg.get('enable', False) and 'vis_cmp_corr' in locals():
+       vis_prev = vis_cmp_corr.copy()
+       print('[PREVIEW] Using bias-corrected visualization as base')
+   else:
+       vis_prev = vis_cmp.copy()
+       print('[PREVIEW] Using original visualization as base')
+   ```
+
+2. **QuickLook底图选择逻辑** (L2264-2273):
+   ```python
+   # 使用bias补偿后的可视化（如果可用）作为quicklook的底图
+   bc_cfg = PARAMS.get('bias_comp', {})
+   if bc_cfg.get('enable', False) and 'vis_cmp_corr' in locals():
+       base_vis = vis_cmp_corr
+   else:
+       base_vis = vis_cmp
+   ```
+
+### 修改原理
+- 当`bias_comp.enable=True`且存在`vis_cmp_corr`变量时，使用bias补偿后的可视化
+- `vis_cmp_corr`在L2073-2090生成，显示的是bias补偿后的结果
+- 这确保了预览效果与实际导出数据的一致性
+
+## 验证方法
+
+1. **运行程序**: `python align_centerline_to_gcode_pro_edit_max.py`
+2. **确认bias补偿启用**: 检查`bias_comp.json`存在且`PARAMS['bias_comp']['enable']=True`
+3. **查看窗口**: 应该能看到两个可视化窗口
+   - "Centerline vs G-code (RHR)" - 原始测量
+   - "Centerline vs G-code [Bias Corrected]" - bias补偿后
+4. **导出测试**: 按'c'键导出，观察控制台信息：
+   - 应该看到`[PREVIEW] Using bias-corrected visualization as base`
+   - CorrectedPreview窗口应该基于bias补偿后的数据
+5. **对比验证**: 导出的corrected.gcode应该与CorrectedPreview中显示的轨迹一致
+
+## 修改文件
+
+- **文件**: `align_centerline_to_gcode_pro_edit_max.py`
+- **修改行数**: L2239-2250, L2264-2273
+- **影响**: CorrectedPreview和QuickLook现在都会在bias补偿启用时使用正确的底图
+
+## 预期效果
+
+修复后，当bias补偿启用时：
+- CorrectedPreview将基于"Centerline vs G-code [Bias Corrected]"数据生成
+- 导出的corrected.gcode与CorrectedPreview显示完全一致
+- QuickLook图像也会使用bias补偿后的可视化作为底图
+- 用户看到的预览效果与实际导出数据保持一致
+
+## 兼容性
+
+- 当bias补偿未启用时，仍使用原始可视化，保持向后兼容
+- 不影响其他功能和现有工作流程
+- 修改仅在导出阶段生效，不影响实时可视化逻辑

@@ -2236,7 +2236,14 @@ def run():
                     # === 7) 预览叠加 ===
                     if PARAMS.get('preview_corrected', True):
                         try:
-                            vis_prev = vis_cmp.copy()
+                            # 检查是否启用bias补偿，如果启用则使用bias补偿后的可视化作为底图
+                            bc_cfg = PARAMS.get('bias_comp', {})
+                            if bc_cfg.get('enable', False) and 'vis_cmp_corr' in locals():
+                                vis_prev = vis_cmp_corr.copy()
+                                print('[PREVIEW] Using bias-corrected visualization as base')
+                            else:
+                                vis_prev = vis_cmp.copy()
+                                print('[PREVIEW] Using original visualization as base')
                             Hprev, Wprev = vis_prev.shape[:2]
                             def xy_to_px(xy_arr):
                                 if xy_arr.size == 0: return np.empty((0,2), int)
@@ -2262,7 +2269,13 @@ def run():
                     # quicklook & report
                     if PARAMS.get('dump_quicklook', True):
                         hist = _render_histogram(delta_n_apply, title='applied delta_n histogram (mm)')
-                        quick = _compose_quicklook(vis_cmp, None, hist,
+                        # 使用bias补偿后的可视化（如果可用）作为quicklook的底图
+                        bc_cfg = PARAMS.get('bias_comp', {})
+                        if bc_cfg.get('enable', False) and 'vis_cmp_corr' in locals():
+                            base_vis = vis_cmp_corr
+                        else:
+                            base_vis = vis_cmp
+                        quick = _compose_quicklook(base_vis, None, hist,
                             hud_text='Exported: offsets & corrected.gcode')
                         qp = out_dir / 'quicklook.png'
                         cv2.imwrite(str(qp), quick); print('[SAVE]', qp)
