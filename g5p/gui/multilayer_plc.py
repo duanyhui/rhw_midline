@@ -10,25 +10,52 @@ from PyQt5.QtCore import QThread, QObject, pyqtSignal
 
 from multilayer_data import ProjectConfig
 
+# ==================== PLC数据交换协议定义 ====================
+
+class PLCDataProtocol:
+    """PLC数据交换协议定义"""
+    
+    # 数据交换命令类型
+    CMD_READ_LAYER = "read_current_layer"      # 读取当前层号
+    CMD_READ_STATUS = "read_machine_status"    # 读取机床状态
+    CMD_WRITE_COMPLETE = "write_layer_complete" # 写入层完成信号
+    CMD_SEND_CORRECTION = "send_correction_data" # 发送纠偏数据
+    CMD_ALERT_ERROR = "alert_deviation_error"   # 偏差过大警告
+    
+    # 机床状态枚举
+    STATUS_IDLE = "idle"           # 空闲
+    STATUS_PROCESSING = "processing" # 加工中
+    STATUS_WAITING = "waiting"     # 等待纠偏数据
+    STATUS_ERROR = "error"         # 错误状态
+    
+    # 纠偏数据状态
+    CORRECTION_VALID = "valid"     # 有效纠偏数据
+    CORRECTION_SKIP = "skip"       # 跳过纠偏（偏差过大）
+    CORRECTION_ERROR = "error"     # 纠偏数据错误
+
 # ==================== PLC通信基类 ====================
 
 class PLCCommunicator(QObject):
     """PLC通信基类"""
     layer_changed = pyqtSignal(int)  # 层号变化信号
     connection_status = pyqtSignal(bool, str)  # 连接状态信号
+    machine_status_changed = pyqtSignal(str)  # 机床状态变化信号
+    correction_request = pyqtSignal(int)  # 纠偏请求信号
     
     def __init__(self, config: ProjectConfig):
         super().__init__()
         self.config = config
         self.connected = False
         self.running = False
+        self.current_layer = 0
+        self.machine_status = PLCDataProtocol.STATUS_IDLE
         
     def connect(self):
         """连接PLC"""
         raise NotImplementedError
         
-    def disconnect(self):
-        """断开连接"""
+    def disconnect_plc(self):
+        """断开PLC连接"""
         self.running = False
         self.connected = False
         
@@ -36,18 +63,32 @@ class PLCCommunicator(QObject):
         """读取当前层号"""
         raise NotImplementedError
         
-    def read_start_signal(self) -> bool:
-        """读取开始信号"""
+    def read_machine_status(self) -> str:
+        """读取机床状态"""
         raise NotImplementedError
         
-    def write_completion_signal(self, layer_id: int, success: bool):
-        """写入完成信号"""
-        pass  # 可选实现
+    def read_start_signal(self) -> bool:
+        """读取开始信号（兼容旧接口）"""
+        # 默认实现，基于机床状态判断
+        status = self.read_machine_status()
+        return status == PLCDataProtocol.STATUS_WAITING
+        
+    def write_layer_completion(self, layer_id: int, success: bool, processing_time: float = 0.0):
+        """写入层完成信号"""
+        raise NotImplementedError
+        
+    def send_correction_data(self, layer_id: int, correction_data: dict) -> bool:
+        """发送纠偏数据到PLC"""
+        raise NotImplementedError
+        
+    def send_deviation_alert(self, layer_id: int, alert_message: str, deviation_value: float):
+        """发送偏差过大警告"""
+        raise NotImplementedError
 
-# ==================== TCP方式PLC通信 ====================
+# ==================== TCP方式PLC通信（支持JSON数据交换） ====================
 
 class TCPPLCCommunicator(PLCCommunicator):
-    """TCP方式PLC通信"""
+    """TCP方式PLC通信，支持JSON数据交换"""
     
     def __init__(self, config: ProjectConfig):
         super().__init__(config)
@@ -66,8 +107,8 @@ class TCPPLCCommunicator(PLCCommunicator):
             self.connection_status.emit(False, f"TCP连接失败: {e}")
             return False
             
-    def disconnect(self):
-        super().disconnect()
+    def disconnect_plc(self):
+        super().disconnect_plc()
         if self.socket:
             try:
                 self.socket.close()
@@ -75,66 +116,172 @@ class TCPPLCCommunicator(PLCCommunicator):
                 pass
             self.socket = None
             
-    def read_current_layer(self) -> int:
+    def _send_command(self, command: dict) -> dict:
+        """发送命令并接收响应"""
         if not self.connected or not self.socket:
-            return -1
+            return {"success": False, "error": "连接未建立"}
+        
         try:
-            # 发送读取层号请求
-            request = {"type": "read_layer", "timestamp": time.time()}
-            request_data = json.dumps(request).encode('utf-8')
-            self.socket.send(len(request_data).to_bytes(4, byteorder='big'))
-            self.socket.send(request_data)
+            # 发送命令
+            command_data = json.dumps(command).encode('utf-8')
+            self.socket.send(len(command_data).to_bytes(4, byteorder='big'))
+            self.socket.send(command_data)
             
             # 接收响应
             length_bytes = self.socket.recv(4)
             if len(length_bytes) < 4:
-                return -1
-            length = int.from_bytes(length_bytes, byteorder='big')
+                return {"success": False, "error": "接收数据长度错误"}
             
+            length = int.from_bytes(length_bytes, byteorder='big')
             response_data = self.socket.recv(length)
             response = json.loads(response_data.decode('utf-8'))
-            return response.get("layer", -1)
+            return response
         except Exception as e:
-            print(f"TCP读取层号失败: {e}")
-            return -1
+            return {"success": False, "error": str(e)}
             
-    def read_start_signal(self) -> bool:
-        if not self.connected or not self.socket:
+    def read_current_layer(self) -> int:
+        command = {
+            "type": PLCDataProtocol.CMD_READ_LAYER,
+            "timestamp": time.time()
+        }
+        response = self._send_command(command)
+        return response.get("layer", -1) if response.get("success") else -1
+        
+    def read_machine_status(self) -> str:
+        command = {
+            "type": PLCDataProtocol.CMD_READ_STATUS,
+            "timestamp": time.time()
+        }
+        response = self._send_command(command)
+        return response.get("status", PLCDataProtocol.STATUS_ERROR) if response.get("success") else PLCDataProtocol.STATUS_ERROR
+            
+    def write_layer_completion(self, layer_id: int, success: bool, processing_time: float = 0.0):
+        """写入层完成信号"""
+        command = {
+            "type": PLCDataProtocol.CMD_WRITE_COMPLETE,
+            "layer": layer_id,
+            "success": success,
+            "processing_time": processing_time,
+            "timestamp": time.time()
+        }
+        response = self._send_command(command)
+        return response.get("success", False)
+        
+    def send_correction_data(self, layer_id: int, correction_data: dict) -> bool:
+        """发送纠偏数据到PLC"""
+        # 检查纠偏数据安全性
+        safety_check = self._check_correction_safety(correction_data)
+        if not safety_check["safe"]:
+            self.send_deviation_alert(layer_id, safety_check["message"], safety_check["max_deviation"])
             return False
+            
+        command = {
+            "type": PLCDataProtocol.CMD_SEND_CORRECTION,
+            "layer": layer_id,
+            "correction_status": PLCDataProtocol.CORRECTION_VALID,
+            "data": correction_data,
+            "timestamp": time.time()
+        }
+        response = self._send_command(command)
+        return response.get("success", False)
+        
+    def send_deviation_alert(self, layer_id: int, alert_message: str, deviation_value: float):
+        """发送偏差过大警告"""
+        command = {
+            "type": PLCDataProtocol.CMD_ALERT_ERROR,
+            "layer": layer_id,
+            "alert_message": alert_message,
+            "deviation_value": deviation_value,
+            "correction_status": PLCDataProtocol.CORRECTION_SKIP,
+            "timestamp": time.time()
+        }
+        self._send_command(command)
+        
+    def _check_correction_safety(self, correction_data: dict) -> dict:
+        """检查纠偏数据安全性"""
         try:
-            request = {"type": "read_start", "timestamp": time.time()}
-            request_data = json.dumps(request).encode('utf-8')
-            self.socket.send(len(request_data).to_bytes(4, byteorder='big'))
-            self.socket.send(request_data)
+            # 安全阈值设置
+            MAX_OFFSET_MM = 20.0  # 最大允许偏移量
+            MAX_GRADIENT = 0.5    # 最大允许梯度
             
-            length_bytes = self.socket.recv(4)
-            if len(length_bytes) < 4:
-                return False
-            length = int.from_bytes(length_bytes, byteorder='big')
+            # 检查偏移表数据
+            if "offset_table_path" in correction_data:
+                # 尝试使用pandas，如果没有则使用csv模块
+                try:
+                    # Type: ignore for pandas import
+                    import pandas as pd  # type: ignore
+                    offset_df = pd.read_csv(correction_data["offset_table_path"])
+                    
+                    # 检查最大偏移量
+                    if "dx_mm" in offset_df.columns and "dy_mm" in offset_df.columns:
+                        max_offset = ((offset_df["dx_mm"]**2 + offset_df["dy_mm"]**2)**0.5).max()
+                        if max_offset > MAX_OFFSET_MM:
+                            return {
+                                "safe": False,
+                                "message": f"偏移量过大: {max_offset:.2f}mm > {MAX_OFFSET_MM}mm",
+                                "max_deviation": max_offset
+                            }
+                    
+                    # 检查梯度变化
+                    if len(offset_df) > 1:
+                        dx_diff = offset_df["dx_mm"].diff().abs().max()
+                        dy_diff = offset_df["dy_mm"].diff().abs().max()
+                        max_gradient = max(dx_diff, dy_diff)
+                        if max_gradient > MAX_GRADIENT:
+                            return {
+                                "safe": False,
+                                "message": f"梯度变化过大: {max_gradient:.3f} > {MAX_GRADIENT}",
+                                "max_deviation": max_gradient
+                            }
+                            
+                except ImportError:
+                    # 如果没有pandas，使用csv模块读取
+                    import csv
+                    with open(correction_data["offset_table_path"], 'r') as f:
+                        reader = csv.DictReader(f)
+                        data = list(reader)
+                        if not data:
+                            return {"safe": True, "message": "空数据文件", "max_deviation": 0.0}
+                        
+                        # 检查最大偏移量
+                        max_offset = 0.0
+                        max_gradient = 0.0
+                        prev_dx, prev_dy = 0.0, 0.0
+                        
+                        for i, row in enumerate(data):
+                            dx = float(row.get("dx_mm", 0))
+                            dy = float(row.get("dy_mm", 0))
+                            offset = (dx**2 + dy**2)**0.5
+                            max_offset = max(max_offset, offset)
+                            
+                            # 检查梯度
+                            if i > 0:
+                                gradient = max(abs(dx - prev_dx), abs(dy - prev_dy))
+                                max_gradient = max(max_gradient, gradient)
+                            prev_dx, prev_dy = dx, dy
+                            
+                        if max_offset > MAX_OFFSET_MM:
+                            return {
+                                "safe": False,
+                                "message": f"偏移量过大: {max_offset:.2f}mm > {MAX_OFFSET_MM}mm",
+                                "max_deviation": max_offset
+                            }
+                            
+                        if max_gradient > MAX_GRADIENT:
+                            return {
+                                "safe": False,
+                                "message": f"梯度变化过大: {max_gradient:.3f} > {MAX_GRADIENT}",
+                                "max_deviation": max_gradient
+                            }
             
-            response_data = self.socket.recv(length)
-            response = json.loads(response_data.decode('utf-8'))
-            return response.get("start", False)
+            return {"safe": True, "message": "数据安全", "max_deviation": 0.0}
+            
         except Exception as e:
-            print(f"TCP读取开始信号失败: {e}")
-            return False
-            
-    def write_completion_signal(self, layer_id: int, success: bool):
-        """写入完成信号"""
-        if not self.connected or not self.socket:
-            return
-        try:
-            request = {
-                "type": "write_completion",
-                "layer": layer_id,
-                "success": success,
-                "timestamp": time.time()
+            return {
+                "safe": False,
+                "message": f"数据检查错误: {str(e)}",
+                "max_deviation": float('inf')
             }
-            request_data = json.dumps(request).encode('utf-8')
-            self.socket.send(len(request_data).to_bytes(4, byteorder='big'))
-            self.socket.send(request_data)
-        except Exception as e:
-            print(f"TCP写入完成信号失败: {e}")
 
 # ==================== S7协议PLC通信 ====================
 
@@ -169,8 +316,8 @@ class S7PLCCommunicator(PLCCommunicator):
             self.connection_status.emit(False, f"S7连接失败: {e}")
             return False
             
-    def disconnect(self):
-        super().disconnect()
+    def disconnect_plc(self):
+        super().disconnect_plc()
         if self.client:
             try:
                 self.client.disconnect()
@@ -294,8 +441,8 @@ class MockPLCCommunicator(PLCCommunicator):
         self.connection_status.emit(True, "模拟PLC连接成功")
         return True
         
-    def disconnect(self):
-        super().disconnect()
+    def disconnect_plc(self):
+        super().disconnect_plc()
         
     def read_current_layer(self) -> int:
         if not self.connected:
@@ -340,6 +487,7 @@ class PLCMonitorThread(QThread):
         self.communicator = communicator
         self.last_layer = -1
         self.last_start = False
+        self.last_status = ""
         self.running = False
         self.poll_interval = 0.5  # 500ms轮询间隔
         
@@ -356,7 +504,19 @@ class PLCMonitorThread(QThread):
                     self.last_layer = current_layer
                     self.communicator.layer_changed.emit(current_layer)
                     
-                # 读取开始信号
+                # 读取机床状态
+                machine_status = self.communicator.read_machine_status()
+                if machine_status != self.last_status:
+                    self.last_status = machine_status
+                    if hasattr(self.communicator, 'machine_status_changed'):
+                        self.communicator.machine_status_changed.emit(machine_status)
+                    
+                    # 如果机床进入等待状态，发出纠偏请求信号
+                    if (machine_status == "waiting" and 
+                        hasattr(self.communicator, 'correction_request')):
+                        self.communicator.correction_request.emit(current_layer)
+                
+                # 兼容旧接口：读取开始信号
                 start_signal = self.communicator.read_start_signal()
                 if start_signal != self.last_start:
                     self.last_start = start_signal

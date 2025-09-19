@@ -57,6 +57,9 @@ class MultilayerMainWindow(QMainWindow):
         self.layers: Dict[int, LayerInfo] = {}
         self.current_layer = 0
         
+        # 处理参数（来自高级参数配置）
+        self.process_delay_sec = 0.5  # 默认500ms处理延迟
+        
         # PLC通信
         self.plc_communicator = None
         self.plc_monitor = None
@@ -352,9 +355,11 @@ class MultilayerMainWindow(QMainWindow):
             # 默认使用模拟通信器
             self.plc_communicator = MockPLCCommunicator(self.project_config)
             
-        # 连接信号
+        # 连接新的PLC信号
         self.plc_communicator.connection_status.connect(self.on_plc_status_changed)
         self.plc_communicator.layer_changed.connect(self.on_layer_changed_from_plc)
+        self.plc_communicator.machine_status_changed.connect(self.on_machine_status_changed)
+        self.plc_communicator.correction_request.connect(self.on_correction_request)
         
         # 尝试连接
         if self.plc_communicator.connect():
@@ -373,7 +378,7 @@ class MultilayerMainWindow(QMainWindow):
             self.plc_monitor = None
             
         if self.plc_communicator:
-            self.plc_communicator.disconnect()
+            self.plc_communicator.disconnect_plc()
             self.plc_communicator = None
             
         self.connect_plc_btn.setText("连接PLC")
@@ -449,6 +454,36 @@ class MultilayerMainWindow(QMainWindow):
             if self.auto_next_check.isChecked():
                 self.process_current_layer()
                 
+    def on_machine_status_changed(self, status: str):
+        """机床状态变化"""
+        status_map = {
+            "idle": "空闲",
+            "processing": "加工中",
+            "waiting": "等待纠偏",
+            "error": "错误"
+        }
+        chinese_status = status_map.get(status, status)
+        self.status_label.setText(f"机床状态: {chinese_status}")
+        
+        # 根据状态调整界面
+        if status == "waiting":
+            self.process_current_btn.setEnabled(True)
+            self.status_label.setText(f"机床等待纠偏数据 - 第{self.current_layer}层")
+        elif status == "processing":
+            self.process_current_btn.setEnabled(False)
+        elif status == "error":
+            self.process_current_btn.setEnabled(True)
+            
+    def on_correction_request(self, layer_id: int):
+        """机床请求纠偏数据"""
+        self.status_label.setText(f"机床请求第{layer_id}层纠偏数据")
+        
+        if self.auto_next_check.isChecked() and layer_id in self.layers:
+            self.current_layer = layer_id
+            # 使用高级参数中配置的延迟时间，默认500ms
+            delay_ms = getattr(self, 'process_delay_sec', 0.5) * 1000
+            QTimer.singleShot(int(delay_ms), self.process_current_layer)
+                
     def on_processing_finished(self, layer_id: int, result: Dict):
         """处理完成"""
         if layer_id in self.layers:
@@ -478,11 +513,37 @@ class MultilayerMainWindow(QMainWindow):
             self.update_layer_table()
             
             self.progress_bar.setValue(100)
+            processing_time = result.get('processing_time', 0.0)
             self.status_label.setText(f"第{layer_id}层处理完成")
             
-            # 自动下一层
+            # 发送纠偏数据到PLC（非标定层）
+            if layer_id > 1 and self.plc_communicator and self.plc_communicator.connected:
+                correction_data = result.get('correction', {})
+                if correction_data:
+                    try:
+                        success = self.plc_communicator.send_correction_data(layer_id, correction_data)
+                        if success:
+                            self.status_label.setText(f"第{layer_id}层纠偏数据已发送到PLC")
+                        else:
+                            self.status_label.setText(f"第{layer_id}层纠偏数据发送失败")
+                    except Exception as e:
+                        print(f"发送纠偏数据到PLC失败: {e}")
+                        
+            # 发送层完成信号到PLC
+            if self.plc_communicator and self.plc_communicator.connected:
+                try:
+                    self.plc_communicator.write_layer_completion(
+                        layer_id, True, processing_time
+                    )
+                except Exception as e:
+                    print(f"发送完成信号到PLC失败: {e}")
+            
+            # 自动下一层 - 等待PLC状态而不是使用固定延迟
             if self.auto_next_check.isChecked() and layer_id < len(self.layers):
-                QTimer.singleShot(2000, self.go_next_layer)  # 2秒后自动下一层
+                # 不再使用固定延迟，而是等待PLC发送correction_request信号
+                # PLC会在机床完成当前层加工后发送下一层请求
+                self.status_label.setText(f"第{layer_id}层已完成，等待机床开始下一层...")
+                print(f"第{layer_id}层处理完成，等待PLC发送下一层请求信号...")
                 
     def on_processing_failed(self, layer_id: int, error: str):
         """处理失败"""
@@ -849,6 +910,16 @@ class MultilayerMainWindow(QMainWindow):
         try:
             # 参数已经在对话框中应用到控制器，这里做后续处理
             
+            # 保存处理延迟参数
+            if 'process_delay_sec' in params_dict:
+                self.process_delay_sec = params_dict['process_delay_sec']
+                print(f"处理延迟时间已更新为: {self.process_delay_sec}秒")
+            
+            # 保存自动下一层参数
+            if 'auto_next_layer' in params_dict:
+                self.auto_next_check.setChecked(params_dict['auto_next_layer'])
+                print(f"自动下一层设置已更新为: {params_dict['auto_next_layer']}")
+            
             # 自动触发一次预览以显示参数效果
             if hasattr(self, 'process_current_btn') and self.process_current_btn.isEnabled():
                 # 在当前层上触发参数验证
@@ -857,7 +928,7 @@ class MultilayerMainWindow(QMainWindow):
             self.status_label.setText("高级参数已应用")
             
             # 显示成功消息
-            QMessageBox.information(self, "成功", "高级参数已成功应用！\n\n主要更新包括：\n- ROI投影参数\n- 最近表面提取参数\n- 引导中心线参数\n- 可视化设置\n- 遮挡区域配置\n- 质量控制阈值")
+            QMessageBox.information(self, "成功", "高级参数已成功应用！\n\n主要更新包括：\n- ROI投影参数\n- 最近表面提取参数\n- 引导中心线参数\n- 可视化设置\n- 遮挡区域配置\n- 质量控制阈值\n- 处理延迟时间")
             
         except Exception as e:
             QMessageBox.critical(self, "错误", f"应用高级参数失败: {e}")
