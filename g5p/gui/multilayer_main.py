@@ -23,7 +23,7 @@ from PyQt5.QtWidgets import (
     QMessageBox, QScrollArea, QFrame, QListWidget, QListWidgetItem
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QObject
-from PyQt5.QtGui import QPixmap, QFont
+from PyQt5.QtGui import QPixmap, QFont, QCloseEvent
 
 # 本地模块
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -78,7 +78,7 @@ class MultilayerMainWindow(QMainWindow):
         
         # 主布局：水平分割
         main_layout = QHBoxLayout(central_widget)
-        splitter = QSplitter(Qt.Horizontal)
+        splitter = QSplitter()
         main_layout.addWidget(splitter)
         
         # 左侧控制面板
@@ -590,36 +590,124 @@ class MultilayerMainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"保存项目失败: {e}")
             
     def export_results(self):
-        """导出结果"""
+        """导出结果 - 增强版，包含每层out文件夹"""
         try:
             export_dir = QFileDialog.getExistingDirectory(self, "选择导出目录")
             if export_dir:
                 export_path = Path(export_dir) / f"{self.project_config.project_name}_export"
                 export_path.mkdir(exist_ok=True)
                 
-                # 导出各层结果
-                for layer_id, layer_info in self.layers.items():
-                    if layer_info.processing_result:
-                        layer_dir = export_path / f"layer_{layer_id:02d}"
-                        layer_dir.mkdir(exist_ok=True)
-                        
-                        # 保存可视化图像
-                        result = layer_info.processing_result
-                        for img_name in ['vis_cmp', 'vis_corr', 'hist_panel']:
-                            if img_name in result and result[img_name] is not None:
-                                img_path = layer_dir / f"{img_name}.png"
-                                cv2.imwrite(str(img_path), result[img_name])
-                                
-                        # 保存统计数据
-                        if 'metrics' in result:
-                            metrics_path = layer_dir / "metrics.json"
-                            with open(metrics_path, 'w', encoding='utf-8') as f:
-                                json.dump(result['metrics'], f, ensure_ascii=False, indent=2)
-                                
+                # 导出各层可视化结果
+                self.export_visualization_results(export_path)
+                
+                # 导出每层的out文件夹（机床纠偏数据）
+                self.export_layer_out_directories(export_path)
+                
+                # 导出项目摘要
+                self.export_project_summary(export_path)
+                
                 QMessageBox.information(self, "成功", f"结果导出至: {export_path}")
                 
         except Exception as e:
             QMessageBox.critical(self, "错误", f"导出失败: {e}")
+            
+    def export_visualization_results(self, export_path: Path):
+        """导出可视化结果"""
+        for layer_id, layer_info in self.layers.items():
+            if layer_info.processing_result:
+                layer_dir = export_path / "visualization" / f"layer_{layer_id:02d}"
+                layer_dir.mkdir(parents=True, exist_ok=True)
+                
+                # 保存可视化图像
+                result = layer_info.processing_result
+                for img_name in ['vis_cmp', 'vis_corr', 'hist_panel']:
+                    if img_name in result and result[img_name] is not None:
+                        img_path = layer_dir / f"{img_name}.png"
+                        cv2.imwrite(str(img_path), result[img_name])
+                        
+                # 保存统计数据
+                if 'metrics' in result:
+                    metrics_path = layer_dir / "metrics.json"
+                    with open(metrics_path, 'w', encoding='utf-8') as f:
+                        json.dump(result['metrics'], f, ensure_ascii=False, indent=2)
+                        
+    def export_layer_out_directories(self, export_path: Path):
+        """导出每层的out文件夹（机床纠偏数据）"""
+        import shutil
+        
+        machine_data_dir = export_path / "machine_data"
+        machine_data_dir.mkdir(exist_ok=True)
+        
+        exported_layers = []
+        
+        for layer_id, layer_info in self.layers.items():
+            # 只导出非标定层（即需要纠偏的层）
+            if (layer_info.processing_result and 
+                layer_info.processing_result.get('layer_type') == 'correction'):
+                
+                # 查找对应的layer_XX_out目录
+                layer_out_source = Path(f"layer_{layer_id:02d}_out")
+                if layer_out_source.exists():
+                    layer_out_dest = machine_data_dir / f"layer_{layer_id:02d}_out"
+                    
+                    # 复制整个目录
+                    if layer_out_dest.exists():
+                        shutil.rmtree(layer_out_dest)
+                    shutil.copytree(layer_out_source, layer_out_dest)
+                    
+                    exported_layers.append(layer_id)
+                    print(f"已导出第{layer_id}层机床数据: {layer_out_dest}")
+                    
+        # 创建机床数据目录说明
+        machine_readme = machine_data_dir / "README.md"
+        with open(machine_readme, 'w', encoding='utf-8') as f:
+            f.write(f"# 机床纠偏数据\n\n")
+            f.write(f"项目名称: {self.project_config.project_name}\n")
+            f.write(f"导出时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"已导出层数: {len(exported_layers)}\n\n")
+            f.write("## 目录结构\n")
+            for layer_id in exported_layers:
+                f.write(f"- `layer_{layer_id:02d}_out/`: 第{layer_id}层纠偏数据\n")
+                f.write(f"  - `offset_table.csv`: 偏移表\n")
+                f.write(f"  - `corrected.gcode`: 纠偏后G代码\n")
+                f.write(f"  - `corrected_preview.png`: 纠偏预览图\n")
+                f.write(f"  - `layer_info.json`: 层信息\n\n")
+            f.write("## 使用说明\n")
+            f.write("机床可按层号访问对应的目录，加载相应的纠偏数据。\n")
+            
+    def export_project_summary(self, export_path: Path):
+        """导出项目摘要"""
+        summary = {
+            'project_name': self.project_config.project_name,
+            'total_layers': len(self.layers),
+            'completed_layers': sum(1 for info in self.layers.values() if info.status == 'completed'),
+            'correction_layers': sum(1 for info in self.layers.values() 
+                                   if info.processing_result and info.processing_result.get('layer_type') == 'correction'),
+            'export_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'layers_summary': []
+        }
+        
+        for layer_id, layer_info in self.layers.items():
+            layer_summary = {
+                'layer_id': layer_id,
+                'status': layer_info.status,
+                'layer_type': layer_info.processing_result.get('layer_type', 'unknown') if layer_info.processing_result else 'unknown',
+                'timestamp': layer_info.timestamp
+            }
+            
+            if layer_info.processing_result:
+                metrics = layer_info.processing_result.get('metrics', {})
+                layer_summary.update({
+                    'valid_ratio': metrics.get('valid_ratio', 0),
+                    'dev_p95': metrics.get('dev_p95', 0),
+                    'processing_time': layer_info.processing_result.get('processing_time', 0)
+                })
+                
+            summary['layers_summary'].append(layer_summary)
+            
+        summary_file = export_path / "project_summary.json"
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
             
     def open_advanced_params(self):
         """打开高级参数调节对话框"""
@@ -701,7 +789,7 @@ class MultilayerMainWindow(QMainWindow):
         self.disconnect_plc()
         if self.controller:
             self.controller.close()
-        event.accept()
+        if event: event.accept()
 
 # ==================== 主函数 ====================
 

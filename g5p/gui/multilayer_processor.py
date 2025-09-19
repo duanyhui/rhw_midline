@@ -99,9 +99,12 @@ class LayerProcessingThread(QThread):
                     result['is_calibration_layer'] = False
                     result['layer_type'] = 'correction'
                     
-                    # 保存当前层的偏差补偿（用于下一层）
+                            # 保存当前层的偏差补偏（用于下一层）
                     bias_path = self.controller.save_bias_from_current()
                     result['bias_comp_path'] = bias_path
+                    
+                    # 为当前层创建独立的out文件夹
+                    self.create_layer_out_directory(layer_id, correction)
                     
                     self.progress_updated.emit(layer_id, "纠偏数据导出完成")
                     
@@ -160,6 +163,53 @@ class LayerProcessingThread(QThread):
                     os.remove(temp_bias_path)
                 except:
                     pass
+                    
+    def create_layer_out_directory(self, layer_id: int, correction_result: Dict):
+        """为指定层创建独立的out文件夹并复制纠偏文件"""
+        try:
+            import shutil
+            from pathlib import Path
+            
+            # 创建层级out目录
+            layer_out_dir = Path(f"layer_{layer_id:02d}_out")
+            layer_out_dir.mkdir(exist_ok=True)
+            
+            # 复制纠偏文件到层级目录
+            files_to_copy = [
+                ('offset_csv', 'offset_table.csv'),
+                ('corrected_gcode', 'corrected.gcode'),
+                ('centerline_gcode', 'centerline.gcode'),
+                ('corrected_preview', 'corrected_preview.png'),
+                ('quicklook', 'quicklook.png'),
+                ('report_json', 'report.json')
+            ]
+            
+            copied_files = []
+            for key, filename in files_to_copy:
+                if key in correction_result:
+                    src_file = Path(correction_result[key])
+                    if src_file.exists():
+                        dst_file = layer_out_dir / filename
+                        shutil.copy2(src_file, dst_file)
+                        copied_files.append(filename)
+                        
+            # 创建层信息文件
+            layer_info = {
+                'layer_id': layer_id,
+                'layer_type': 'correction',
+                'files': copied_files,
+                'export_time': time.strftime("%Y-%m-%d %H:%M:%S")
+            }
+            
+            info_file = layer_out_dir / 'layer_info.json'
+            with open(info_file, 'w', encoding='utf-8') as f:
+                json.dump(layer_info, f, ensure_ascii=False, indent=2)
+                
+            print(f"第{layer_id}层out文件夹已创建: {layer_out_dir}")
+            print(f"已复制文件: {', '.join(copied_files)}")
+            
+        except Exception as e:
+            print(f"创建第{layer_id}层out文件夹失败: {e}")
                     
     def generate_error_comparison_visualization(self, result: Dict, layer_id: int):
         """生成误差对比可视化图"""
