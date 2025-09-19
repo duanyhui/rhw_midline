@@ -26,6 +26,13 @@ class InteractiveMachineState:
     failed_layers: int = 0
     total_processing_time: float = 0.0
     layer_times: Dict[int, float] = field(default_factory=dict)
+    
+    # 纠偏数据应用状态
+    correction_data: Dict[int, Dict] = field(default_factory=dict)  # 每层的纠偏数据
+    correction_applied: Dict[int, bool] = field(default_factory=dict)  # 纠偏是否已应用
+    original_path: Optional[str] = None  # 原始加工路径
+    corrected_path: Optional[str] = None  # 纠偏后路径
+    deviation_stats: Dict[int, Dict] = field(default_factory=dict)  # 偏差统计
 
 
 class InteractiveMockPLCServer:
@@ -48,6 +55,10 @@ class InteractiveMockPLCServer:
             "status": "显示当前状态",
             "stats": "显示统计信息",
             "layers": "设置总层数 <数量>",
+            "correction": "显示纠偏数据应用情况",
+            "simulate": "模拟机床应用纠偏数据 <层号>",
+            "path": "显示加工路径信息",
+            "deviation": "显示偏差统计信息",
             "help": "显示帮助信息",
             "quit": "退出服务器"
         }
@@ -177,14 +188,28 @@ class InteractiveMockPLCServer:
                 print(f"\n[系统] 接收到纠偏数据: 第{layer_id}层, 状态: {correction_status}")
                 
                 if correction_status == "valid":
+                    # 保存纠偏数据
+                    self.machine_state.correction_data[layer_id] = data
                     self.machine_state.correction_received = True
                     self.machine_state.machine_status = "idle"
+                    
+                    # 解析和显示纠偏数据详情（包含文件信息）
+                    self._process_correction_data(layer_id, data)
+                    
                     print(f"[系统] 第{layer_id}层纠偏数据有效，机床准备就绪")
+                    print("[提示] 纠偏数据已接收，包含corrected.gcode和offset_table.csv")
+                    print("[提示] 使用 'simulate' 命令模拟应用纠偏数据")
                     print("[提示] 使用 'next' 命令进入下一层，或 'start' 开始下一层加工")
                     
                 elif correction_status == "skip":
                     print(f"[系统] 第{layer_id}层跳过纠偏（偏差过大），使用原始数据")
+                    self.machine_state.correction_applied[layer_id] = False
                     self.machine_state.machine_status = "idle"
+                    
+                elif correction_status == "warning":
+                    print(f"[警告] 第{layer_id}层纠偏数据超出安全范围，已自动丢弃")
+                    print("[安全] 机床使用原始加工路径，不应用纠偏")
+                    self.machine_state.correction_applied[layer_id] = False
                     
                 return {"success": True, "message": "纠偏数据已接收"}
                 
@@ -199,6 +224,94 @@ class InteractiveMockPLCServer:
                 
             else:
                 return {"success": False, "error": f"未知命令类型: {cmd_type}"}
+                
+    def _process_correction_data(self, layer_id: int, data: Dict):
+        """处理纠偏数据并显示详情（增强版，支持文件信息）"""
+        try:
+            # 解析纠偏数据的关键信息
+            gcode_adjustments = data.get('gcode_adjustments', [])
+            correction_summary = data.get('correction_summary', {})
+            processing_info = data.get('processing_info', {})
+            
+            # 新增: 文件路径信息
+            corrected_gcode_path = data.get('corrected_gcode_path', '')
+            offset_table_path = data.get('offset_table_path', '')
+            output_directory = data.get('output_directory', '')
+            available_files = data.get('available_files', [])
+            
+            print(f"\n━━━ 第{layer_id}层纠偏数据详情 ━━━")
+            
+            # 显示文件信息（重点！）
+            if output_directory:
+                print(f"• 输出目录: {output_directory}")
+                
+            if corrected_gcode_path:
+                import os
+                file_size = os.path.getsize(corrected_gcode_path) if os.path.exists(corrected_gcode_path) else 0
+                print(f"• 纠偏后G代码: {corrected_gcode_path} ({file_size} 字节)")
+            else:
+                print(f"• 纠偏后G代码: 未提供")
+                
+            if offset_table_path:
+                import os
+                file_size = os.path.getsize(offset_table_path) if os.path.exists(offset_table_path) else 0
+                print(f"• 偏移表文件: {offset_table_path} ({file_size} 字节)")
+            else:
+                print(f"• 偏移表文件: 未提供")
+                
+            if available_files:
+                print(f"• 相关文件: {', '.join(available_files)}")
+            
+            # 显示处理信息
+            if processing_info:
+                valid_ratio = processing_info.get('valid_ratio', 0)
+                total_points = processing_info.get('total_correction_points', 0)
+                print(f"• 数据质量: 有效点数 {total_points}, 有效率 {valid_ratio:.1%}")
+            
+            # 显示纠偏统计
+            if correction_summary:
+                avg_correction = correction_summary.get('avg_correction_mm', 0)
+                max_correction = correction_summary.get('max_correction_mm', 0) 
+                affected_lines = correction_summary.get('affected_gcode_lines', 0)
+                
+                print(f"• 纠偏统计: 平均 {avg_correction:.3f}mm, 最大 {max_correction:.3f}mm")
+                print(f"• 影响范围: {affected_lines} 行G代码被修正")
+                
+                # 保存偏差统计
+                self.machine_state.deviation_stats[layer_id] = {
+                    'avg_correction': avg_correction,
+                    'max_correction': max_correction,
+                    'affected_lines': affected_lines,
+                    'total_points': processing_info.get('total_correction_points', 0),
+                    'valid_ratio': processing_info.get('valid_ratio', 0)
+                }
+            
+            # 显示 G代码调整信息
+            if gcode_adjustments:
+                print(f"• G代码调整: {len(gcode_adjustments)} 个调整点")
+                # 显示前几个调整点作为示例
+                for i, adj in enumerate(gcode_adjustments[:3]):
+                    line_num = adj.get('line_number', 0)
+                    original = adj.get('original_line', '')
+                    corrected = adj.get('corrected_line', '')
+                    offset = adj.get('offset_mm', [0, 0, 0])
+                    print(f"  第{line_num}行: 偏移({offset[0]:.3f}, {offset[1]:.3f}, {offset[2]:.3f})mm")
+                    
+                if len(gcode_adjustments) > 3:
+                    print(f"  ... 还有 {len(gcode_adjustments)-3} 个调整点")
+            
+            # 模拟机床接收和应用纠偏数据
+            print(f"• 机床状态: 纠偏数据已接收，等待应用")
+            if corrected_gcode_path and offset_table_path:
+                print(f"• 文件状态: corrected.gcode 和 offset_table.csv 已接收")
+                print(f"• 存储位置: 纠偏数据已保存到机床内存")
+            else:
+                print(f"• 文件状态: 缺少部分文件路径")
+            print(f"• 应用状态: 等待手动确认应用 (使用 'simulate {layer_id}' 命令)")
+            print("━" * 50)
+            
+        except Exception as e:
+            print(f"[错误] 解析纠偏数据失败: {e}")
                 
     def _command_loop(self):
         """命令行处理循环"""
@@ -299,6 +412,22 @@ class InteractiveMockPLCServer:
                 else:
                     print("错误: 请指定层数，例如: layers 6")
                     
+            elif cmd == "correction":
+                self._show_correction_status()
+                
+            elif cmd == "simulate":
+                if args and args[0].isdigit():
+                    layer_id = int(args[0])
+                    self._simulate_apply_correction(layer_id)
+                else:
+                    print("错误: 请指定层号，例如: simulate 2")
+                    
+            elif cmd == "path":
+                self._show_path_info()
+                
+            elif cmd == "deviation":
+                self._show_deviation_stats()
+                    
             elif cmd == "help":
                 self.print_help()
                 
@@ -317,6 +446,13 @@ class InteractiveMockPLCServer:
         print(f"  状态: {self.machine_state.machine_status}")
         print(f"  已处理层数: {self.machine_state.processed_layers}")
         print(f"  失败层数: {self.machine_state.failed_layers}")
+        print(f"  纠偏数据已接收: {self.machine_state.correction_received}")
+        
+        # 显示纠偏数据应用状态
+        applied_count = sum(1 for applied in self.machine_state.correction_applied.values() if applied)
+        received_count = len(self.machine_state.correction_data)
+        print(f"  纠偏数据: 已接收{received_count}层, 已应用{applied_count}层")
+        
         if self.machine_state.layer_start_time and self.machine_state.machine_status == "processing":
             elapsed = time.time() - self.machine_state.layer_start_time
             print(f"  当前层加工时间: {elapsed:.1f}秒")
@@ -353,6 +489,108 @@ class InteractiveMockPLCServer:
         print("="*60)
         self.print_statistics()
         print("="*60)
+        
+    def _show_correction_status(self):
+        """显示纠偏数据应用情况"""
+        print(f"\n纠偏数据应用情况:")
+        print(f"  当前层: {self.machine_state.current_layer}")
+        print(f"  纠偏数据已接收: {self.machine_state.correction_received}")
+        
+        if self.machine_state.correction_data:
+            print(f"  已接收纠偏数据的层:")
+            for layer_id in sorted(self.machine_state.correction_data.keys()):
+                applied = self.machine_state.correction_applied.get(layer_id, False)
+                status = "✅ 已应用" if applied else "⏳ 未应用"
+                print(f"    第{layer_id}层: {status}")
+        else:
+            print(f"  暂无纠偏数据")
+    
+    def _simulate_apply_correction(self, layer_id: int):
+        """模拟机床应用纠偏数据"""
+        if layer_id not in self.machine_state.correction_data:
+            print(f"错误: 第{layer_id}层没有纠偏数据")
+            return
+            
+        print(f"\n正在模拟应用第{layer_id}层纠偏数据...")
+        
+        # 模拟机床应用过程
+        correction_data = self.machine_state.correction_data[layer_id]
+        gcode_adjustments = correction_data.get('gcode_adjustments', [])
+        
+        print(f"• 步骤1: 验证纠偏数据安全性...")
+        time.sleep(0.5)
+        print(f"• 步骤2: 加载原始加工程序...")
+        time.sleep(0.3)
+        print(f"• 步骤3: 应用 {len(gcode_adjustments)} 个位置调整...")
+        time.sleep(0.8)
+        print(f"• 步骤4: 更新机床坐标系统...")
+        time.sleep(0.4)
+        print(f"• 步骤5: 纠偏数据应用完成！")
+        
+        # 标记为已应用
+        self.machine_state.correction_applied[layer_id] = True
+        
+        # 显示应用结果
+        if layer_id in self.machine_state.deviation_stats:
+            stats = self.machine_state.deviation_stats[layer_id]
+            print(f"\n应用结果:")
+            print(f"  平均纠偏: {stats['avg_correction']:.3f}mm")
+            print(f"  最大纠偏: {stats['max_correction']:.3f}mm")
+            print(f"  调整点数: {stats['affected_lines']}")
+            print(f"  机床状态: 纠偏已生效，准备加工")
+        
+        print(f"\n✅ 第{layer_id}层纠偏数据已成功应用到机床！")
+    
+    def _show_path_info(self):
+        """显示加工路径信息"""
+        print(f"\n加工路径信息:")
+        if self.machine_state.original_path:
+            print(f"  原始路径: {self.machine_state.original_path}")
+        else:
+            print(f"  原始路径: 未设置")
+            
+        if self.machine_state.corrected_path:
+            print(f"  纠偏后路径: {self.machine_state.corrected_path}")
+        else:
+            print(f"  纠偏后路径: 未生成")
+            
+        applied_layers = [layer_id for layer_id, applied in self.machine_state.correction_applied.items() if applied]
+        if applied_layers:
+            print(f"  已应用纠偏的层: {sorted(applied_layers)}")
+        else:
+            print(f"  已应用纠偏的层: 无")
+    
+    def _show_deviation_stats(self):
+        """显示偏差统计信息"""
+        if not self.machine_state.deviation_stats:
+            print(f"\n暂无偏差统计数据")
+            return
+            
+        print(f"\n偏差统计数据:")
+        print(f"  层号    平均纠偏    最大纠偏    调整点数    有效率")
+        print(f"  " + "-" * 55)
+        
+        total_avg = 0
+        total_max = 0
+        total_points = 0
+        
+        for layer_id in sorted(self.machine_state.deviation_stats.keys()):
+            stats = self.machine_state.deviation_stats[layer_id]
+            avg_corr = stats['avg_correction']
+            max_corr = stats['max_correction']
+            points = stats['affected_lines']
+            valid_ratio = stats['valid_ratio']
+            
+            print(f"  {layer_id:>4}    {avg_corr:>8.3f}mm    {max_corr:>8.3f}mm    {points:>8}    {valid_ratio:>6.1%}")
+            
+            total_avg += avg_corr
+            total_max = max(total_max, max_corr)
+            total_points += points
+        
+        if len(self.machine_state.deviation_stats) > 0:
+            avg_avg = total_avg / len(self.machine_state.deviation_stats)
+            print(f"  " + "-" * 55)
+            print(f"  平均  {avg_avg:>8.3f}mm    {total_max:>8.3f}mm    {total_points:>8}    -")
         
     def stop(self):
         """停止服务器"""

@@ -58,7 +58,7 @@ class MultilayerMainWindow(QMainWindow):
         self.current_layer = 0
         
         # 处理参数（来自高级参数配置）
-        self.process_delay_sec = 0.5  # 默认500ms处理延迟
+        self.process_delay_sec = 2  # 默认500ms处理延迟
         
         # PLC通信
         self.plc_communicator = None
@@ -365,6 +365,9 @@ class MultilayerMainWindow(QMainWindow):
         if self.plc_communicator.connect():
             self.connect_plc_btn.setText("断开PLC")
             
+            # 启动状态轮询
+            self.plc_communicator.start_polling()
+            
             # 启动监控线程
             self.plc_monitor = PLCMonitorThread(self.plc_communicator)
             self.plc_monitor.start()
@@ -378,6 +381,8 @@ class MultilayerMainWindow(QMainWindow):
             self.plc_monitor = None
             
         if self.plc_communicator:
+            # 停止轮询
+            self.plc_communicator.stop_polling()
             self.plc_communicator.disconnect_plc()
             self.plc_communicator = None
             
@@ -475,14 +480,22 @@ class MultilayerMainWindow(QMainWindow):
             self.process_current_btn.setEnabled(True)
             
     def on_correction_request(self, layer_id: int):
-        """机床请求纠偏数据"""
-        self.status_label.setText(f"机床请求第{layer_id}层纠偏数据")
+        """机床请求纠偏数据 - 这里才开始处理"""
+        print(f"PLC请求第{layer_id}层纠偏数据，开始处理...")
+        self.status_label.setText(f"接收到PLC请求，开始处理第{layer_id}层")
         
-        if self.auto_next_check.isChecked() and layer_id in self.layers:
-            self.current_layer = layer_id
-            # 使用高级参数中配置的延迟时间，默认500ms
-            delay_ms = getattr(self, 'process_delay_sec', 0.5) * 1000
-            QTimer.singleShot(int(delay_ms), self.process_current_layer)
+        # 设置当前层
+        self.current_layer = layer_id
+        
+        # 检查层是否存在
+        if layer_id not in self.layers:
+            print(f"错误: 第{layer_id}层不存在")
+            self.status_label.setText(f"错误: 第{layer_id}层不存在")
+            return
+            
+        # 延迟一点时间开始处理（模拟采集延迟）
+        delay_ms = getattr(self, 'process_delay_sec', 0.5) * 1000
+        QTimer.singleShot(int(delay_ms), self.process_current_layer)
                 
     def on_processing_finished(self, layer_id: int, result: Dict):
         """处理完成"""
@@ -523,20 +536,22 @@ class MultilayerMainWindow(QMainWindow):
                     try:
                         success = self.plc_communicator.send_correction_data(layer_id, correction_data)
                         if success:
-                            self.status_label.setText(f"第{layer_id}层纠偏数据已发送到PLC")
+                            self.status_label.setText(f"第{layer_id}层纠偏数据已发送到PLC（包含corrected.gcode和offset_table.csv）")
+                            print(f"纠偏数据已发送: corrected.gcode + offset_table.csv")
                         else:
                             self.status_label.setText(f"第{layer_id}层纠偏数据发送失败")
                     except Exception as e:
                         print(f"发送纠偏数据到PLC失败: {e}")
+                else:
+                    print(f"第{layer_id}层没有纠偏数据可发送")
+            elif layer_id == 1:
+                # 第一层仅为标定，不发送纠偏数据
+                print(f"第{layer_id}层为标定层，不发送纠偏数据")
+                if self.plc_communicator and self.plc_communicator.connected:
+                    self.status_label.setText(f"第{layer_id}层标定完成，等待PLC下一层信号...")
                         
-            # 发送层完成信号到PLC
-            if self.plc_communicator and self.plc_communicator.connected:
-                try:
-                    self.plc_communicator.write_layer_completion(
-                        layer_id, True, processing_time
-                    )
-                except Exception as e:
-                    print(f"发送完成信号到PLC失败: {e}")
+            # 不再发送层完成信号，等待PLC的下一个请求
+            print(f"第{layer_id}层处理完成，等待PLC发送下一层请求信号...")
             
             # 自动下一层 - 等待PLC状态而不是使用固定延迟
             if self.auto_next_check.isChecked() and layer_id < len(self.layers):

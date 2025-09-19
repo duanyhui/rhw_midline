@@ -6,7 +6,7 @@ import json
 import time
 import threading
 from typing import Optional
-from PyQt5.QtCore import QThread, QObject, pyqtSignal
+from PyQt5.QtCore import QThread, QObject, pyqtSignal, QTimer
 
 from multilayer_data import ProjectConfig
 
@@ -49,6 +49,50 @@ class PLCCommunicator(QObject):
         self.running = False
         self.current_layer = 0
         self.machine_status = PLCDataProtocol.STATUS_IDLE
+        
+        # 轮询定时器
+        self.poll_timer = QTimer()
+        self.poll_timer.timeout.connect(self._poll_plc_status)
+        self.poll_interval = 1000  # 1秒轮询一次
+        
+        # 状态缓存
+        self.last_machine_status = ""
+        self.last_layer = -1
+        
+    def start_polling(self):
+        """开始轮询PLC状态"""
+        if self.connected and not self.poll_timer.isActive():
+            self.poll_timer.start(self.poll_interval)
+            print("PLC状态轮询已启动")
+            
+    def stop_polling(self):
+        """停止轮询PLC状态"""
+        if self.poll_timer.isActive():
+            self.poll_timer.stop()
+            print("PLC状态轮询已停止")
+            
+    def _poll_plc_status(self):
+        """轮询PLC状态，检测变化并发出信号"""
+        if not self.connected:
+            return
+            
+        try:
+            # 读取机床状态
+            current_status = self.read_machine_status()
+            if current_status != self.last_machine_status:
+                self.last_machine_status = current_status
+                self.machine_status_changed.emit(current_status)
+                print(f"PLC状态变化: {current_status}")
+                
+                # 如果机床状态为waiting，表示完成了加工，等待纠偏数据
+                if current_status == PLCDataProtocol.STATUS_WAITING:
+                    current_layer = self.read_current_layer()
+                    if current_layer > 0:
+                        print(f"PLC请求第{current_layer}层纠偏数据")
+                        self.correction_request.emit(current_layer)
+                        
+        except Exception as e:
+            print(f"PLC状态轮询错误: {e}")
         
     def connect(self):
         """连接PLC"""
@@ -168,9 +212,12 @@ class TCPPLCCommunicator(PLCCommunicator):
         return response.get("success", False)
         
     def send_correction_data(self, layer_id: int, correction_data: dict) -> bool:
-        """发送纠偏数据到PLC"""
+        """发送纠偏数据到PLC（包含文件路径）"""
+        # 整理纠偏数据，确保包含文件路径
+        enhanced_data = self._prepare_correction_data(layer_id, correction_data)
+        
         # 检查纠偏数据安全性
-        safety_check = self._check_correction_safety(correction_data)
+        safety_check = self._check_correction_safety(enhanced_data)
         if not safety_check["safe"]:
             self.send_deviation_alert(layer_id, safety_check["message"], safety_check["max_deviation"])
             return False
@@ -179,11 +226,50 @@ class TCPPLCCommunicator(PLCCommunicator):
             "type": PLCDataProtocol.CMD_SEND_CORRECTION,
             "layer": layer_id,
             "correction_status": PLCDataProtocol.CORRECTION_VALID,
-            "data": correction_data,
+            "data": enhanced_data,
             "timestamp": time.time()
         }
         response = self._send_command(command)
         return response.get("success", False)
+        
+    def _prepare_correction_data(self, layer_id: int, correction_data: dict) -> dict:
+        """准备纠偏数据，包含corrected.gcode和offset_table.csv路径"""
+        import os
+        from pathlib import Path
+        
+        enhanced_data = correction_data.copy()
+        
+        # 找到当前层的输出目录
+        output_dir = Path("output") / f"layer_{layer_id:02d}_out"
+        
+        if output_dir.exists():
+            # 添加corrected.gcode路径
+            corrected_gcode_path = output_dir / "corrected.gcode"
+            if corrected_gcode_path.exists():
+                enhanced_data["corrected_gcode_path"] = str(corrected_gcode_path)
+                
+            # 添加offset_table.csv路径
+            offset_table_path = output_dir / "offset_table.csv"
+            if offset_table_path.exists():
+                enhanced_data["offset_table_path"] = str(offset_table_path)
+                
+            # 添加其他相关文件
+            processing_metrics_path = output_dir / "processing_metrics.json"
+            if processing_metrics_path.exists():
+                enhanced_data["processing_metrics_path"] = str(processing_metrics_path)
+                
+            bias_comp_path = output_dir / "bias_compensation.json"
+            if bias_comp_path.exists():
+                enhanced_data["bias_compensation_path"] = str(bias_comp_path)
+                
+            # 添加文件列表信息
+            enhanced_data["output_directory"] = str(output_dir)
+            enhanced_data["available_files"] = [f.name for f in output_dir.iterdir() if f.is_file()]
+            
+        else:
+            print(f"警告: 第{layer_id}层输出目录不存在: {output_dir}")
+            
+        return enhanced_data
         
     def send_deviation_alert(self, layer_id: int, alert_message: str, deviation_value: float):
         """发送偏差过大警告"""
