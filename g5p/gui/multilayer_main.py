@@ -632,7 +632,7 @@ class MultilayerMainWindow(QMainWindow):
                         json.dump(result['metrics'], f, ensure_ascii=False, indent=2)
                         
     def export_layer_out_directories(self, export_path: Path):
-        """导出每层的out文件夹（机床纠偏数据）"""
+        """导出每层的out文件夹（机床纠偏数据） - 从总output文件夹中复制"""
         import shutil
         
         machine_data_dir = export_path / "machine_data"
@@ -640,24 +640,27 @@ class MultilayerMainWindow(QMainWindow):
         
         exported_layers = []
         
-        for layer_id, layer_info in self.layers.items():
-            # 只导出非标定层（即需要纠偏的层）
-            if (layer_info.processing_result and 
-                layer_info.processing_result.get('layer_type') == 'correction'):
-                
-                # 查找对应的layer_XX_out目录
-                layer_out_source = Path(f"layer_{layer_id:02d}_out")
-                if layer_out_source.exists():
-                    layer_out_dest = machine_data_dir / f"layer_{layer_id:02d}_out"
+        # 从总output文件夹中查找各层数据
+        output_source_dir = Path("output")
+        if output_source_dir.exists():
+            for layer_id, layer_info in self.layers.items():
+                # 只导出非标定层（即需要纠偏的层）
+                if (layer_info.processing_result and 
+                    layer_info.processing_result.get('layer_type') == 'correction'):
                     
-                    # 复制整个目录
-                    if layer_out_dest.exists():
-                        shutil.rmtree(layer_out_dest)
-                    shutil.copytree(layer_out_source, layer_out_dest)
-                    
-                    exported_layers.append(layer_id)
-                    print(f"已导出第{layer_id}层机床数据: {layer_out_dest}")
-                    
+                    # 查找output目录下的layer_XX_out目录
+                    layer_out_source = output_source_dir / f"layer_{layer_id:02d}_out"
+                    if layer_out_source.exists():
+                        layer_out_dest = machine_data_dir / f"layer_{layer_id:02d}_out"
+                        
+                        # 复制整个目录
+                        if layer_out_dest.exists():
+                            shutil.rmtree(layer_out_dest)
+                        shutil.copytree(layer_out_source, layer_out_dest)
+                        
+                        exported_layers.append(layer_id)
+                        print(f"已导出第{layer_id}层机床数据: {layer_out_dest}")
+                        
         # 创建机床数据目录说明
         machine_readme = machine_data_dir / "README.md"
         with open(machine_readme, 'w', encoding='utf-8') as f:
@@ -670,13 +673,75 @@ class MultilayerMainWindow(QMainWindow):
                 f.write(f"- `layer_{layer_id:02d}_out/`: 第{layer_id}层纠偏数据\n")
                 f.write(f"  - `offset_table.csv`: 偏移表\n")
                 f.write(f"  - `corrected.gcode`: 纠偏后G代码\n")
-                f.write(f"  - `corrected_preview.png`: 纠偏预览图\n")
-                f.write(f"  - `layer_info.json`: 层信息\n\n")
+                f.write(f"  - `original_layer_{layer_id:02d}.gcode`: 原始G代码\n")
+                f.write(f"  - `comparison_visualization.png`: 对比可视化\n")
+                f.write(f"  - `corrected_visualization.png`: 纠偏可视化\n")
+                f.write(f"  - `processing_metrics.json`: 处理指标\n")
+                f.write(f"  - `layer_info.json`: 层信息\n")
+                f.write(f"  - `README.md`: 详细说明\n\n")
             f.write("## 使用说明\n")
             f.write("机床可按层号访问对应的目录，加载相应的纠偏数据。\n")
+            f.write("每个层目录包含完整的加工数据：原始G代码、纠偏后G代码、偏移表和可视化结果。\n")
+            
+        # 创建总体数据统计
+        stats_file = machine_data_dir / "overall_statistics.json"
+        overall_stats = {
+            'project_name': self.project_config.project_name,
+            'total_layers_processed': len(exported_layers),
+            'export_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'layers': exported_layers,
+            'quality_summary': self.generate_quality_summary(exported_layers)
+        }
+        
+        with open(stats_file, 'w', encoding='utf-8') as f:
+            json.dump(overall_stats, f, ensure_ascii=False, indent=2)
+            
+    def generate_quality_summary(self, exported_layers: list) -> Dict:
+        """生成质量汇总统计"""
+        quality_summary = {
+            'average_valid_ratio': 0.0,
+            'average_dev_p95': 0.0,
+            'best_layer': None,
+            'worst_layer': None,
+            'layer_details': []
+        }
+        
+        valid_ratios = []
+        dev_p95s = []
+        
+        for layer_id in exported_layers:
+            if layer_id in self.layers:
+                layer_info = self.layers[layer_id]
+                if layer_info.processing_result:
+                    metrics = layer_info.processing_result.get('metrics', {})
+                    valid_ratio = metrics.get('valid_ratio', 0)
+                    dev_p95 = metrics.get('dev_p95', 0)
+                    
+                    valid_ratios.append(valid_ratio)
+                    dev_p95s.append(dev_p95)
+                    
+                    quality_summary['layer_details'].append({
+                        'layer_id': layer_id,
+                        'valid_ratio': valid_ratio,
+                        'dev_p95': dev_p95,
+                        'status': layer_info.status
+                    })
+        
+        if valid_ratios:
+            quality_summary['average_valid_ratio'] = sum(valid_ratios) / len(valid_ratios)
+            quality_summary['average_dev_p95'] = sum(dev_p95s) / len(dev_p95s)
+            
+            # 找出最佳和最差层（基于P95偏差）
+            if dev_p95s:
+                min_dev_idx = dev_p95s.index(min(dev_p95s))
+                max_dev_idx = dev_p95s.index(max(dev_p95s))
+                quality_summary['best_layer'] = exported_layers[min_dev_idx]
+                quality_summary['worst_layer'] = exported_layers[max_dev_idx]
+        
+        return quality_summary
             
     def export_project_summary(self, export_path: Path):
-        """导出项目摘要"""
+        """导出项目摘要 - 包含新的output文件夹信息"""
         summary = {
             'project_name': self.project_config.project_name,
             'total_layers': len(self.layers),
@@ -684,6 +749,19 @@ class MultilayerMainWindow(QMainWindow):
             'correction_layers': sum(1 for info in self.layers.values() 
                                    if info.processing_result and info.processing_result.get('layer_type') == 'correction'),
             'export_time': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'output_structure': {
+                'description': '每层数据保存在output文件夹下的独立目录中',
+                'pattern': 'output/layer_{layer_id:02d}_out/',
+                'contains': [
+                    '原始G代码 (original_layer_XX.gcode)',
+                    '纠偏后G代码 (corrected.gcode)',
+                    '偏移表 (offset_table.csv)',
+                    '多种可视化图像',
+                    '处理指标 (processing_metrics.json)',
+                    '偏差补偿数据 (bias_compensation.json)',
+                    '详细说明 (README.md)'
+                ]
+            },
             'layers_summary': []
         }
         
@@ -692,7 +770,9 @@ class MultilayerMainWindow(QMainWindow):
                 'layer_id': layer_id,
                 'status': layer_info.status,
                 'layer_type': layer_info.processing_result.get('layer_type', 'unknown') if layer_info.processing_result else 'unknown',
-                'timestamp': layer_info.timestamp
+                'timestamp': layer_info.timestamp,
+                'gcode_source': layer_info.gcode_path if hasattr(layer_info, 'gcode_path') else '',
+                'output_directory': f'output/layer_{layer_id:02d}_out/' if layer_info.processing_result and layer_info.processing_result.get('layer_type') == 'correction' else None
             }
             
             if layer_info.processing_result:
@@ -700,6 +780,7 @@ class MultilayerMainWindow(QMainWindow):
                 layer_summary.update({
                     'valid_ratio': metrics.get('valid_ratio', 0),
                     'dev_p95': metrics.get('dev_p95', 0),
+                    'dev_mean': metrics.get('dev_mean', 0),
                     'processing_time': layer_info.processing_result.get('processing_time', 0)
                 })
                 
@@ -708,6 +789,38 @@ class MultilayerMainWindow(QMainWindow):
         summary_file = export_path / "project_summary.json"
         with open(summary_file, 'w', encoding='utf-8') as f:
             json.dump(summary, f, ensure_ascii=False, indent=2)
+            
+        # 同时创建一个简化的README文件
+        readme_file = export_path / "README.md"
+        with open(readme_file, 'w', encoding='utf-8') as f:
+            f.write(f"# {self.project_config.project_name} - 导出结果\n\n")
+            f.write(f"导出时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+            f.write(f"总层数: {len(self.layers)}\n")
+            f.write(f"已完成层数: {summary['completed_layers']}\n")
+            f.write(f"纠偏层数: {summary['correction_layers']}\n\n")
+            
+            f.write("## 目录结构\n\n")
+            f.write("```\n")
+            f.write(f"{self.project_config.project_name}_export/\n")
+            f.write("├── machine_data/          # 机床纠偏数据（从 output 文件夹复制）\n")
+            f.write("│   ├── layer_01_out/\n")
+            f.write("│   ├── layer_02_out/\n")
+            f.write("│   └── README.md\n")
+            f.write("├── visualization/         # 可视化结果\n")
+            f.write("└── project_summary.json   # 项目摘要\n")
+            f.write("```\n\n")
+            
+            f.write("## 使用说明\n\n")
+            f.write("1. **machine_data/**: 包含机床所需的所有纠偏数据\n")
+            f.write("2. **visualization/**: 包含可视化分析结果\n")
+            f.write("3. **project_summary.json**: 包含完整的项目信息和统计数据\n\n")
+            
+            f.write("每个 layer_XX_out 文件夹包含：\n")
+            f.write("- 原始G代码和纠偏后G代码\n")
+            f.write("- 偏移表 (CSV格式)\n")
+            f.write("- 多种可视化图像\n")
+            f.write("- 处理指标和层信息\n")
+            f.write("- 偏差补偿数据（用于下一层）\n")
             
     def open_advanced_params(self):
         """打开高级参数调节对话框"""
@@ -784,12 +897,13 @@ class MultilayerMainWindow(QMainWindow):
         """供子组件调用的参数更新回调"""
         self.on_advanced_params_applied(params_dict)
             
-    def closeEvent(self, event):
+    def closeEvent(self, a0):
         """关闭事件"""
         self.disconnect_plc()
         if self.controller:
             self.controller.close()
-        if event: event.accept()
+        if a0:
+            a0.accept()
 
 # ==================== 主函数 ====================
 

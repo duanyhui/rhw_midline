@@ -165,17 +165,21 @@ class LayerProcessingThread(QThread):
                     pass
                     
     def create_layer_out_directory(self, layer_id: int, correction_result: Dict):
-        """为指定层创建独立的out文件夹并复制纠偏文件"""
+        """为指定层创建独立的out文件夹并复制纠偏文件（保存到output总文件夹内）"""
         try:
             import shutil
             from pathlib import Path
             
-            # 创建层级out目录
-            layer_out_dir = Path(f"layer_{layer_id:02d}_out")
+            # 创建总的output目录
+            output_dir = Path("output")
+            output_dir.mkdir(exist_ok=True)
+            
+            # 在output目录下创建层级out目录
+            layer_out_dir = output_dir / f"layer_{layer_id:02d}_out"
             layer_out_dir.mkdir(exist_ok=True)
             
-            # 复制纠偏文件到层级目录
-            files_to_copy = [
+            # 复制纠偏相关文件
+            correction_files = [
                 ('offset_csv', 'offset_table.csv'),
                 ('corrected_gcode', 'corrected.gcode'),
                 ('centerline_gcode', 'centerline.gcode'),
@@ -185,31 +189,121 @@ class LayerProcessingThread(QThread):
             ]
             
             copied_files = []
-            for key, filename in files_to_copy:
+            for key, filename in correction_files:
                 if key in correction_result:
                     src_file = Path(correction_result[key])
                     if src_file.exists():
                         dst_file = layer_out_dir / filename
                         shutil.copy2(src_file, dst_file)
                         copied_files.append(filename)
-                        
-            # 创建层信息文件
+            
+            # 复制当前层的原始G代码
+            if hasattr(self.layer_info, 'gcode_path') and self.layer_info.gcode_path:
+                gcode_src = Path(self.layer_info.gcode_path)
+                if gcode_src.exists():
+                    gcode_dst = layer_out_dir / f"original_layer_{layer_id:02d}.gcode"
+                    shutil.copy2(gcode_src, gcode_dst)
+                    copied_files.append(f"original_layer_{layer_id:02d}.gcode")
+            
+            # 保存可视化图像（从处理结果中获取）
+            if hasattr(self, 'controller') and self.controller.last:
+                vis_files = [
+                    ('vis_cmp', 'comparison_visualization.png'),
+                    ('vis_corr', 'corrected_visualization.png'),
+                    ('vis_probe', 'probe_visualization.png'),
+                    ('hist_panel', 'histogram_panel.png'),
+                    ('vis_top', 'top_view.png'),
+                    ('vis_nearest', 'nearest_surface.png')
+                ]
+                
+                for key, filename in vis_files:
+                    if key in self.controller.last and self.controller.last[key] is not None:
+                        img_data = self.controller.last[key]
+                        img_path = layer_out_dir / filename
+                        try:
+                            import cv2
+                            cv2.imwrite(str(img_path), img_data)
+                            copied_files.append(filename)
+                        except Exception as e:
+                            print(f"保存{filename}失败: {e}")
+            
+            # 保存层处理指标
+            if hasattr(self, 'controller') and self.controller.last:
+                metrics = self.controller.last.get('metrics', {})
+                metrics_file = layer_out_dir / 'processing_metrics.json'
+                with open(metrics_file, 'w', encoding='utf-8') as f:
+                    json.dump(metrics, f, ensure_ascii=False, indent=2)
+                copied_files.append('processing_metrics.json')
+            
+            # 保存偏差补偿数据（如果存在）
+            bias_comp_file = layer_out_dir / 'bias_compensation.json'
+            try:
+                if 'bias_comp_path' in correction_result and correction_result['bias_comp_path']:
+                    bias_src = Path(correction_result['bias_comp_path'])
+                    if bias_src.exists():
+                        shutil.copy2(bias_src, bias_comp_file)
+                        copied_files.append('bias_compensation.json')
+            except Exception as e:
+                print(f"保存偏差补偿数据失败: {e}")
+                
+            # 创建详细的层信息文件
             layer_info = {
                 'layer_id': layer_id,
                 'layer_type': 'correction',
+                'gcode_source': self.layer_info.gcode_path if hasattr(self.layer_info, 'gcode_path') else '',
                 'files': copied_files,
-                'export_time': time.strftime("%Y-%m-%d %H:%M:%S")
+                'export_time': time.strftime("%Y-%m-%d %H:%M:%S"),
+                'processing_summary': {
+                    'status': 'completed',
+                    'has_correction_data': 'corrected.gcode' in copied_files,
+                    'has_visualization': any('visualization' in f for f in copied_files),
+                    'has_bias_compensation': 'bias_compensation.json' in copied_files
+                }
             }
+            
+            # 添加处理指标到层信息
+            if hasattr(self, 'controller') and self.controller.last:
+                metrics = self.controller.last.get('metrics', {})
+                layer_info['quality_metrics'] = {
+                    'valid_ratio': metrics.get('valid_ratio', 0),
+                    'dev_p95': metrics.get('dev_p95', 0),
+                    'dev_mean': metrics.get('dev_mean', 0),
+                    'plane_inlier_ratio': metrics.get('plane_inlier_ratio', 0)
+                }
             
             info_file = layer_out_dir / 'layer_info.json'
             with open(info_file, 'w', encoding='utf-8') as f:
                 json.dump(layer_info, f, ensure_ascii=False, indent=2)
                 
+            # 创建README文件
+            readme_file = layer_out_dir / 'README.md'
+            with open(readme_file, 'w', encoding='utf-8') as f:
+                f.write(f"# 第{layer_id}层纠偏数据\n\n")
+                f.write(f"生成时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"层类型: {'纠偏层' if layer_info['layer_type'] == 'correction' else '标定层'}\n\n")
+                f.write("## 文件说明\n")
+                f.write("### 核心纠偏文件\n")
+                f.write("- `offset_table.csv`: 偏移量表格，包含每个点的纠偏数据\n")
+                f.write("- `corrected.gcode`: 纠偏后的G代码，可直接用于机床加工\n")
+                f.write(f"- `original_layer_{layer_id:02d}.gcode`: 原始G代码文件\n\n")
+                f.write("### 可视化文件\n")
+                f.write("- `comparison_visualization.png`: 理论轨迹与实际轨迹对比图\n")
+                f.write("- `corrected_visualization.png`: 纠偏后效果可视化\n")
+                f.write("- `corrected_preview.png`: 纠偏预览图\n")
+                f.write("- `histogram_panel.png`: 偏差分布直方图\n\n")
+                f.write("### 数据文件\n")
+                f.write("- `layer_info.json`: 层处理信息和状态\n")
+                f.write("- `processing_metrics.json`: 处理质量指标\n")
+                f.write("- `bias_compensation.json`: 偏差补偿数据（用于下一层）\n")
+                
             print(f"第{layer_id}层out文件夹已创建: {layer_out_dir}")
-            print(f"已复制文件: {', '.join(copied_files)}")
+            print(f"已保存文件: {', '.join(copied_files)}")
+            print(f"文件总数: {len(copied_files)}")
             
         except Exception as e:
             print(f"创建第{layer_id}层out文件夹失败: {e}")
+            import traceback
+            traceback.print_exc()
                     
     def generate_error_comparison_visualization(self, result: Dict, layer_id: int):
         """生成误差对比可视化图"""
