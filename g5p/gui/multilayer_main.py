@@ -38,6 +38,7 @@ import cv2
 # 导入其他模块
 from multilayer_data import LayerInfo, ProjectConfig
 from multilayer_plc import PLCCommunicator, TCPPLCCommunicator, S7PLCCommunicator, PLCMonitorThread, MockPLCCommunicator
+from s7_plc_enhanced import S7PLCEnhanced  # 新增增强的S7通信器
 from multilayer_processor import LayerProcessingThread
 from multilayer_visualizer import LayerVisualizationWidget
 
@@ -73,6 +74,9 @@ class MultilayerMainWindow(QMainWindow):
         
         # 启动相机
         self.start_camera()
+        
+        # 验证数据处理能力
+        QTimer.singleShot(1000, self.validate_system_capabilities)
         
     def setup_ui(self):
         """初始化UI"""
@@ -275,9 +279,18 @@ class MultilayerMainWindow(QMainWindow):
         
     def setup_connections(self):
         """设置信号连接"""
+        # PLC配置变化信号连接
         self.use_plc_check.toggled.connect(self.on_plc_config_changed)
+        self.plc_type_combo.currentTextChanged.connect(self.on_plc_config_changed)
+        self.plc_ip_edit.textChanged.connect(self.on_plc_config_changed)
+        self.plc_port_spin.valueChanged.connect(self.on_plc_config_changed)
+        self.layer_address_edit.textChanged.connect(self.on_plc_config_changed)
+        
+        # 项目配置变化信号连接
         self.project_name_edit.textChanged.connect(self.on_project_config_changed)
         self.total_layers_spin.valueChanged.connect(self.on_project_config_changed)
+        self.layer_thickness_spin.valueChanged.connect(self.on_project_config_changed)
+        self.auto_next_check.toggled.connect(self.on_project_config_changed)
         
     def start_camera(self):
         """启动相机"""
@@ -348,7 +361,8 @@ class MultilayerMainWindow(QMainWindow):
         if self.project_config.plc_type == "tcp":
             self.plc_communicator = TCPPLCCommunicator(self.project_config)
         elif self.project_config.plc_type == "s7":
-            self.plc_communicator = S7PLCCommunicator(self.project_config)
+            # 优先使用增强版S7通信器
+            self.plc_communicator = S7PLCEnhanced(self.project_config)
         elif self.project_config.plc_type == "mock":
             self.plc_communicator = MockPLCCommunicator(self.project_config)
         else:
@@ -360,6 +374,12 @@ class MultilayerMainWindow(QMainWindow):
         self.plc_communicator.layer_changed.connect(self.on_layer_changed_from_plc)
         self.plc_communicator.machine_status_changed.connect(self.on_machine_status_changed)
         self.plc_communicator.correction_request.connect(self.on_correction_request)
+        
+        # 连接增强版S7通信器的额外信号（只对S7PLCEnhanced有效）
+        if isinstance(self.plc_communicator, S7PLCEnhanced):
+            self.plc_communicator.data_transmission_progress.connect(self.on_data_transmission_progress)
+            self.plc_communicator.safety_alert.connect(self.on_safety_alert)
+            self.plc_communicator.heartbeat_updated.connect(self.on_heartbeat_updated)
         
         # 尝试连接
         if self.plc_communicator.connect():
@@ -451,51 +471,234 @@ class MultilayerMainWindow(QMainWindow):
             self.status_label.setText(message)
             
     def on_layer_changed_from_plc(self, layer_id: int):
-        """PLC层号变化"""
-        if layer_id in self.layers:
-            self.current_layer = layer_id
-            self.status_label.setText(f"PLC通知: 切换到第{layer_id}层")
+        """增强的PLC层号变化处理"""
+        print(f"PLC层号变化: {layer_id}")
+        
+        # 检查层号是否有效
+        if layer_id <= 0:
+            print(f"错误: 无效的层号 {layer_id}")
+            self.status_label.setText(f"错误: 无效的层号 {layer_id}")
+            return
             
-            if self.auto_next_check.isChecked():
-                self.process_current_layer()
+        # 检查层号是否在已加载G代码范围内
+        if layer_id not in self.layers:
+            # 如果层号超出范围，但在总层数内，警告用户
+            if layer_id <= self.project_config.total_layers:
+                print(f"警告: 第{layer_id}层G代码未加载")
+                self.status_label.setText(f"警告: 第{layer_id}层G代码未加载，请先加载所有层的G代码")
+                return
+            else:
+                print(f"错误: 第{layer_id}层不存在（已加载层数: {len(self.layers)}）")
+                self.status_label.setText(f"错误: 第{layer_id}层不存在")
+                return
+        
+        # 更新当前层
+        old_layer = self.current_layer
+        self.current_layer = layer_id
+        
+        # 更新界面显示
+        if old_layer != layer_id:
+            self.status_label.setText(f"PLC通知: 从第{old_layer}层切换到第{layer_id}层")
+            # 检查并更新前一层的状态
+            if old_layer > 0 and old_layer in self.layers and self.layers[old_layer].status == "processing":
+                self.layers[old_layer].status = "completed"
+                print(f"自动将第{old_layer}层状态更新为已完成")
+        else:
+            self.status_label.setText(f"PLC确认: 当前为第{layer_id}层")
+        
+        # 更新层管理表格
+        self.update_layer_table()
+        
+        # 在自动模式下，不在这里直接处理，等待PLC状态变为waiting时才处理
+        # 这样可以避免早期触发处理
+        print(f"层号变化完成，当前层: {self.current_layer}，等待PLC发送waiting状态")
                 
     def on_machine_status_changed(self, status: str):
-        """机床状态变化"""
+        """增强的机床状态变化处理"""
+        print(f"PLC状态变化: {status}")
+        
         status_map = {
             "idle": "空闲",
             "processing": "加工中",
             "waiting": "等待纠偏",
-            "error": "错误"
+            "error": "错误",
+            "completed": "完成"
         }
         chinese_status = status_map.get(status, status)
-        self.status_label.setText(f"机床状态: {chinese_status}")
         
-        # 根据状态调整界面
-        if status == "waiting":
+        # 更新状态显示
+        status_with_layer = f"机床状态: {chinese_status} - 第{self.current_layer}层"
+        self.status_label.setText(status_with_layer)
+        
+        # 根据状态调整界面和处理逻辑
+        if status == "idle":
             self.process_current_btn.setEnabled(True)
-            self.status_label.setText(f"机床等待纠偏数据 - 第{self.current_layer}层")
+            print(f"机床空闲，等待开始下一阶段工作")
+            
         elif status == "processing":
             self.process_current_btn.setEnabled(False)
+            print(f"机床正在加工第{self.current_layer}层，算法程序等待")
+            
+        elif status == "waiting":
+            self.process_current_btn.setEnabled(True)
+            self.status_label.setText(f"机床等待纠偏数据 - 第{self.current_layer}层")
+            print(f"机床进入等待状态，等待correction_request信号")
+            # 注意：不在这里直接处理，等待correction_request信号
+            
         elif status == "error":
             self.process_current_btn.setEnabled(True)
+            self.status_label.setText(f"机床错误 - 第{self.current_layer}层")
+            print(f"机床出现错误，需要排查问题")
+            
+        elif status == "completed":
+            print(f"第{self.current_layer}层加工完成")
+            # 在一些实现中，completed状态后可能会自动转为idle
+            
+        else:
+            print(f"未知的机床状态: {status}")
             
     def on_correction_request(self, layer_id: int):
-        """机床请求纠偏数据 - 这里才开始处理"""
-        print(f"PLC请求第{layer_id}层纠偏数据，开始处理...")
+        """增强的机床纠偏数据请求处理"""
+        print(f"\n=== PLC请求第{layer_id}层纠偏数据 ===")
+        print(f"当前系统状态:")
+        print(f"  - 当前层: {self.current_layer}")
+        print(f"  - 请求层: {layer_id}")
+        print(f"  - 已加载层数: {len(self.layers)}")
+        print(f"  - 自动模式: {self.auto_next_check.isChecked()}")
+        print(f"  - PLC连接状态: {self.plc_communicator.connected if self.plc_communicator else '未连接'}")
+        
+        # 更新状态显示
         self.status_label.setText(f"接收到PLC请求，开始处理第{layer_id}层")
         
-        # 设置当前层
-        self.current_layer = layer_id
+        # 同步当前层号
+        if self.current_layer != layer_id:
+            print(f"层号不一致，从 {self.current_layer} 更新为 {layer_id}")
+            self.current_layer = layer_id
+            self.update_layer_table()  # 更新界面显示
         
         # 检查层是否存在
         if layer_id not in self.layers:
-            print(f"错误: 第{layer_id}层不存在")
-            self.status_label.setText(f"错误: 第{layer_id}层不存在")
-            return
+            error_msg = f"错误: 第{layer_id}层G代码不存在，请先加载对应的G代码文件"
+            print(error_msg)
+            self.status_label.setText(error_msg)
             
-        # 延迟一点时间开始处理（模拟采集延迟）
-        delay_ms = getattr(self, 'process_delay_sec', 0.5) * 1000
-        QTimer.singleShot(int(delay_ms), self.process_current_layer)
+            # 向PLC发送错误响应
+            if self.plc_communicator and self.plc_communicator.connected:
+                try:
+                    self.plc_communicator.write_layer_completion(layer_id, False, 0.0)
+                    print(f"已向PLC发送第{layer_id}层错误响应")
+                except Exception as e:
+                    print(f"发送错误响应失败: {e}")
+            
+            # 显示错误对话框
+            QMessageBox.warning(self, "纠偏请求错误", 
+                               f"{error_msg}\n\n"
+                               f"当前已加载层数: {len(self.layers)}\n"
+                               f"请求的层号: {layer_id}\n\n"
+                               "请检查G代码加载情况。")
+            return
+        
+        # 检查是否正在处理其他层
+        if self.processing_thread and self.processing_thread.isRunning():
+            print(f"警告: 已有层正在处理中，将等待完成后处理第{layer_id}层")
+            self.status_label.setText(f"等待上一层处理完成，然后处理第{layer_id}层")
+            
+            # 创建队列处理机制
+            def process_when_ready():
+                """当前处理完成后自动处理队列中的层"""
+                if not (self.processing_thread and self.processing_thread.isRunning()):
+                    print(f"队列处理：开始处理第{layer_id}层")
+                    self.process_current_layer()
+                else:
+                    # 继续等待
+                    QTimer.singleShot(500, process_when_ready)
+            
+            QTimer.singleShot(500, process_when_ready)
+            return
+        
+        # 检查数据完整性
+        layer_info = self.layers[layer_id]
+        if not layer_info.gcode_path or not os.path.exists(layer_info.gcode_path):
+            error_msg = f"错误: 第{layer_id}层G代码文件不存在: {layer_info.gcode_path}"
+            print(error_msg)
+            self.status_label.setText(error_msg)
+            
+            # 向PLC发送错误响应
+            if self.plc_communicator and self.plc_communicator.connected:
+                try:
+                    self.plc_communicator.write_layer_completion(layer_id, False, 0.0)
+                    print(f"已向PLC发送第{layer_id}层文件错误响应")
+                except Exception as e:
+                    print(f"发送错误响应失败: {e}")
+            
+            QMessageBox.warning(self, "文件错误", error_msg)
+            return
+        
+        # 获取处理延迟时间
+        delay_sec = getattr(self, 'process_delay_sec', 0.5)
+        delay_ms = int(delay_sec * 1000)
+        
+        print(f"延迟 {delay_sec}秒 后开始处理（模拟采集延迟）")
+        
+        # 更新层状态为处理中
+        layer_info.status = "processing"
+        self.update_layer_table()
+        
+        # 延迟开始处理（模拟采集延迟）
+        QTimer.singleShot(delay_ms, lambda: self.process_layer_with_validation(layer_id))
+        
+        print(f"=== 纠偏请求处理完成 ===")
+    
+    def process_layer_with_validation(self, layer_id: int):
+        """带验证的层处理"""
+        try:
+            # 最终验证
+            if layer_id != self.current_layer:
+                print(f"警告: 延迟处理时层号发生变化 ({layer_id} -> {self.current_layer})")
+                return
+            
+            if layer_id not in self.layers:
+                print(f"错误: 延迟处理时第{layer_id}层已不存在")
+                return
+            
+            # 开始处理
+            self.process_current_layer()
+            
+        except Exception as e:
+            error_msg = f"层处理验证失败: {e}"
+            print(error_msg)
+            self.status_label.setText(error_msg)
+            
+            # 向PLC发送错误响应
+            if self.plc_communicator and self.plc_communicator.connected:
+                try:
+                    self.plc_communicator.write_layer_completion(layer_id, False, 0.0)
+                except Exception as e2:
+                    print(f"发送错误响应失败: {e2}")
+    
+    def on_data_transmission_progress(self, current_batch: int, total_batches: int, status_msg: str):
+        """数据传输进度更新"""
+        progress = int((current_batch / total_batches) * 100) if total_batches > 0 else 0
+        self.progress_bar.setValue(progress)
+        self.status_label.setText(f"数据传输: {status_msg}")
+        print(f"传输进度: {current_batch}/{total_batches} - {status_msg}")
+    
+    def on_safety_alert(self, layer_id: int, alert_message: str, deviation_value: float):
+        """安全警告处理"""
+        warning_msg = f"第{layer_id}层安全警告: {alert_message}"
+        print(f"安全警告: {warning_msg}")
+        self.status_label.setText(warning_msg)
+        
+        # 显示警告对话框
+        QMessageBox.warning(self, "安全警告", 
+                           f"{warning_msg}\n\n偏差值: {deviation_value:.3f}mm\n\n"
+                           "请检查数据和设备状态。")
+    
+    def on_heartbeat_updated(self, heartbeat_count: int):
+        """心跳更新"""
+        # 可以在状态栏显示心跳信息，或者只在调试时显示
+        if heartbeat_count % 10 == 0:  # 每10次心跳显示一次
+            print(f"PLC心跳: {heartbeat_count}")
                 
     def on_processing_finished(self, layer_id: int, result: Dict):
         """处理完成"""
@@ -527,7 +730,13 @@ class MultilayerMainWindow(QMainWindow):
             
             self.progress_bar.setValue(100)
             processing_time = result.get('processing_time', 0.0)
-            self.status_label.setText(f"第{layer_id}层处理完成")
+            
+            # 检查处理结果质量
+            quality_status = self.check_processing_quality(layer_id, result)
+            
+            # 更新状态显示包含质量信息
+            self.status_label.setText(f"第{layer_id}层处理完成 - {quality_status}")
+            print(f"第{layer_id}层处理完成 - 用时: {processing_time:.1f}s - {quality_status}")
             
             # 发送纠偏数据到PLC（非标定层）
             if layer_id > 1 and self.plc_communicator and self.plc_communicator.connected:
@@ -559,7 +768,410 @@ class MultilayerMainWindow(QMainWindow):
                 # PLC会在机床完成当前层加工后发送下一层请求
                 self.status_label.setText(f"第{layer_id}层已完成，等待机床开始下一层...")
                 print(f"第{layer_id}层处理完成，等待PLC发送下一层请求信号...")
+    
+    def check_processing_quality(self, layer_id: int, result: Dict) -> str:
+        """检查处理结果质量"""
+        try:
+            metrics = result.get('metrics', {})
+            if not metrics:
+                return "无质量数据"
+            
+            valid_ratio = metrics.get('valid_ratio', 0.0)
+            
+            # 优先使用新的轨迹精度指标
+            if 'trajectory_p95_distance' in metrics:
+                precision = metrics.get('trajectory_p95_distance', 0.0)
+                precision_type = "P95距离"
+            elif 'dev_p95' in metrics:
+                precision = metrics.get('dev_p95', 0.0)
+                precision_type = "P95偏差"
+            else:
+                return f"覆盖率: {valid_ratio:.1%}"
+            
+            # 质量评估
+            if valid_ratio >= 0.8 and precision <= 1.0:
+                quality = "优秀"
+            elif valid_ratio >= 0.6 and precision <= 2.0:
+                quality = "良好"
+            elif valid_ratio >= 0.4 and precision <= 3.0:
+                quality = "可接受"
+            else:
+                quality = "需注意"
+            
+            return f"{quality} (覆盖率: {valid_ratio:.1%}, {precision_type}: {precision:.2f}mm)"
+            
+        except Exception as e:
+            print(f"质量检查失败: {e}")
+            return "质量检查失败"
+    
+    def validate_plc_data_compatibility(self) -> Dict[str, Any]:
+        """验证PLC数据兼容性和处理能力"""
+        validation_result = {
+            "overall_ready": True,
+            "issues": [],
+            "warnings": [],
+            "capabilities": {
+                "layer_processing": False,
+                "correction_data_handling": False,
+                "quality_assessment": False,
+                "plc_communication": False,
+                "error_handling": False,
+                "batch_processing": False
+            },
+            "data_flow_status": {
+                "gcode_loading": False,
+                "bias_compensation": False,
+                "offset_data_generation": False,
+                "plc_transmission": False,
+                "status_synchronization": False
+            }
+        }
+        
+        try:
+            # 1. 检查层处理能力
+            if hasattr(self, 'process_current_layer') and callable(getattr(self, 'process_current_layer')):
+                validation_result["capabilities"]["layer_processing"] = True
+            else:
+                validation_result["issues"].append("缺少层处理方法")
+            
+            # 2. 检查纠偏数据处理能力
+            if hasattr(self, 'on_correction_request') and callable(getattr(self, 'on_correction_request')):
+                validation_result["capabilities"]["correction_data_handling"] = True
+            else:
+                validation_result["issues"].append("缺少纠偏数据处理方法")
+            
+            # 3. 检查质量评估能力
+            if hasattr(self, 'check_processing_quality') and callable(getattr(self, 'check_processing_quality')):
+                validation_result["capabilities"]["quality_assessment"] = True
+            else:
+                validation_result["warnings"].append("缺少质量评估能力")
+            
+            # 4. 检查PLC通信能力
+            if (hasattr(self, 'plc_communicator') and 
+                hasattr(self, 'connect_plc') and callable(getattr(self, 'connect_plc'))):
+                validation_result["capabilities"]["plc_communication"] = True
                 
+                # 检查PLC通信器类型支持
+                if self.plc_communicator:
+                    plc_type = type(self.plc_communicator).__name__
+                    if 'S7PLCEnhanced' in plc_type:
+                        validation_result["capabilities"]["batch_processing"] = True
+                        print(f"PLC通信器类型: {plc_type} (支持增强功能)")
+                    else:
+                        validation_result["warnings"].append(f"PLC通信器类型: {plc_type} (基础功能)")
+            else:
+                validation_result["issues"].append("缺少PLC通信能力")
+            
+            # 5. 检查错误处理能力
+            if (hasattr(self, 'on_processing_failed') and callable(getattr(self, 'on_processing_failed')) and
+                hasattr(self, 'process_layer_with_validation') and callable(getattr(self, 'process_layer_with_validation'))):
+                validation_result["capabilities"]["error_handling"] = True
+            else:
+                validation_result["warnings"].append("错误处理能力不完整")
+            
+            # 6. 检查数据流状态
+            # G代码加载
+            if hasattr(self, 'layers') and len(getattr(self, 'layers', {})) > 0:
+                validation_result["data_flow_status"]["gcode_loading"] = True
+            else:
+                validation_result["warnings"].append("尚未加载G代码文件")
+            
+            # 偏差补偿能力
+            if hasattr(self, 'controller') and self.controller:
+                validation_result["data_flow_status"]["bias_compensation"] = True
+            else:
+                validation_result["issues"].append("缺少算法控制器")
+            
+            # PLC传输能力
+            if (self.plc_communicator and 
+                hasattr(self.plc_communicator, 'send_correction_data') and 
+                callable(getattr(self.plc_communicator, 'send_correction_data'))):
+                validation_result["data_flow_status"]["plc_transmission"] = True
+            else:
+                validation_result["warnings"].append("PLC数据传输能力未就绪")
+            
+            # 状态同步能力
+            signal_methods = ['on_layer_changed_from_plc', 'on_machine_status_changed', 'on_correction_request']
+            if all(hasattr(self, method) and callable(getattr(self, method)) for method in signal_methods):
+                validation_result["data_flow_status"]["status_synchronization"] = True
+            else:
+                validation_result["issues"].append("缺少PLC状态同步方法")
+            
+            # 7. 综合评估
+            capabilities_ready = sum(validation_result["capabilities"].values())
+            data_flow_ready = sum(validation_result["data_flow_status"].values())
+            critical_issues = len(validation_result["issues"])
+            
+            validation_result["overall_ready"] = (
+                capabilities_ready >= 4 and  # 至少需要基础能力
+                data_flow_ready >= 3 and     # 至少需要基础数据流
+                critical_issues == 0         # 无关键问题
+            )
+            
+            # 生成总结报告
+            validation_result["summary"] = {
+                "capabilities_score": f"{capabilities_ready}/6",
+                "data_flow_score": f"{data_flow_ready}/5",
+                "critical_issues_count": critical_issues,
+                "warnings_count": len(validation_result["warnings"]),
+                "readiness_level": "Ready" if validation_result["overall_ready"] else "Needs Attention"
+            }
+            
+            return validation_result
+            
+        except Exception as e:
+            validation_result["overall_ready"] = False
+            validation_result["issues"].append(f"验证过程异常: {str(e)}")
+            return validation_result
+    
+    def print_data_processing_status(self):
+        """打印数据处理能力状态报告"""
+        validation = self.validate_plc_data_compatibility()
+        
+        print("\n" + "="*60)
+        print("数据处理能力验证报告")
+        print("="*60)
+        
+        # 总体状态
+        status_icon = "✓" if validation["overall_ready"] else "✗"
+        print(f"\n总体状态: {status_icon} {validation['summary']['readiness_level']}")
+        
+        # 能力评分
+        print(f"\n能力评分:")
+        print(f"  - 功能能力: {validation['summary']['capabilities_score']}")
+        print(f"  - 数据流: {validation['summary']['data_flow_score']}")
+        
+        # 详细能力
+        print(f"\n具体能力:")
+        for capability, status in validation["capabilities"].items():
+            icon = "✓" if status else "✗"
+            print(f"  {icon} {capability}: {'Ready' if status else 'Missing'}")
+        
+        # 数据流状态
+        print(f"\n数据流状态:")
+        for flow, status in validation["data_flow_status"].items():
+            icon = "✓" if status else "✗"
+            print(f"  {icon} {flow}: {'Ready' if status else 'Not Ready'}")
+        
+        # 问题和警告
+        if validation["issues"]:
+            print(f"\n关键问题 ({len(validation['issues'])}):")
+            for issue in validation["issues"]:
+                print(f"  ✗ {issue}")
+        
+        if validation["warnings"]:
+            print(f"\n警告 ({len(validation['warnings'])}):")
+            for warning in validation["warnings"]:
+                print(f"  ⚠ {warning}")
+        
+        print("="*60)
+        return validation
+    
+    def handle_plc_data_error(self, error_type: str, error_details: dict):
+        """处理PLC数据错误和异常情况"""
+        try:
+            layer_id = error_details.get('layer_id', self.current_layer)
+            error_message = error_details.get('message', 'Unknown error')
+            
+            print(f"\n=== PLC数据错误处理 ===")
+            print(f"错误类型: {error_type}")
+            print(f"层号: {layer_id}")
+            print(f"错误详情: {error_message}")
+            
+            # 根据错误类型采取不同处理策略
+            if error_type == "layer_mismatch":
+                # 层号不匹配
+                expected_layer = error_details.get('expected_layer')
+                actual_layer = error_details.get('actual_layer')
+                print(f"层号不匹配: 期望{expected_layer}, 实际{actual_layer}")
+                
+                # 同步层号
+                if actual_layer and actual_layer in self.layers:
+                    self.current_layer = actual_layer
+                    self.status_label.setText(f"已同步到第{actual_layer}层")
+                    self.update_layer_table()
+                
+            elif error_type == "data_transmission_failure":
+                # 数据传输失败
+                retry_count = error_details.get('retry_count', 0)
+                max_retries = error_details.get('max_retries', 3)
+                
+                if retry_count < max_retries:
+                    print(f"数据传输失败，将进行第{retry_count + 1}次重试")
+                    self.status_label.setText(f"第{layer_id}层数据传输失败，正在重试...")
+                    
+                    # 延迟后重试
+                    QTimer.singleShot(2000, lambda: self.retry_data_transmission(layer_id, retry_count + 1))
+                else:
+                    print(f"数据传输失败，已超过最大重试次数")
+                    self.status_label.setText(f"第{layer_id}层数据传输失败")
+                    
+                    # 标记层为错误状态
+                    if layer_id in self.layers:
+                        self.layers[layer_id].status = "error"
+                        self.update_layer_table()
+                        
+                    # 显示错误对话框
+                    QMessageBox.critical(self, "数据传输错误", 
+                                        f"第{layer_id}层数据传输失败\n\n"
+                                        f"错误: {error_message}\n"
+                                        f"重试次数: {retry_count}/{max_retries}\n\n"
+                                        "请检查PLC连接和数据格式")
+                
+            elif error_type == "quality_check_failure":
+                # 质量检查失败
+                quality_metrics = error_details.get('quality_metrics', {})
+                print(f"质量检查失败: {quality_metrics}")
+                
+                self.status_label.setText(f"第{layer_id}层质量不符合要求")
+                
+                # 显示警告对话框
+                QMessageBox.warning(self, "质量警告", 
+                                   f"第{layer_id}层处理结果质量不佳\n\n"
+                                   f"详情: {error_message}\n\n"
+                                   "请检查采集条件和算法参数")
+                
+            elif error_type == "plc_connection_lost":
+                # PLC连接丢失
+                print(f"PLC连接丢失")
+                self.status_label.setText("PLC连接丢失，正在尝试重连...")
+                
+                # 尝试重新连接
+                self.disconnect_plc()
+                QTimer.singleShot(3000, self.connect_plc)
+                
+            elif error_type == "gcode_file_missing":
+                # G代码文件缺失
+                missing_file = error_details.get('file_path', '')
+                print(f"G代码文件缺失: {missing_file}")
+                
+                self.status_label.setText(f"第{layer_id}层G代码文件缺失")
+                
+                # 显示错误对话框
+                QMessageBox.critical(self, "G代码文件错误", 
+                                    f"第{layer_id}层G代码文件不存在\n\n"
+                                    f"文件路径: {missing_file}\n\n"
+                                    "请检查文件路径和重新加载G代码")
+                
+            else:
+                # 未知错误类型
+                print(f"未知错误类型: {error_type}")
+                self.status_label.setText(f"系统错误: {error_type}")
+                
+                QMessageBox.warning(self, "系统错误", 
+                                   f"发生未知错误\n\n"
+                                   f"类型: {error_type}\n"
+                                   f"详情: {error_message}")
+            
+            # 向PLC发送错误状态
+            if self.plc_communicator and self.plc_communicator.connected:
+                try:
+                    self.plc_communicator.write_layer_completion(layer_id, False, 0.0)
+                    print(f"已向PLC发送错误状态")
+                except Exception as e:
+                    print(f"发送错误状态失败: {e}")
+            
+            print(f"=== 错误处理完成 ===")
+            
+        except Exception as e:
+            error_msg = f"错误处理器异常: {str(e)}"
+            print(error_msg)
+            self.status_label.setText(error_msg)
+    
+    def retry_data_transmission(self, layer_id: int, retry_count: int):
+        """重试数据传输"""
+        try:
+            print(f"开始第{retry_count}次重试传输第{layer_id}层数据")
+            
+            if layer_id not in self.layers:
+                print(f"重试失败: 第{layer_id}层不存在")
+                return
+            
+            layer_info = self.layers[layer_id]
+            if not layer_info.processing_result:
+                print(f"重试失败: 第{layer_id}层没有处理结果")
+                return
+            
+            # 获取纠偏数据
+            correction_data = layer_info.processing_result.get('correction', {})
+            if not correction_data:
+                print(f"重试失败: 第{layer_id}层没有纠偏数据")
+                return
+            
+            # 尝试发送
+            if self.plc_communicator and self.plc_communicator.connected:
+                success = self.plc_communicator.send_correction_data(layer_id, correction_data)
+                if success:
+                    print(f"第{retry_count}次重试成功")
+                    self.status_label.setText(f"第{layer_id}层数据重试传输成功")
+                else:
+                    print(f"第{retry_count}次重试失败")
+                    # 继续错误处理
+                    self.handle_plc_data_error("data_transmission_failure", {
+                        'layer_id': layer_id,
+                        'message': f'第{retry_count}次重试仍然失败',
+                        'retry_count': retry_count,
+                        'max_retries': 3
+                    })
+            else:
+                print(f"重试失败: PLC未连接")
+                
+        except Exception as e:
+            print(f"重试数据传输异常: {e}")
+    
+    def validate_system_capabilities(self) -> None:
+        """验证系统数据处理能力"""
+        try:
+            print(f"\n{'='*60}")
+            print("多层加工纠偏系统 - 数据处理能力验证")
+            print(f"{'='*60}")
+            
+            # 执行验证
+            validation = self.print_data_processing_status()
+            
+            # 根据验证结果更新界面
+            not_ready_msg = "检查中"  # 默认值
+            
+            if validation["overall_ready"]:
+                ready_msg = "系统就绪，可以处理PLC数据"
+                self.camera_status_label.setText("相机: 已就绪")
+                print(f"\n✓ {ready_msg}")
+            else:
+                issues_count = len(validation["issues"])
+                warnings_count = len(validation["warnings"])
+                not_ready_msg = f"系统需要注意 ({issues_count}个问题, {warnings_count}个警告)"
+                print(f"\n⚠ {not_ready_msg}")
+                
+                # 显示关键问题
+                if validation["issues"]:
+                    print(f"\n关键问题需要解决:")
+                    for i, issue in enumerate(validation["issues"], 1):
+                        print(f"  {i}. {issue}")
+            
+            # 显示功能状态摘要
+            capabilities_ready = sum(validation["capabilities"].values())
+            data_flow_ready = sum(validation["data_flow_status"].values())
+            
+            summary_msg = (
+                f"功能状态: {capabilities_ready}/6 | "
+                f"数据流: {data_flow_ready}/5 | "
+                f"问题: {len(validation['issues'])} | "
+                f"警告: {len(validation['warnings'])}"
+            )
+            print(f"\n{summary_msg}")
+            
+            # 更新状态显示
+            if validation["overall_ready"]:
+                self.status_label.setText("系统就绪 - 可以处理PLC数据")
+            else:
+                self.status_label.setText(f"系统检查中 - {not_ready_msg}")
+            
+            print(f"{'='*60}\n")
+            
+        except Exception as e:
+            error_msg = f"系统能力验证异常: {str(e)}"
+            print(error_msg)
+            self.status_label.setText(error_msg)
     def on_processing_failed(self, layer_id: int, error: str):
         """处理失败"""
         if layer_id in self.layers:
@@ -612,7 +1224,15 @@ class MultilayerMainWindow(QMainWindow):
             
     def on_plc_config_changed(self):
         """PLC配置变化"""
+        # 更新配置
         self.update_project_config()
+        
+        # 如果PLC已连接，提示用户重新连接以应用新配置
+        if (self.plc_communicator and self.plc_communicator.connected):
+            self.status_label.setText("PLC配置已更改，请重新连接以应用新设置")
+            # 可选：自动断开并重连
+            # self.disconnect_plc()
+            # self.connect_plc()
         
     def on_project_config_changed(self):
         """项目配置变化"""
