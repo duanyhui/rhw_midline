@@ -780,3 +780,198 @@ class PLCMonitorThread(QThread):
         """停止监控"""
         self.running = False
         self.wait(3000)  # 等待最多3秒
+
+# ==================== S7模拟器通信器 ====================
+
+class S7SimulatorPLCCommunicator(PLCCommunicator):
+    """S7模拟器PLC通信器，专用于连接S7模拟器进行测试"""
+    
+    def __init__(self, config: ProjectConfig):
+        super().__init__(config)
+        self.mock_s7 = None
+        self.safety_limits = {
+            "max_offset_mm": 20.0,
+            "max_gradient": 0.5,
+        }
+    
+    def connect(self):
+        """连接到S7模拟器"""
+        try:
+            # 导入S7模拟器通信模块
+            from s7_simulator.mock_s7_communicator import MockS7Communicator
+            
+            # 创建连接 (默认端口8502)
+            s7_sim_port = getattr(self.config, 's7_sim_port', 8502)
+            self.mock_s7 = MockS7Communicator(self.config.plc_ip, s7_sim_port)
+            
+            # 连接到模拟器
+            success = self.mock_s7.connect(ip=self.config.plc_ip, rack=0, slot=1)
+            
+            if success:
+                self.connected = True
+                self.connection_status.emit(True, f"S7模拟器连接成功 ({self.config.plc_ip}:{s7_sim_port})")
+                return True
+            else:
+                self.connection_status.emit(False, "S7模拟器连接失败")
+                return False
+                
+        except ImportError as e:
+            self.connection_status.emit(False, f"S7模拟器模块导入失败: {e}")
+            return False
+        except Exception as e:
+            self.connection_status.emit(False, f"S7模拟器连接错误: {e}")
+            return False
+    
+    def disconnect_plc(self):
+        """断开S7模拟器连接"""
+        super().disconnect_plc()
+        if self.mock_s7:
+            try:
+                self.mock_s7.disconnect()
+            except:
+                pass
+            self.mock_s7 = None
+    
+    def read_current_layer(self) -> int:
+        """读取当前层号"""
+        if not self.connected or not self.mock_s7:
+            return -1
+        
+        try:
+            return self.mock_s7.get_current_layer()
+        except Exception as e:
+            print(f"S7模拟器读取层号失败: {e}")
+            return -1
+    
+    def read_machine_status(self) -> str:
+        """读取机床状态"""
+        if not self.connected or not self.mock_s7:
+            return PLCDataProtocol.STATUS_ERROR
+        
+        try:
+            status = self.mock_s7.get_machine_status()
+            # 映射模拟器状态到协议状态
+            status_map = {
+                "idle": PLCDataProtocol.STATUS_IDLE,
+                "running": PLCDataProtocol.STATUS_PROCESSING,
+                "completed": PLCDataProtocol.STATUS_WAITING,
+                "error": PLCDataProtocol.STATUS_ERROR
+            }
+            return status_map.get(status, PLCDataProtocol.STATUS_ERROR)
+        except Exception as e:
+            print(f"S7模拟器读取状态失败: {e}")
+            return PLCDataProtocol.STATUS_ERROR
+    
+    def write_layer_completion(self, layer_id: int, success: bool, processing_time: float = 0.0):
+        """写入层完成信号"""
+        if not self.connected or not self.mock_s7:
+            return False
+        
+        try:
+            # 这里可以扩展写入完成信号的逻辑
+            print(f"S7模拟器: 第{layer_id}层完成，成功={success}, 耗时={processing_time:.1f}s")
+            return True
+        except Exception as e:
+            print(f"S7模拟器写入完成信号失败: {e}")
+            return False
+    
+    def send_correction_data(self, layer_id: int, correction_data: dict) -> bool:
+        """发送纠偏数据到S7模拟器"""
+        if not self.connected or not self.mock_s7:
+            return False
+        
+        try:
+            # 提取偏移表数据
+            offset_table = correction_data.get("offset_table", [])
+            if not offset_table:
+                print("警告: 没有偏移数据")
+                return True
+            
+            # 安全检查
+            safe_offsets = self._validate_safety(offset_table)
+            if not safe_offsets:
+                print("警告: 偏移数据安全检查失败，跳过发送")
+                return True
+            
+            # 设置处理锁
+            self.mock_s7.set_processing_lock(True)
+            
+            # 分批发送数据
+            batch_size = 128
+            total_points = len(safe_offsets)
+            total_batches = (total_points + batch_size - 1) // batch_size
+            
+            for batch_num in range(total_batches):
+                start_idx = batch_num * batch_size
+                end_idx = min(start_idx + batch_size, total_points)
+                batch_data = [(dx, dy) for x, y, dx, dy in safe_offsets[start_idx:end_idx]]
+                
+                # 发送批次数据
+                self.mock_s7.write_offset_batch(batch_data, batch_num + 1, total_batches)
+                
+                print(f"S7模拟器: 发送批次 {batch_num + 1}/{total_batches}: {len(batch_data)} 个偏移点")
+                
+                time.sleep(0.1)  # 批次间延时
+            
+            # 释放处理锁
+            self.mock_s7.set_processing_lock(False)
+            
+            print(f"S7模拟器: 纠偏数据发送完成 - 第{layer_id}层, {total_points}个点, {total_batches}批")
+            return True
+            
+        except Exception as e:
+            print(f"S7模拟器发送纠偏数据失败: {e}")
+            try:
+                if self.mock_s7:
+                    self.mock_s7.set_processing_lock(False)
+            except:
+                pass
+            return False
+    
+    def send_deviation_alert(self, layer_id: int, alert_message: str, deviation_value: float):
+        """发送偏差过大警告"""
+        print(f"S7模拟器警告: 第{layer_id}层 - {alert_message} (偏差: {deviation_value:.3f})")
+    
+    def _validate_safety(self, offset_table: list) -> list:
+        """安全验证偏移数据"""
+        if not offset_table:
+            return []
+        
+        safe_offsets = []
+        max_offset = self.safety_limits["max_offset_mm"]
+        max_gradient = self.safety_limits["max_gradient"]
+        
+        for i, (x, y, dx, dy) in enumerate(offset_table):
+            # 检查偏移量大小
+            offset_magnitude = (dx**2 + dy**2)**0.5
+            if offset_magnitude > max_offset:
+                print(f"S7模拟器安全检查: 点{i} 偏移量过大 {offset_magnitude:.3f}mm，设为0")
+                dx, dy = 0.0, 0.0
+            
+            # 检查梯度变化
+            if i > 0:
+                prev_dx, prev_dy = safe_offsets[-1][2], safe_offsets[-1][3]
+                gradient_dx = abs(dx - prev_dx)
+                gradient_dy = abs(dy - prev_dy)
+                
+                if gradient_dx > max_gradient:
+                    print(f"S7模拟器安全检查: 点{i} X梯度过大 {gradient_dx:.3f}，使用前值")
+                    dx = prev_dx
+                
+                if gradient_dy > max_gradient:
+                    print(f"S7模拟器安全检查: 点{i} Y梯度过大 {gradient_dy:.3f}，使用前值")
+                    dy = prev_dy
+            
+            safe_offsets.append((x, y, dx, dy))
+        
+        return safe_offsets
+    
+    def get_status_info(self) -> dict:
+        """获取详细状态信息"""
+        if not self.connected or not self.mock_s7:
+            return {"connected": False, "error": "未连接"}
+        
+        try:
+            return self.mock_s7.get_status_info()
+        except Exception as e:
+            return {"connected": False, "error": str(e)}

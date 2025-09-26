@@ -140,7 +140,7 @@ class MultilayerMainWindow(QMainWindow):
         plc_layout.addRow(self.use_plc_check)
         
         self.plc_type_combo = QComboBox()
-        self.plc_type_combo.addItems(["tcp", "s7", "mock"])
+        self.plc_type_combo.addItems(["tcp", "s7", "s7_sim", "mock"])
         self.plc_type_combo.setCurrentText(self.project_config.plc_type)
         plc_layout.addRow("通信类型:", self.plc_type_combo)
         
@@ -363,6 +363,10 @@ class MultilayerMainWindow(QMainWindow):
         elif self.project_config.plc_type == "s7":
             # 优先使用增强版S7通信器
             self.plc_communicator = S7PLCEnhanced(self.project_config)
+        elif self.project_config.plc_type == "s7_sim":
+            # S7模拟器通信器
+            from multilayer_plc import S7SimulatorPLCCommunicator
+            self.plc_communicator = S7SimulatorPLCCommunicator(self.project_config)
         elif self.project_config.plc_type == "mock":
             self.plc_communicator = MockPLCCommunicator(self.project_config)
         else:
