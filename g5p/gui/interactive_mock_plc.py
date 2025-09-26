@@ -8,7 +8,7 @@ import socket
 import threading
 import time
 import sys
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 from dataclasses import dataclass, field
 
 
@@ -44,8 +44,10 @@ class InteractiveMockPLCServer:
         self.socket = None
         self.running = False
         self.clients = []
+        self.client_threads = []  # 跟踪客户端线程
         self.machine_state = InteractiveMachineState()
         self.lock = threading.Lock()
+        self.max_clients = 5  # 最大客户端连接数
         self.command_help = {
             "start": "开始当前层加工",
             "complete": "完成当前层加工",
@@ -68,11 +70,13 @@ class InteractiveMockPLCServer:
         try:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
             self.socket.bind((self.host, self.port))
-            self.socket.listen(5)
+            self.socket.listen(self.max_clients)
             self.running = True
             
             print(f"\n交互式模拟PLC服务器启动: {self.host}:{self.port}")
+            print(f"最大客户端连接数: {self.max_clients}")
             print("=" * 60)
             self.print_status()
             self.print_help()
@@ -81,11 +85,54 @@ class InteractiveMockPLCServer:
             network_thread = threading.Thread(target=self._network_server, daemon=True)
             network_thread.start()
             
+            # 启动连接清理线程
+            cleanup_thread = threading.Thread(target=self._cleanup_connections, daemon=True)
+            cleanup_thread.start()
+            
             # 主线程处理命令行输入
             self._command_loop()
                         
         except Exception as e:
             print(f"服务器启动失败: {e}")
+            
+    def _cleanup_connections(self):
+        """定期清理死连接"""
+        import time
+        while self.running:
+            try:
+                time.sleep(5)  # 每5秒检查一次
+                with self.lock:
+                    # 清理已结束的线程
+                    self.client_threads = [t for t in self.client_threads if t.is_alive()]
+                    
+                    if len(self.client_threads) > 0:
+                        print(f"[维护] 当前活跃连接数: {len(self.client_threads)}")
+            except Exception as e:
+                print(f"[维护] 连接清理错误: {e}")
+                
+    def stop(self):
+        """停止服务器"""
+        print("\n正在停止服务器...")
+        self.running = False
+        
+        # 关闭所有客户端连接
+        with self.lock:
+            for client in self.clients[:]:
+                try:
+                    client.close()
+                except:
+                    pass
+            self.clients.clear()
+        
+        # 关闭服务器Socket
+        if self.socket:
+            try:
+                self.socket.close()
+            except:
+                pass
+            self.socket = None
+        
+        print("服务器已停止")
             
     def _network_server(self):
         """网络服务线程"""
@@ -94,16 +141,35 @@ class InteractiveMockPLCServer:
             
         while self.running:
             try:
+                self.socket.settimeout(1.0)  # 设置超时，允许定期检查running状态
                 client_socket, address = self.socket.accept()
-                print(f"\n[网络] 客户端连接: {address}")
+                
+                # 检查客户端连接数限制
+                with self.lock:
+                    if len(self.client_threads) >= self.max_clients:
+                        print(f"[网络] 拒绝连接 {address}: 已达到最大连接数 {self.max_clients}")
+                        client_socket.close()
+                        continue
+                
+                print(f"\n[网络] 客户端连接: {address} (连接数: {len(self.client_threads) + 1})")
+                
+                # 添加到客户端列表
+                with self.lock:
+                    self.clients.append(client_socket)
                 
                 client_thread = threading.Thread(
                     target=self._handle_client, 
                     args=(client_socket, address),
                     daemon=True
                 )
+                
+                with self.lock:
+                    self.client_threads.append(client_thread)
+                
                 client_thread.start()
                 
+            except socket.timeout:
+                continue  # 超时是正常的，继续检查running状态
             except Exception as e:
                 if self.running:
                     print(f"[网络] 接受连接错误: {e}")
@@ -111,34 +177,258 @@ class InteractiveMockPLCServer:
     def _handle_client(self, client_socket: socket.socket, address):
         """处理客户端连接"""
         try:
+            # 设置Socket超时和选项
+            client_socket.settimeout(30.0)  # 30秒超时
+            client_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            
             while self.running:
-                # 接收数据长度
-                length_bytes = client_socket.recv(4)
-                if len(length_bytes) < 4:
+                # 安全接收数据长度
+                length_bytes = self._recv_exact(client_socket, 4)
+                if not length_bytes:
+                    print(f"[网络] 客户端 {address} 关闭连接")
                     break
-                    
-                length = int.from_bytes(length_bytes, byteorder='big')
                 
-                # 接收命令数据
-                command_data = client_socket.recv(length)
-                if len(command_data) < length:
+                # 验证长度字段的合理性
+                is_valid, length = self._validate_length_bytes(length_bytes, address)
+                
+                if not is_valid:
+                    if length == -1:  # 边界错位，需要修复
+                        print(f"[边界修复] 尝试修复数据包边界...")
+                        if not self._recover_packet_boundary(client_socket, length_bytes, address):
+                            print(f"[边界修复] 修复失败，断开连接")
+                            break
+                        continue
+                    else:
+                        # 长度异常，尝试清空缓冲区
+                        print(f"[网络] 客户端 {address} 发送的数据长度异常: {length}")
+                        print(f"[调试] 长度字节: {length_bytes.hex()} -> {length}")
+                        
+                        if not self._clear_socket_buffer(client_socket, address):
+                            break
+                        continue
+                
+                # 安全接收命令数据
+                command_data = self._recv_exact(client_socket, length)
+                if not command_data:
+                    print(f"[网络] 客户端 {address} 数据接收不完整")
                     break
+                
+                # 安全解析JSON
+                try:
+                    command_str = command_data.decode('utf-8')
+                    if not command_str.strip():
+                        print(f"[网络] 客户端 {address} 发送空数据")
+                        continue
+                        
+                    command = json.loads(command_str)
+                except json.JSONDecodeError as je:
+                    print(f"[网络] 客户端 {address} JSON解析错误: {je}")
+                    print(f"[调试] 长度: {length}, 实际数据长度: {len(command_data)}")
+                    print(f"[调试] 原始数据: {command_data[:100]}...")
+                    print(f"[调试] 数据hex: {command_data[:50].hex()}")
                     
-                command = json.loads(command_data.decode('utf-8'))
+                    # 检查是否是数据包边界问题
+                    if b'{' not in command_data[:100]:
+                        print(f"[恢复] 数据不包含JSON起始字符，可能是边界错位")
+                        # 尝试在数据中查找JSON起始位置
+                        json_start = command_data.find(b'{')
+                        if json_start > 0:
+                            print(f"[恢复] 在位置 {json_start} 找到JSON起始")
+                            try:
+                                fixed_data = command_data[json_start:]
+                                command = json.loads(fixed_data.decode('utf-8'))
+                                print(f"[恢复] JSON解析成功: {command.get('type', 'unknown')}")
+                            except Exception:
+                                print(f"[恢复] JSON修复失败")
+                                continue
+                        else:
+                            print(f"[恢复] 未找到JSON数据，跳过此数据包")
+                            continue
+                    else:
+                        # 发送错误响应
+                        error_response = {"success": False, "error": f"JSON解析失败: {str(je)}"}
+                        self._send_response(client_socket, error_response)
+                        continue
+                except UnicodeDecodeError as ue:
+                    print(f"[网络] 客户端 {address} 编码解析错误: {ue}")
+                    continue
                 
                 # 处理命令
                 response = self._process_command(command)
                 
-                # 发送响应
-                response_data = json.dumps(response).encode('utf-8')
-                client_socket.send(len(response_data).to_bytes(4, byteorder='big'))
-                client_socket.send(response_data)
+                # 安全发送响应
+                if not self._send_response(client_socket, response):
+                    print(f"[网络] 客户端 {address} 响应发送失败")
+                    break
                 
+        except socket.timeout:
+            print(f"[网络] 客户端 {address} 连接超时")
+        except socket.error as se:
+            print(f"[网络] 客户端 {address} Socket错误: {se}")
         except Exception as e:
             print(f"[网络] 客户端 {address} 处理错误: {e}")
+            import traceback
+            print(f"[调试] 详细错误信息:\n{traceback.format_exc()}")
         finally:
-            client_socket.close()
-            print(f"[网络] 客户端 {address} 断开连接")
+            # 从客户端列表中移除
+            with self.lock:
+                if client_socket in self.clients:
+                    self.clients.remove(client_socket)
+            
+            try:
+                client_socket.close()
+            except:
+                pass
+            print(f"[网络] 客户端 {address} 断开连接 (当前连接数: {len(self.clients)})")
+    
+    def _recv_exact(self, sock: socket.socket, n: int) -> bytes:
+        """精确接收指定长度的数据，带边界检测"""
+        data = b''
+        retry_count = 0
+        max_retries = 3
+        
+        while len(data) < n and retry_count < max_retries:
+            try:
+                chunk = sock.recv(n - len(data))
+                if not chunk:
+                    return b''  # 连接关闭
+                data += chunk
+            except socket.timeout:
+                retry_count += 1
+                print(f"[网络] 接收超时 (重试 {retry_count}/{max_retries})，已接收 {len(data)}/{n} 字节")
+                if retry_count >= max_retries:
+                    return b''
+                continue
+            except socket.error:
+                return b''
+        return data
+    
+    def _validate_length_bytes(self, length_bytes: bytes, address) -> Tuple[bool, int]:
+        """验证长度字段的合理性"""
+        if len(length_bytes) != 4:
+            return False, 0
+            
+        length = int.from_bytes(length_bytes, byteorder='big')
+        
+        # 检查长度是否合理（JSON命令通常在10-10000字节之间）
+        if 10 <= length <= 1024 * 1024:  # 10字节到1MB
+            return True, length
+        
+        # 长度异常，尝试修复
+        print(f"[边界检测] 客户端 {address} 长度异常: {length}")
+        print(f"[边界检测] 长度字节: {length_bytes.hex()}")
+        
+        # 检查是否包含JSON起始标记
+        if b'{' in length_bytes:
+            print(f"[边界检测] 长度字段中包含JSON数据，可能是边界错位")
+            return False, -1  # 特殊标记，表示需要边界修复
+            
+        return False, length
+    
+    def _clear_socket_buffer(self, client_socket: socket.socket, address) -> bool:
+        """清空Socket缓冲区"""
+        try:
+            print(f"[恢复] 尝试清空Socket缓冲区...")
+            client_socket.settimeout(0.1)  # 短超时
+            total_discarded = 0
+            
+            while True:
+                discard = client_socket.recv(4096)
+                if not discard:
+                    break
+                total_discarded += len(discard)
+                print(f"[恢复] 丢弃 {len(discard)} 字节")
+                
+                # 防止无限循环
+                if total_discarded > 1024 * 1024:  # 1MB
+                    print(f"[恢复] 已丢弃 {total_discarded} 字节，停止清理")
+                    break
+                    
+        except socket.timeout:
+            pass  # 超时是正常的，表示缓冲区已清空
+        except Exception as e:
+            print(f"[恢复] 清理缓冲区失败: {e}")
+            return False
+        finally:
+            client_socket.settimeout(30.0)  # 恢复原超时
+            
+        print(f"[恢复] 缓冲区已清空，总计丢弃 {total_discarded} 字节")
+        return True
+    
+    def _recover_packet_boundary(self, client_socket: socket.socket, length_bytes: bytes, address) -> bool:
+        """尝试修复数据包边界错位"""
+        try:
+            print(f"[边界修复] 原始长度字节: {length_bytes.hex()}")
+            
+            # 查找JSON起始位置
+            json_start = length_bytes.find(b'{')
+            if json_start >= 0:
+                print(f"[边界修复] 在长度字段位置 {json_start} 找到JSON起始")
+                
+                # 构建完整的JSON数据
+                remaining_data = length_bytes[json_start:]
+                
+                # 尝试接收更多数据以完成JSON
+                client_socket.settimeout(1.0)
+                try:
+                    more_data = client_socket.recv(1024)
+                    remaining_data += more_data
+                    print(f"[边界修复] 接收到额外 {len(more_data)} 字节")
+                except socket.timeout:
+                    pass
+                
+                # 尝试解析JSON
+                try:
+                    # 查找完整的JSON结束
+                    json_str = remaining_data.decode('utf-8')
+                    bracket_count = 0
+                    json_end = -1
+                    
+                    for i, char in enumerate(json_str):
+                        if char == '{':
+                            bracket_count += 1
+                        elif char == '}':
+                            bracket_count -= 1
+                            if bracket_count == 0:
+                                json_end = i
+                                break
+                    
+                    if json_end >= 0:
+                        complete_json = json_str[:json_end + 1]
+                        command = json.loads(complete_json)
+                        
+                        print(f"[边界修复] JSON解析成功: {command.get('type', 'unknown')}")
+                        
+                        # 处理命令并发送响应
+                        response = self._process_command(command)
+                        self._send_response(client_socket, response)
+                        return True
+                        
+                except Exception as e:
+                    print(f"[边界修复] JSON修复失败: {e}")
+                    
+            return False
+            
+        except Exception as e:
+            print(f"[边界修复] 修复过程出错: {e}")
+            return False
+        finally:
+            client_socket.settimeout(30.0)  # 恢复原超时
+    
+    def _send_response(self, sock: socket.socket, response: dict) -> bool:
+        """安全发送响应"""
+        try:
+            response_data = json.dumps(response, ensure_ascii=False).encode('utf-8')
+            length_bytes = len(response_data).to_bytes(4, byteorder='big')
+            
+            # 发送长度
+            sock.sendall(length_bytes)
+            # 发送数据
+            sock.sendall(response_data)
+            return True
+        except Exception as e:
+            print(f"[网络] 发送响应失败: {e}")
+            return False
             
     def _process_command(self, command: Dict) -> Dict:
         """处理接收到的命令"""

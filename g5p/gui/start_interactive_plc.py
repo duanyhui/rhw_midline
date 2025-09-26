@@ -53,8 +53,22 @@ def main():
     except KeyboardInterrupt:
         print("\n收到停止信号...")
         server.stop()
+    except OSError as e:
+        if "Address already in use" in str(e) or "通常每个套接字地址" in str(e):
+            print(f"启动失败: 端口502已被占用")
+            print("解决方案:")
+            print("1. 检查是否有其他PLC服务器正在运行")
+            print("2. 等待几秒后重试")
+            print("3. 重启计算机释放端口")
+        else:
+            print(f"启动失败: {e}")
     except Exception as e:
         print(f"启动失败: {e}")
+        import traceback
+        print(f"详细错误信息:\n{traceback.format_exc()}")
+        
+    print("\n程序结束")
+    input("按回车键退出...")
 
 if __name__ == "__main__":
     main()

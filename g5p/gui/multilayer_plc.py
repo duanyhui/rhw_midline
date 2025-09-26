@@ -3,6 +3,7 @@
 多层加工纠偏系统 - PLC通信模块
 """
 import json
+import socket
 import time
 import threading
 from typing import Optional
@@ -140,15 +141,27 @@ class TCPPLCCommunicator(PLCCommunicator):
         
     def connect(self):
         try:
-            import socket
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.settimeout(5.0)
+            
+            # 配置Socket选项
+            self.socket.settimeout(10.0)  # 增加超时时间到10秒
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)  # 启用保活
+            self.socket.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # 禁用Nagle算法
+            
+            # 连接到PLC
             self.socket.connect((self.config.plc_ip, self.config.plc_port))
             self.connected = True
             self.connection_status.emit(True, "TCP连接成功")
+            print(f"[TCP] 成功连接到 {self.config.plc_ip}:{self.config.plc_port}")
             return True
-        except Exception as e:
+        except socket.timeout:
+            self.connection_status.emit(False, "TCP连接超时")
+            return False
+        except socket.error as e:
             self.connection_status.emit(False, f"TCP连接失败: {e}")
+            return False
+        except Exception as e:
+            self.connection_status.emit(False, f"TCP连接异常: {e}")
             return False
             
     def disconnect_plc(self):
@@ -161,27 +174,165 @@ class TCPPLCCommunicator(PLCCommunicator):
             self.socket = None
             
     def _send_command(self, command: dict) -> dict:
-        """发送命令并接收响应"""
+        """发送命令并接收响应，带自动重连"""
         if not self.connected or not self.socket:
             return {"success": False, "error": "连接未建立"}
         
+        # 尝试3次通信，失败后自动重连
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                # 检查连接状态
+                if not self._check_connection():
+                    if attempt < max_attempts - 1:
+                        print(f"[TCP] 连接检查失败，尝试重连... ({attempt + 1}/{max_attempts})")
+                        if self._reconnect():
+                            continue
+                    return {"success": False, "error": "连接检查失败"}
+                
+                # 发送命令
+                command_data = json.dumps(command, ensure_ascii=False).encode('utf-8')
+                length_bytes = len(command_data).to_bytes(4, byteorder='big')
+                
+                # 验证要发送的数据长度
+                if len(command_data) > 1024 * 1024:  # 1MB
+                    return {"success": False, "error": f"命令数据过大: {len(command_data)} 字节"}
+                
+                # 使用sendall确保数据完整发送
+                self.socket.sendall(length_bytes)
+                self.socket.sendall(command_data)
+                
+                # 精确接收响应长度
+                length_bytes = self._recv_exact(4)
+                if not length_bytes:
+                    if attempt < max_attempts - 1:
+                        print(f"[TCP] 接收长度失败，尝试重连... ({attempt + 1}/{max_attempts})")
+                        if self._reconnect():
+                            continue
+                    return {"success": False, "error": "服务器关闭连接"}
+                
+                length = int.from_bytes(length_bytes, byteorder='big')
+                
+                # 验证长度合理性
+                if length <= 0 or length > 1024 * 1024:  # 最大1MB
+                    print(f"[TCP] 响应长度异常: {length}, 长度字节: {length_bytes.hex()}")
+                    if attempt < max_attempts - 1:
+                        print(f"[TCP] 尝试清理并重连... ({attempt + 1}/{max_attempts})")
+                        self._clear_socket_buffer()
+                        if self._reconnect():
+                            continue
+                    return {"success": False, "error": f"响应数据长度异常: {length}"}
+                
+                # 精确接收响应数据
+                response_data = self._recv_exact(length)
+                if not response_data:
+                    if attempt < max_attempts - 1:
+                        print(f"[TCP] 接收数据失败，尝试重连... ({attempt + 1}/{max_attempts})")
+                        if self._reconnect():
+                            continue
+                    return {"success": False, "error": "接收响应数据失败"}
+                
+                # 安全解析JSON
+                try:
+                    response_str = response_data.decode('utf-8')
+                    if not response_str.strip():
+                        return {"success": False, "error": "服务器返回空响应"}
+                        
+                    response = json.loads(response_str)
+                    return response
+                except json.JSONDecodeError as je:
+                    print(f"[TCP] JSON解析错误: {je}")
+                    print(f"[TCP] 原始数据: {response_data[:100]}...")
+                    if attempt < max_attempts - 1:
+                        print(f"[TCP] 数据损坏，尝试重连... ({attempt + 1}/{max_attempts})")
+                        if self._reconnect():
+                            continue
+                    return {"success": False, "error": f"JSON解析失败: {str(je)[:100]}"}
+                except UnicodeDecodeError as ue:
+                    return {"success": False, "error": f"编码解析失败: {str(ue)}"}
+                    
+            except socket.timeout:
+                if attempt < max_attempts - 1:
+                    print(f"[TCP] 通信超时，尝试重连... ({attempt + 1}/{max_attempts})")
+                    if self._reconnect():
+                        continue
+                return {"success": False, "error": "通信超时"}
+            except socket.error as se:
+                self.connected = False
+                if attempt < max_attempts - 1:
+                    print(f"[TCP] 网络错误 {se}，尝试重连... ({attempt + 1}/{max_attempts})")
+                    if self._reconnect():
+                        continue
+                return {"success": False, "error": f"网络错误: {str(se)}"}
+            except Exception as e:
+                if attempt < max_attempts - 1:
+                    print(f"[TCP] 通信异常 {e}，尝试重连... ({attempt + 1}/{max_attempts})")
+                    if self._reconnect():
+                        continue
+                return {"success": False, "error": f"通信异常: {str(e)}"}
+        
+        return {"success": False, "error": "多次重试失败"}
+    
+    def _recv_exact(self, n: int) -> bytes:
+        """精确接收指定长度的数据"""
+        if not self.socket:
+            return b''
+            
+        data = b''
+        while len(data) < n:
+            try:
+                chunk = self.socket.recv(n - len(data))
+                if not chunk:
+                    return b''  # 连接关闭
+                data += chunk
+            except socket.timeout:
+                print(f"[TCP] 接收数据超时，已接收 {len(data)}/{n} 字节")
+                return b''
+            except socket.error:
+                return b''
+        return data
+    
+    def _check_connection(self) -> bool:
+        """检查连接是否有效"""
+        if not self.socket or not self.connected:
+            return False
+        
         try:
-            # 发送命令
-            command_data = json.dumps(command).encode('utf-8')
-            self.socket.send(len(command_data).to_bytes(4, byteorder='big'))
-            self.socket.send(command_data)
-            
-            # 接收响应
-            length_bytes = self.socket.recv(4)
-            if len(length_bytes) < 4:
-                return {"success": False, "error": "接收数据长度错误"}
-            
-            length = int.from_bytes(length_bytes, byteorder='big')
-            response_data = self.socket.recv(length)
-            response = json.loads(response_data.decode('utf-8'))
-            return response
+            # 发送一个小的测试包检查连接
+            self.socket.send(b'')
+            return True
+        except socket.error:
+            self.connected = False
+            return False
+    
+    def _reconnect(self) -> bool:
+        """尝试重新连接"""
+        try:
+            self.disconnect_plc()
+            time.sleep(0.5)  # 短暂等待
+            return self.connect()
         except Exception as e:
-            return {"success": False, "error": str(e)}
+            print(f"[TCP] 重连失败: {e}")
+            return False
+    
+    def _clear_socket_buffer(self):
+        """清理客户端Socket缓冲区"""
+        if not self.socket:
+            return
+        
+        try:
+            self.socket.settimeout(0.1)
+            while True:
+                data = self.socket.recv(1024)
+                if not data:
+                    break
+                print(f"[TCP] 清理缓冲区数据: {len(data)} 字节")
+        except socket.timeout:
+            pass  # 正常，缓冲区已清空
+        except Exception:
+            pass
+        finally:
+            self.socket.settimeout(10.0)  # 恢复原超时
             
     def read_current_layer(self) -> int:
         command = {
