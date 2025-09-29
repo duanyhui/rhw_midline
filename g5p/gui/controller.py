@@ -315,16 +315,7 @@ class AlignController:
 
         # 1) 外参与 G 代码
         self.R, self.t, _ = core.load_extrinsic(cfg['T_path'])
-        
-        # 使用增强的G代码解析器
-        try:
-            from gcode_parser_patch import parse_gcode_xy_enhanced
-            g_raw, feed = parse_gcode_xy_enhanced(cfg['gcode_path'], step_mm=cfg['guide_step_mm'])
-            print(f"[INFO] 使用增强G代码解析器，解析到 {len(g_raw)} 个点")
-        except ImportError:
-            # 如果补丁不可用，使用原版解析器
-            g_raw, feed = core.parse_gcode_xy(cfg['gcode_path'], step_mm=cfg['guide_step_mm'])
-            print(f"[INFO] 使用原版G代码解析器，解析到 {len(g_raw)} 个点")
+        g_raw, feed = core.parse_gcode_xy(cfg['gcode_path'], step_mm=cfg['guide_step_mm'])
         step_mm = float(cfg['guide_step_mm'])
         g_xy = core.resample_polyline(g_raw, max(0.2, step_mm)) if g_raw.size > 0 else g_raw
         T_ref, N_ref = core.tangent_normal(g_xy) if g_xy.size > 0 else (np.zeros((0,2)), np.zeros((0,2)))
@@ -659,12 +650,7 @@ class AlignController:
                 gpath = bc.get('gcode_path', '')
                 step_cal = float(bc.get('guide_step_mm', self.cfg.guide_step_mm))
                 if gpath:
-                    # 使用增强的G代码解析器
-                    try:
-                        from gcode_parser_patch import parse_gcode_xy_enhanced
-                        g_cal_raw, _ = parse_gcode_xy_enhanced(gpath, step_mm=step_cal)
-                    except ImportError:
-                        g_cal_raw, _ = core.parse_gcode_xy(gpath, step_mm=step_cal)
+                    g_cal_raw, _ = core.parse_gcode_xy(gpath, step_mm=step_cal)
                     g_cal = core.resample_polyline(g_cal_raw, max(0.2, step_cal)) if g_cal_raw.size > 0 else g_cal_raw
                     if g_cal.size > 0:
                         T_cal, _ = core.tangent_normal(g_cal)

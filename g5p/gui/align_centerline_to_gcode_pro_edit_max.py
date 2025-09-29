@@ -225,47 +225,7 @@ def load_extrinsic(T_path: Union[str, Path]):
     T = np.asarray(data['T'], dtype=float)
     return R, t, T
 
-# ---- G-code 解析（支持 G0/G1 + G2/G3 圆弧）----
-def parse_gcode_line_parameters(line: str) -> dict:
-    """
-    增强版G代码参数解析，支持紧凑格式和标准格式。
-    
-    支持格式：
-    - 标准格式：G01 X75.7 Y-184.7 Z988.0
-    - 紧凑格式：G01X75.7Y-184.7Z988.0
-    - 混合格式：G01 X75.7Y-184.7 Z988.0
-    
-    Returns:
-        dict: {param: value} 如 {'G': 1, 'X': 75.7, 'Y': -184.7, 'Z': 988.0}
-    """
-    line = line.strip().upper()
-    if not line:
-        return {}
-        
-    params = {}
-    
-    # 使用增强的正则表达式来匹配参数
-    # 匹配模式：字母 + 可选符号 + 数字(含小数)
-    pattern = r'([A-Z])([+-]?\d*\.?\d+)'
-    matches = re.findall(pattern, line)
-    
-    for param_char, value_str in matches:
-        try:
-            # 处理整数和浮点数
-            if '.' in value_str:
-                params[param_char] = float(value_str)
-            else:
-                # 对于G、M等指令代码，保持为整数
-                if param_char in ['G', 'M', 'T', 'N']:
-                    params[param_char] = int(value_str)
-                else:
-                    params[param_char] = float(value_str)
-        except ValueError:
-            # 如果转换失败，跳过这个参数
-            continue
-            
-    return params
-
+# ---- G-code 解析（支持 G0/G1 + G2/G3 圆弧） ----
 def _interp_arc_xy(xy0, xy1, ij=None, R=None, cw=True, step=1.0):
     # 仅处理平面 XY 圆弧。优先 IJ 圆心；否则用 R。
     p0 = np.array(xy0, float); p1 = np.array(xy1, float)
