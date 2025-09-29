@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Centerline ↔ G-code (Guided Fit) — STRICT One-to-One Edition
@@ -266,67 +266,93 @@ def parse_gcode_xy(path: Union[str, Path], step_mm: float = 1.0) -> Tuple[np.nda
     p = Path(path) if not isinstance(path, Path) else path
     if (not path) or (not p.exists()):
         return np.empty((0,2), float), None
-    pts = []
-    feed = None
-    cur = {'X': None, 'Y': None}
+    pts: List[List[float]] = []
+    feed: Optional[float] = None
+    cur_x: Optional[float] = None
+    cur_y: Optional[float] = None
+    cur_mode: Optional[int] = None  # 0/1/2/3 => G0/G1/G2/G3
+    # support optional '=': e.g., X=1.0, Z=988.0
+    word_re = re.compile(r'([A-Za-z])\s*=?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))')
     with p.open('r', encoding='utf-8', errors='ignore') as f:
         for raw in f:
             line = raw.strip()
             if (not line) or line.startswith(';') or line.startswith('('):
                 continue
-            if ';' in line: line = line.split(';',1)[0]
+            if ';' in line:
+                line = line.split(';',1)[0]
             while '(' in line and ')' in line:
-                a = line.find('('); b = line.find(')');
+                a = line.find('('); b = line.find(')', a+1)
                 if a < 0 or b < 0 or b <= a: break
                 line = (line[:a] + ' ' + line[b+1:]).strip()
-            toks = re.findall(r'[A-Za-z]+-?\d+(?:\.\d+)?', line)
-
-            if not toks: continue
-            cmd = toks[0].upper()
-            for u in toks[1:]:
-                U = u.upper()
-                if U.startswith('F'):
-                    try: feed = float(U[1:])
-                    except: pass
-            if cmd in ('G0','G00','G1','G01','G2','G02','G3','G03'):
-                x = cur['X']; y = cur['Y']
-                I = J = R = None
-                for u in toks[1:]:
-                    U = u.upper()
-                    if U.startswith('X'):
-                        try: x = float(U[1:])
-                        except: pass
-                    elif U.startswith('Y'):
-                        try: y = float(U[1:])
-                        except: pass
-                    elif U.startswith('I'):
-                        try: I = float(U[1:])
-                        except: pass
-                    elif U.startswith('J'):
-                        try: J = float(U[1:])
-                        except: pass
-                    elif U.startswith('R'):
-                        try: R = float(U[1:])
-                        except: pass
-                if x is None or y is None:
+            if not line:
+                continue
+            words = [(m.group(1).upper(), m.group(2)) for m in word_re.finditer(line)]
+            if not words:
+                continue
+            # modal G: keep last motion mode if present in line
+            g_in_line: Optional[int] = None
+            for k, v_str in words:
+                if k == 'G':
+                    try:
+                        gv = int(round(float(v_str)))
+                        if gv in (0,1,2,3):
+                            g_in_line = gv
+                    except Exception:
+                        pass
+            if g_in_line is not None:
+                cur_mode = g_in_line
+            # parse words
+            tgt_x: Optional[float] = None
+            tgt_y: Optional[float] = None
+            I = J = R = None
+            for k, v_str in words:
+                try:
+                    v = float(v_str)
+                except Exception:
                     continue
-                if cmd in ('G2','G02','G3','G03'):
-                    cw = cmd in ('G2','G02')
-                    if len(pts)==0 and (cur['X'] is None or cur['Y'] is None):
-                        pts.append([x, y])
-                    else:
-                        p0 = np.array([cur['X'], cur['Y']]) if cur['X'] is not None else np.array(pts[-1])
-                        p1 = np.array([x, y])
-                        ij = (I,J) if (I is not None and J is not None) else None
-                        arc = _interp_arc_xy(p0, p1, ij=ij, R=R, cw=cw, step=step_mm)
-                        if len(pts)>0 and np.allclose(pts[-1], arc[0]):
-                            pts.extend(arc[1:].tolist())
-                        else:
-                            pts.extend(arc.tolist())
+                if k == 'F':
+                    feed = v
+                elif k == 'X':
+                    tgt_x = v
+                elif k == 'Y':
+                    tgt_y = v
+                elif k == 'I':
+                    I = v
+                elif k == 'J':
+                    J = v
+                elif k == 'R':
+                    R = v
+            # skip lines with no XY updates
+            if tgt_x is None and tgt_y is None:
+                continue
+            # single-axis updates: use last known for the other axis
+            x = tgt_x if tgt_x is not None else cur_x
+            y = tgt_y if tgt_y is not None else cur_y
+            if x is None or y is None:
+                # cache partial updates and continue
+                if tgt_x is not None:
+                    cur_x = tgt_x
+                if tgt_y is not None:
+                    cur_y = tgt_y
+                continue
+            mode = cur_mode if cur_mode is not None else 1
+            if mode in (2,3):
+                cw = (mode == 2)
+                if len(pts)==0 and (cur_x is None or cur_y is None):
+                    pts.append([x, y])
                 else:
-                    if len(pts)==0 or not np.allclose([x,y], pts[-1]):
-                        pts.append([x,y])
-                cur['X'], cur['Y'] = x, y
+                    p0 = np.array(pts[-1]) if len(pts)>0 else np.array([cur_x, cur_y])
+                    p1 = np.array([x, y])
+                    ij = (I,J) if (I is not None and J is not None) else None
+                    arc = _interp_arc_xy(p0, p1, ij=ij, R=R, cw=cw, step=step_mm)
+                    if len(pts)>0 and np.allclose(pts[-1], arc[0]):
+                        pts.extend(arc[1:].tolist())
+                    else:
+                        pts.extend(arc.tolist())
+            else:
+                if len(pts)==0 or not np.allclose([x,y], pts[-1]):
+                    pts.append([x,y])
+            cur_x, cur_y = x, y
     P = np.asarray(pts, float) if pts else np.empty((0,2), float)
     return P, feed
 
