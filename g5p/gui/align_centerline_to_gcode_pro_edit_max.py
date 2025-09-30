@@ -270,7 +270,10 @@ def parse_gcode_xy(path: Union[str, Path], step_mm: float = 1.0) -> Tuple[np.nda
     feed: Optional[float] = None
     cur_x: Optional[float] = None
     cur_y: Optional[float] = None
+    cur_z: Optional[float] = None
     cur_mode: Optional[int] = None  # 0/1/2/3 => G0/G1/G2/G3
+    prev_mode: Optional[int] = None
+    absolute_mode: bool = True      # G90 absolute (default); G91 incremental
     # support optional '=': e.g., X=1.0, Z=988.0
     word_re = re.compile(r'([A-Za-z])\s*=?\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))')
     with p.open('r', encoding='utf-8', errors='ignore') as f:
@@ -295,8 +298,12 @@ def parse_gcode_xy(path: Union[str, Path], step_mm: float = 1.0) -> Tuple[np.nda
                 if k == 'G':
                     try:
                         gv = int(round(float(v_str)))
-                        if gv in (0,1,2,3):
+                        if gv in (0, 1, 2, 3):
                             g_in_line = gv
+                        elif gv == 90:
+                            absolute_mode = True
+                        elif gv == 91:
+                            absolute_mode = False
                     except Exception:
                         pass
             if g_in_line is not None:
@@ -305,6 +312,7 @@ def parse_gcode_xy(path: Union[str, Path], step_mm: float = 1.0) -> Tuple[np.nda
             tgt_x: Optional[float] = None
             tgt_y: Optional[float] = None
             I = J = R = None
+            tgt_z: Optional[float] = None
             for k, v_str in words:
                 try:
                     v = float(v_str)
@@ -316,18 +324,36 @@ def parse_gcode_xy(path: Union[str, Path], step_mm: float = 1.0) -> Tuple[np.nda
                     tgt_x = v
                 elif k == 'Y':
                     tgt_y = v
+                elif k == 'Z':
+                    tgt_z = v
                 elif k == 'I':
                     I = v
                 elif k == 'J':
                     J = v
                 elif k == 'R':
                     R = v
+            # update Z if present (used to detect plunge/rapid but not for 2D path)
+            if tgt_z is not None:
+                cur_z = tgt_z
+
             # skip lines with no XY updates
             if tgt_x is None and tgt_y is None:
+                # still update mode and Z; nothing more to do
+                prev_mode = cur_mode
                 continue
-            # single-axis updates: use last known for the other axis
-            x = tgt_x if tgt_x is not None else cur_x
-            y = tgt_y if tgt_y is not None else cur_y
+
+            # compute target XY using absolute/relative mode
+            if absolute_mode:
+                x = tgt_x if tgt_x is not None else cur_x
+                y = tgt_y if tgt_y is not None else cur_y
+            else:
+                # incremental: missing axis implies 0 delta
+                base_x = 0.0 if cur_x is None else cur_x
+                base_y = 0.0 if cur_y is None else cur_y
+                dx = 0.0 if tgt_x is None else tgt_x
+                dy = 0.0 if tgt_y is None else tgt_y
+                x = base_x + dx
+                y = base_y + dy
             if x is None or y is None:
                 # cache partial updates and continue
                 if tgt_x is not None:
@@ -336,8 +362,19 @@ def parse_gcode_xy(path: Union[str, Path], step_mm: float = 1.0) -> Tuple[np.nda
                     cur_y = tgt_y
                 continue
             mode = cur_mode if cur_mode is not None else 1
+
+            # Ignore rapid moves (G0). Only keep cutting paths G1/G2/G3.
+            if mode == 0:
+                cur_x, cur_y = x, y
+                prev_mode = mode
+                continue
+
             if mode in (2,3):
                 cw = (mode == 2)
+                # when entering cutting from a non-cutting mode, add the entry point first
+                if prev_mode not in (1,2,3) and cur_x is not None and cur_y is not None:
+                    if len(pts)==0 or not np.allclose([cur_x, cur_y], pts[-1]):
+                        pts.append([cur_x, cur_y])
                 if len(pts)==0 and (cur_x is None or cur_y is None):
                     pts.append([x, y])
                 else:
@@ -350,9 +387,14 @@ def parse_gcode_xy(path: Union[str, Path], step_mm: float = 1.0) -> Tuple[np.nda
                     else:
                         pts.extend(arc.tolist())
             else:
+                # when entering cutting from a non-cutting mode, add the entry point first
+                if prev_mode not in (1,2,3) and cur_x is not None and cur_y is not None:
+                    if len(pts)==0 or not np.allclose([cur_x, cur_y], pts[-1]):
+                        pts.append([cur_x, cur_y])
                 if len(pts)==0 or not np.allclose([x,y], pts[-1]):
                     pts.append([x,y])
             cur_x, cur_y = x, y
+            prev_mode = mode
     P = np.asarray(pts, float) if pts else np.empty((0,2), float)
     return P, feed
 
