@@ -32,7 +32,7 @@ class S7PLCEnhanced(PLCCommunicator):
         # S7连接参数
         self.plc_ip = config.plc_ip
         self.rack = 0  # 西门子PLC默认机架号
-        self.slot = 1  # 西门子PLC默认插槽号
+        self.slot = 2  # 西门子PLC默认插槽号
         
         # snap7客户端
         self.client = None
