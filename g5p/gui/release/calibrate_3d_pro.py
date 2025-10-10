@@ -90,9 +90,6 @@ def trim_outliers_once(cam_pts: np.ndarray, mach_pts: np.ndarray, trim_percent: 
     return cam_pts[idx], mach_pts[idx], idx
 
 
-def test():
-    print("www")
-
 # =================== 单帧采集与对齐（参考 SDK registration 示例） ===================
 class SingleShotGrabber:
     """抓取单帧彩色+深度，并计算：
