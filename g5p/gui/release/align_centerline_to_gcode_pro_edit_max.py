@@ -25,9 +25,6 @@ import time
 import os
 import json
 
-def test():
-    print("test")
-
 # ===================== 参数（含新增） =====================
 PARAMS = dict(
     # 文件
